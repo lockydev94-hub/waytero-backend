@@ -1,0 +1,417 @@
+# ============================================================
+# WAY TERO — HOTEL CONSTANTS
+# File: app/modules/hotel/constants/__init__.py
+# Doc Ref: BRD Part 4 §57-92, SRS Part 5 §153-194, API Doc 09_HOTEL_API
+# ============================================================
+
+# ------------------------------------------------------------
+# Hotel lifecycle
+# ------------------------------------------------------------
+# DRAFT precedes the docs' PENDING: an admin builds a hotel over several
+# sittings, and nothing half-finished should sit in a verification queue.
+HOTEL_STATUS_DRAFT = "DRAFT"
+HOTEL_STATUS_PENDING = "PENDING"
+HOTEL_STATUS_UNDER_REVIEW = "UNDER_REVIEW"
+HOTEL_STATUS_DOCUMENT_PENDING = "DOCUMENT_PENDING"
+HOTEL_STATUS_APPROVED = "APPROVED"
+HOTEL_STATUS_REJECTED = "REJECTED"
+HOTEL_STATUS_ACTIVE = "ACTIVE"
+HOTEL_STATUS_INACTIVE = "INACTIVE"
+HOTEL_STATUS_SUSPENDED = "SUSPENDED"
+HOTEL_STATUS_BLOCKED = "BLOCKED"
+
+HOTEL_STATUSES = [
+    HOTEL_STATUS_DRAFT,
+    HOTEL_STATUS_PENDING,
+    HOTEL_STATUS_UNDER_REVIEW,
+    HOTEL_STATUS_DOCUMENT_PENDING,
+    HOTEL_STATUS_APPROVED,
+    HOTEL_STATUS_REJECTED,
+    HOTEL_STATUS_ACTIVE,
+    HOTEL_STATUS_INACTIVE,
+    HOTEL_STATUS_SUSPENDED,
+    HOTEL_STATUS_BLOCKED,
+]
+
+# BLOCKED is terminal by design — unblocking is a data-correction task,
+# not a workflow step, so it must not be reachable from the UI.
+VALID_HOTEL_TRANSITIONS: dict[str, list[str]] = {
+    HOTEL_STATUS_DRAFT: [HOTEL_STATUS_PENDING],
+    HOTEL_STATUS_PENDING: [
+        HOTEL_STATUS_UNDER_REVIEW,
+        HOTEL_STATUS_APPROVED,
+        HOTEL_STATUS_REJECTED,
+    ],
+    HOTEL_STATUS_UNDER_REVIEW: [
+        HOTEL_STATUS_DOCUMENT_PENDING,
+        HOTEL_STATUS_APPROVED,
+        HOTEL_STATUS_REJECTED,
+    ],
+    HOTEL_STATUS_DOCUMENT_PENDING: [
+        HOTEL_STATUS_UNDER_REVIEW,
+        HOTEL_STATUS_APPROVED,
+        HOTEL_STATUS_REJECTED,
+    ],
+    HOTEL_STATUS_REJECTED: [HOTEL_STATUS_DRAFT, HOTEL_STATUS_PENDING],
+    HOTEL_STATUS_APPROVED: [
+        HOTEL_STATUS_ACTIVE,
+        HOTEL_STATUS_SUSPENDED,
+        HOTEL_STATUS_BLOCKED,
+    ],
+    HOTEL_STATUS_ACTIVE: [
+        HOTEL_STATUS_INACTIVE,
+        HOTEL_STATUS_SUSPENDED,
+        HOTEL_STATUS_BLOCKED,
+    ],
+    HOTEL_STATUS_INACTIVE: [
+        HOTEL_STATUS_ACTIVE,
+        HOTEL_STATUS_SUSPENDED,
+        HOTEL_STATUS_BLOCKED,
+    ],
+    HOTEL_STATUS_SUSPENDED: [
+        HOTEL_STATUS_ACTIVE,
+        HOTEL_STATUS_INACTIVE,
+        HOTEL_STATUS_BLOCKED,
+    ],
+    HOTEL_STATUS_BLOCKED: [],
+}
+
+# Statuses in which a hotel is editable by an admin without re-verification.
+HOTEL_EDITABLE_STATUSES = [
+    HOTEL_STATUS_DRAFT,
+    HOTEL_STATUS_REJECTED,
+    HOTEL_STATUS_DOCUMENT_PENDING,
+]
+
+# Statuses that count as "in the verification pipeline" for KPI tiles.
+HOTEL_PIPELINE_STATUSES = [
+    HOTEL_STATUS_PENDING,
+    HOTEL_STATUS_UNDER_REVIEW,
+    HOTEL_STATUS_DOCUMENT_PENDING,
+]
+
+
+# ------------------------------------------------------------
+# Documents — Doc Ref: BRD Part 4 §60
+# ------------------------------------------------------------
+DOC_GST_CERTIFICATE = "GST_CERTIFICATE"
+DOC_PAN_CARD = "PAN_CARD"
+DOC_TRADE_LICENSE = "TRADE_LICENSE"
+DOC_BANK_PROOF = "BANK_PROOF"
+DOC_FIRE_SAFETY = "FIRE_SAFETY_CERTIFICATE"
+DOC_FSSAI = "FSSAI_LICENSE"
+DOC_PROPERTY_OWNERSHIP = "PROPERTY_OWNERSHIP_PROOF"
+DOC_TOURISM_REGISTRATION = "TOURISM_REGISTRATION"
+DOC_OTHER = "OTHER"
+
+HOTEL_DOCUMENT_TYPES = [
+    DOC_GST_CERTIFICATE,
+    DOC_PAN_CARD,
+    DOC_TRADE_LICENSE,
+    DOC_BANK_PROOF,
+    DOC_FIRE_SAFETY,
+    DOC_FSSAI,
+    DOC_PROPERTY_OWNERSHIP,
+    DOC_TOURISM_REGISTRATION,
+    DOC_OTHER,
+]
+
+# GST certificate is conditional, not absolute: a hotel below the registration
+# threshold legitimately has none, so readiness only demands it when the hotel
+# claims to be GST-registered.
+HOTEL_REQUIRED_DOCUMENT_TYPES = [
+    DOC_PAN_CARD,
+    DOC_TRADE_LICENSE,
+    DOC_BANK_PROOF,
+]
+
+DOC_STATUS_PENDING = "PENDING"
+DOC_STATUS_VERIFIED = "VERIFIED"
+DOC_STATUS_REJECTED = "REJECTED"
+DOCUMENT_VERIFICATION_STATUSES = [
+    DOC_STATUS_PENDING,
+    DOC_STATUS_VERIFIED,
+    DOC_STATUS_REJECTED,
+]
+
+
+# ------------------------------------------------------------
+# Media
+# ------------------------------------------------------------
+IMAGE_TYPE_EXTERIOR = "EXTERIOR"
+IMAGE_TYPE_LOBBY = "LOBBY"
+IMAGE_TYPE_ROOM = "ROOM"
+IMAGE_TYPE_BATHROOM = "BATHROOM"
+IMAGE_TYPE_RESTAURANT = "RESTAURANT"
+IMAGE_TYPE_AMENITY = "AMENITY"
+IMAGE_TYPE_GALLERY = "GALLERY"
+
+HOTEL_IMAGE_TYPES = [
+    IMAGE_TYPE_EXTERIOR,
+    IMAGE_TYPE_LOBBY,
+    IMAGE_TYPE_ROOM,
+    IMAGE_TYPE_BATHROOM,
+    IMAGE_TYPE_RESTAURANT,
+    IMAGE_TYPE_AMENITY,
+    IMAGE_TYPE_GALLERY,
+]
+
+# Cloudinary folders — passed as folder_override to
+# POST /api/v1/admin/settings/upload-media. No second upload endpoint.
+CLOUDINARY_FOLDER_HOTEL_IMAGES = "waytero/hotels/images"
+CLOUDINARY_FOLDER_HOTEL_DOCUMENTS = "waytero/hotels/documents"
+CLOUDINARY_FOLDER_HOTEL_ROOMS = "waytero/hotels/rooms"
+
+
+# ------------------------------------------------------------
+# Rooms — Doc Ref: BRD Part 4 §64-66
+# ------------------------------------------------------------
+ROOM_TYPE_STANDARD = "STANDARD"
+ROOM_TYPE_DELUXE = "DELUXE"
+ROOM_TYPE_SUPER_DELUXE = "SUPER_DELUXE"
+ROOM_TYPE_EXECUTIVE = "EXECUTIVE"
+ROOM_TYPE_SUITE = "SUITE"
+ROOM_TYPE_FAMILY = "FAMILY"
+ROOM_TYPE_DORMITORY = "DORMITORY"
+ROOM_TYPE_COTTAGE = "COTTAGE"
+ROOM_TYPE_TENT = "TENT"
+
+HOTEL_ROOM_TYPES = [
+    ROOM_TYPE_STANDARD,
+    ROOM_TYPE_DELUXE,
+    ROOM_TYPE_SUPER_DELUXE,
+    ROOM_TYPE_EXECUTIVE,
+    ROOM_TYPE_SUITE,
+    ROOM_TYPE_FAMILY,
+    ROOM_TYPE_DORMITORY,
+    ROOM_TYPE_COTTAGE,
+    ROOM_TYPE_TENT,
+]
+
+BED_TYPES = ["SINGLE", "TWIN", "DOUBLE", "QUEEN", "KING", "BUNK", "SOFA_CUM_BED"]
+
+VIEW_TYPES = [
+    "CITY_VIEW",
+    "SEA_VIEW",
+    "MOUNTAIN_VIEW",
+    "GARDEN_VIEW",
+    "POOL_VIEW",
+    "LAKE_VIEW",
+    "NO_VIEW",
+]
+
+# Standard Indian hotel meal-plan vocabulary. Without it, "does the rate
+# include breakfast" becomes a support ticket per booking.
+MEAL_PLAN_EP = "EP"  # European Plan — room only
+MEAL_PLAN_CP = "CP"  # Continental Plan — room + breakfast
+MEAL_PLAN_MAP = "MAP"  # Modified American Plan — room + breakfast + one meal
+MEAL_PLAN_AP = "AP"  # American Plan — room + all meals
+
+MEAL_PLANS = [MEAL_PLAN_EP, MEAL_PLAN_CP, MEAL_PLAN_MAP, MEAL_PLAN_AP]
+
+MEAL_PLAN_LABELS = {
+    MEAL_PLAN_EP: "Room Only",
+    MEAL_PLAN_CP: "Room + Breakfast",
+    MEAL_PLAN_MAP: "Room + Breakfast + 1 Meal",
+    MEAL_PLAN_AP: "Room + All Meals",
+}
+
+ROOM_STATUS_AVAILABLE = "AVAILABLE"
+ROOM_STATUS_OCCUPIED = "OCCUPIED"
+ROOM_STATUS_MAINTENANCE = "MAINTENANCE"
+ROOM_STATUS_BLOCKED = "BLOCKED"
+PHYSICAL_ROOM_STATUSES = [
+    ROOM_STATUS_AVAILABLE,
+    ROOM_STATUS_OCCUPIED,
+    ROOM_STATUS_MAINTENANCE,
+    ROOM_STATUS_BLOCKED,
+]
+
+
+# ------------------------------------------------------------
+# Rate plans — Doc Ref: BRD Part 4 §70
+# ------------------------------------------------------------
+PLAN_TYPE_PROMOTIONAL = "PROMOTIONAL"
+PLAN_TYPE_WEEKEND = "WEEKEND"
+PLAN_TYPE_SEASONAL = "SEASONAL"
+PLAN_TYPE_FESTIVAL = "FESTIVAL"
+
+RATE_PLAN_TYPES = [
+    PLAN_TYPE_PROMOTIONAL,
+    PLAN_TYPE_WEEKEND,
+    PLAN_TYPE_SEASONAL,
+    PLAN_TYPE_FESTIVAL,
+]
+
+# Overlapping plans are legitimate (Diwali sits inside the winter season), so
+# rather than forbidding overlap the winner is decided by this precedence,
+# then by priority desc, then by id desc. Higher wins.
+RATE_PLAN_PRECEDENCE = {
+    PLAN_TYPE_FESTIVAL: 4,
+    PLAN_TYPE_SEASONAL: 3,
+    PLAN_TYPE_WEEKEND: 2,
+    PLAN_TYPE_PROMOTIONAL: 1,
+}
+
+RATE_MODE_ABSOLUTE = "ABSOLUTE"  # rate_value IS the nightly rate
+RATE_MODE_PERCENT = "PERCENT"  # rate_value is a % delta on base_price
+RATE_MODE_DELTA = "DELTA"  # rate_value is a flat +/- on base_price
+RATE_MODES = [RATE_MODE_ABSOLUTE, RATE_MODE_PERCENT, RATE_MODE_DELTA]
+
+
+# ------------------------------------------------------------
+# Commission — Doc Ref: BRD Part 4 §87
+# ------------------------------------------------------------
+COMMISSION_TYPE_PERCENTAGE = "PERCENTAGE"
+COMMISSION_TYPE_FLAT = "FLAT"
+COMMISSION_TYPE_HYBRID = "HYBRID"
+HOTEL_COMMISSION_TYPES = [
+    COMMISSION_TYPE_PERCENTAGE,
+    COMMISSION_TYPE_FLAT,
+    COMMISSION_TYPE_HYBRID,
+]
+
+COMMISSION_APPLIES_PER_BOOKING = "PER_BOOKING"
+COMMISSION_APPLIES_PER_ROOM_NIGHT = "PER_ROOM_NIGHT"
+COMMISSION_APPLIES_TO = [
+    COMMISSION_APPLIES_PER_BOOKING,
+    COMMISSION_APPLIES_PER_ROOM_NIGHT,
+]
+
+# Where a resolved commission came from — returned to the UI so an admin can
+# see whether a number is inherited or overridden rather than guessing.
+COMMISSION_SOURCE_HOTEL_OVERRIDE = "HOTEL_OVERRIDE"
+COMMISSION_SOURCE_CITY_RULE = "CITY_RULE"
+COMMISSION_SOURCE_GLOBAL_RULE = "GLOBAL_RULE"
+COMMISSION_SOURCE_SYSTEM_DEFAULT = "SYSTEM_DEFAULT"
+
+
+# ------------------------------------------------------------
+# Tax — Doc Ref: BRD Part 4 §88
+# ------------------------------------------------------------
+# Two independent switches. The global GST_ENABLED config decides whether the
+# platform raises a tax invoice at all and OVERRIDES everything below it;
+# tax_mode only becomes meaningful once that global switch is on.
+TAX_MODE_EXCLUSIVE = "EXCLUSIVE"  # displayed rate excludes GST; GST added on top
+TAX_MODE_INCLUSIVE = "INCLUSIVE"  # displayed rate already contains GST; back it out
+TAX_MODE_EXEMPT = "EXEMPT"  # this property charges no GST
+HOTEL_TAX_MODES = [TAX_MODE_EXCLUSIVE, TAX_MODE_INCLUSIVE, TAX_MODE_EXEMPT]
+
+TAX_SOURCE_PLATFORM_DISABLED = "PLATFORM_GST_DISABLED"
+TAX_SOURCE_HOTEL_EXEMPT = "HOTEL_EXEMPT"
+TAX_SOURCE_SLAB = "TARIFF_SLAB"
+
+CONFIG_GST_ENABLED = "GST_ENABLED"
+CONFIG_HOTEL_DEFAULT_COMMISSION = "HOTEL_DEFAULT_COMMISSION_PERCENT"
+CONFIG_HOTEL_INVENTORY_HORIZON_DAYS = "HOTEL_INVENTORY_HORIZON_DAYS"
+CONFIG_HOTEL_RESERVATION_HOLD_MINUTES = "HOTEL_RESERVATION_HOLD_MINUTES"
+CONFIG_HOTEL_CODE_PREFIX = "HOTEL_CODE_PREFIX"
+CONFIG_HOTEL_RESERVATION_PREFIX = "HOTEL_RESERVATION_PREFIX"
+CONFIG_HOTEL_AUTO_APPROVE_ENABLED = "HOTEL_AUTO_APPROVE_ENABLED"
+CONFIG_HOTEL_MIN_IMAGES_REQUIRED = "HOTEL_MIN_IMAGES_REQUIRED"
+CONFIG_HOTEL_ADVANCE_PERCENT_DEFAULT = "HOTEL_ADVANCE_PERCENT_DEFAULT"
+CONFIG_HOTEL_GST_ON_COMMISSION = "HOTEL_GST_ON_COMMISSION_PERCENT"
+
+
+# ------------------------------------------------------------
+# Property attributes
+# ------------------------------------------------------------
+CONFIRMATION_MODE_INSTANT = "INSTANT_CONFIRMATION"
+CONFIRMATION_MODE_MANUAL = "MANUAL_CONFIRMATION"
+CONFIRMATION_MODES = [CONFIRMATION_MODE_INSTANT, CONFIRMATION_MODE_MANUAL]
+
+ALLOCATION_MODE_AT_BOOKING = "AT_BOOKING"
+ALLOCATION_MODE_AT_CHECK_IN = "AT_CHECK_IN"
+ROOM_ALLOCATION_MODES = [ALLOCATION_MODE_AT_BOOKING, ALLOCATION_MODE_AT_CHECK_IN]
+
+MIN_STAR_RATING = 1
+MAX_STAR_RATING = 7
+
+GUEST_ID_TYPES = ["AADHAAR", "PASSPORT", "DRIVING_LICENSE", "VOTER_ID", "PAN"]
+
+
+# ------------------------------------------------------------
+# Audit actions — Doc Ref: API Doc 09_HOTEL_API
+# ------------------------------------------------------------
+ACTION_HOTEL_CREATED = "HOTEL_CREATED"
+ACTION_HOTEL_UPDATED = "HOTEL_UPDATED"
+ACTION_HOTEL_SUBMITTED = "HOTEL_SUBMITTED"
+ACTION_OFFICER_ASSIGNED = "OFFICER_ASSIGNED"
+ACTION_OFFICER_UNASSIGNED = "OFFICER_UNASSIGNED"
+ACTION_REVIEW_STARTED = "REVIEW_STARTED"
+ACTION_DOCUMENT_VERIFIED = "DOCUMENT_VERIFIED"
+ACTION_DOCUMENT_REJECTED = "DOCUMENT_REJECTED"
+ACTION_DOCUMENTS_REQUESTED = "DOCUMENTS_REQUESTED"
+ACTION_HOTEL_APPROVED = "HOTEL_APPROVED"
+ACTION_HOTEL_APPROVED_OWN_RISK = "HOTEL_APPROVED_OWN_RISK"
+ACTION_HOTEL_REJECTED = "HOTEL_REJECTED"
+ACTION_HOTEL_ACTIVATED = "HOTEL_ACTIVATED"
+ACTION_HOTEL_DEACTIVATED = "HOTEL_DEACTIVATED"
+ACTION_HOTEL_SUSPENDED = "HOTEL_SUSPENDED"
+ACTION_HOTEL_BLOCKED = "HOTEL_BLOCKED"
+ACTION_COMMISSION_UPDATED = "COMMISSION_UPDATED"
+ACTION_TAX_UPDATED = "TAX_UPDATED"
+
+
+# ------------------------------------------------------------
+# Hotel switch / split-stay timeline events — Doc Ref: Hotel Switch Spec
+# Migration: 0042_hotel_switch
+# ------------------------------------------------------------
+HOTEL_SWITCH_INITIATED = "HOTEL_SWITCH_INITIATED"
+HOTEL_SWITCH_COMPLETED = "HOTEL_SWITCH_COMPLETED"
+HOTEL_SPLIT_INITIATED = "HOTEL_SPLIT_INITIATED"
+HOTEL_SPLIT_COMPLETED = "HOTEL_SPLIT_COMPLETED"
+HOTEL_ADVANCE_ROLLOVER = "HOTEL_ADVANCE_ROLLOVER"
+HOTEL_ADVANCE_REFUND_RECORDED = "HOTEL_ADVANCE_REFUND_RECORDED"
+
+HOTEL_SWITCH_TIMELINE_EVENTS = [
+    HOTEL_SWITCH_INITIATED,
+    HOTEL_SWITCH_COMPLETED,
+    HOTEL_SPLIT_INITIATED,
+    HOTEL_SPLIT_COMPLETED,
+    HOTEL_ADVANCE_ROLLOVER,
+    HOTEL_ADVANCE_REFUND_RECORDED,
+]
+
+# Split-event audit-row discriminator values for hotel_reservation_split_events.split_type
+HOTEL_SPLIT_TYPE_PRE_CHECKIN_SWITCH = "PRE_CHECKIN_SWITCH"
+HOTEL_SPLIT_TYPE_POST_CHECKIN_SPLIT = "POST_CHECKIN_SPLIT"
+HOTEL_SPLIT_TYPES = [
+    HOTEL_SPLIT_TYPE_PRE_CHECKIN_SWITCH,
+    HOTEL_SPLIT_TYPE_POST_CHECKIN_SPLIT,
+]
+
+# Advance-redistribution strategies for split_advance_strategy + advance_split_strategy
+HOTEL_ADVANCE_STRATEGY_ROLLOVER = "ROLLOVER"
+HOTEL_ADVANCE_STRATEGY_NONE = "NONE"
+HOTEL_ADVANCE_STRATEGIES = [
+    HOTEL_ADVANCE_STRATEGY_ROLLOVER,
+    HOTEL_ADVANCE_STRATEGY_NONE,
+]
+
+# Reasons stored on hotel_reservations.switched_reason (VARCHAR 50)
+HOTEL_SWITCH_REASON_GUEST_REQUEST = "GUEST_REQUEST"
+HOTEL_SWITCH_REASON_QUALITY_ISSUE = "QUALITY_ISSUE"
+HOTEL_SWITCH_REASON_OVERBOOKING = "OVERBOOKING"
+HOTEL_SWITCH_REASON_PARTNER_ADVICE = "PARTNER_ADVICE"
+HOTEL_SWITCH_REASON_OTHER = "OTHER"
+HOTEL_SWITCH_REASONS = [
+    HOTEL_SWITCH_REASON_GUEST_REQUEST,
+    HOTEL_SWITCH_REASON_QUALITY_ISSUE,
+    HOTEL_SWITCH_REASON_OVERBOOKING,
+    HOTEL_SWITCH_REASON_PARTNER_ADVICE,
+    HOTEL_SWITCH_REASON_OTHER,
+]
+
+
+# ------------------------------------------------------------
+# Error codes — Doc Ref: API Doc 09_HOTEL_API
+# ------------------------------------------------------------
+ERR_HOTEL_NOT_FOUND = "HOTEL_001"
+ERR_HOTEL_DUPLICATE = "HOTEL_002"
+ERR_INVALID_TRANSITION = "HOTEL_003"
+ERR_NOT_READY_FOR_SUBMISSION = "HOTEL_004"
+ERR_ROOM_CATEGORY_NOT_FOUND = "HOTEL_005"
+ERR_INVENTORY_UNAVAILABLE = "HOTEL_006"
+ERR_INVALID_RATE_PLAN = "HOTEL_007"
+ERR_PARTNER_SERVICE_MISSING = "HOTEL_008"

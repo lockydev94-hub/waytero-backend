@@ -1,0 +1,29 @@
+# WAY TERO — USER TYPE & ROLE ENUMS
+# Doc Ref: Auth Flow Section 2 — Supported User Types
+from enum import Enum
+
+
+class UserType(str, Enum):
+    CUSTOMER = "CUSTOMER"
+    PARTNER = "PARTNER"
+    DRIVER = "DRIVER"
+    CCO = "CCO"
+    VERIFICATION_OFFICER = "VERIFICATION_OFFICER"
+    FINANCE_MANAGER = "FINANCE_MANAGER"
+    ADMIN = "ADMIN"
+    SUPER_ADMIN = "SUPER_ADMIN"
+
+
+class UserStatus(str, Enum):
+    ACTIVE = "ACTIVE"
+    INACTIVE = "INACTIVE"
+    SUSPENDED = "SUSPENDED"
+    PENDING_VERIFICATION = "PENDING_VERIFICATION"
+    BLOCKED = "BLOCKED"
+
+
+class VerificationStatus(str, Enum):
+    PENDING = "PENDING"
+    UNDER_REVIEW = "UNDER_REVIEW"
+    APPROVED = "APPROVED"
+    REJECTED = "REJECTED"

@@ -1,0 +1,60 @@
+# ============================================================
+# WAY TERO — BASE REQUIREMENTS
+# Python 3.13 | FastAPI | SQLAlchemy 2.x | PostgreSQL 17
+# Verified compatible with Python 3.13 (not 3.14)
+# ============================================================
+
+# --- Web Framework ---
+fastapi==0.115.5
+uvicorn[standard]==0.32.1
+
+# --- Database ---
+sqlalchemy==2.0.36
+asyncpg==0.30.0
+greenlet==3.1.1
+alembic==1.14.0
+
+# --- Pydantic & Settings ---
+pydantic==2.10.3
+pydantic-settings==2.6.1
+pydantic[email]
+
+# --- Authentication & Security ---
+python-jose[cryptography]==3.3.0
+argon2-cffi==23.1.0
+python-multipart==0.0.12
+
+# --- Redis & Cache ---
+redis==5.2.1
+# hiredis is optional C extension — skip on Python 3.14, use pure python fallback
+
+# --- Celery (Background Workers) ---
+celery==5.4.0
+celery[redis]
+
+# --- HTTP Client ---
+httpx==0.28.1
+
+# --- File Storage (MinIO) ---
+minio==7.2.11
+
+# --- Realtime + Push Notifications ---
+# websockets ships inside uvicorn[standard] but pinned here so app code can
+# `import websockets` for the cross-process broadcaster path.
+websockets==13.1
+firebase-admin==6.5.0
+
+# --- Utilities ---
+python-slugify==8.0.4
+phonenumbers==8.13.50
+# Pillow — use 11.1.0+ which has Python 3.13 wheels
+Pillow==11.1.0
+python-dateutil==2.9.0
+
+# --- Logging ---
+structlog==24.4.0
+
+# --- UUID v7 ---
+uuid7==0.1.0
+reportlab==4.2.5
+chardet==7.4.3

@@ -1,0 +1,56 @@
+# ============================================================
+# WAY TERO — BACKEND .GITIGNORE
+# Doc Ref: Security Hardening S2/S3 — never commit secrets
+# ============================================================
+
+# Environment (NEVER commit secrets; commit .env.example only)
+.env
+.env.*
+!.env.example
+
+# Tokens / keys (live JWT dumps, service keys — never commit)
+tok.txt
+*.jwt
+*.jwt.txt
+*.token
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Build / deployment artifacts
+dist/
+build/
+.deploy/
+deployments/
+
+# Editor/backup scratch files (never commit)
+*.bak
+*.bak[0-9]
+
+# Logs / runtime uploads
+*.log
+logs/
+uploads/
+media/
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
