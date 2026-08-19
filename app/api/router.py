@@ -68,6 +68,7 @@ from app.modules.admin.partner_settings_api import (
     router as partner_settings_router,
 )
 from app.modules.admin.public_firebase_api import router as public_firebase_router
+from app.modules.admin.onboarding_docs_api import router as onboarding_docs_router
 
 api_router = APIRouter()
 
@@ -377,4 +378,13 @@ api_router.include_router(
     public_firebase_router,
     prefix="/public",
     tags=["Public Firebase Config"],
+)
+
+# --- Onboarding Guides + Forms (Docs/22_Partner_Onboarding_Guides) ---
+# Print-quality PDFs for partners: requirement guides + hand-fillable forms.
+api_router.include_router(
+    onboarding_docs_router,
+    prefix="/admin/onboarding-docs",
+    tags=["Onboarding Docs"],
+    dependencies=[Depends(require_roles(*ALL_STAFF))],
 )
