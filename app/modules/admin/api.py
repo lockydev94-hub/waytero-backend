@@ -9,9 +9,11 @@
 # All routes are async — uses AsyncSession (project standard)
 # ============================================================
 
+import base64
 import hashlib
 import time
 from typing import List, Optional
+from urllib.parse import quote
 import httpx
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -989,6 +991,35 @@ def _cloudinary_sign(params: dict, api_secret: str) -> str:
     return hashlib.sha1(to_sign.encode("utf-8")).hexdigest()
 
 
+async def _get_cloudinary_creds_shared(db: AsyncSession) -> tuple[str, str, str]:
+    """Shared helper — resolve active Cloudinary credentials from api_integrations."""
+    result = await db.execute(
+        sa_select(ApiIntegration).where(
+            ApiIntegration.service_type == "CLOUDINARY",
+            ApiIntegration.is_active == True,  # noqa: E712
+        )
+    )
+    integration = result.scalar_one_or_none()
+    if not integration or not integration.configuration:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Cloudinary integration is not configured or not active. "
+                "Go to Settings → API Integrations → Cloudinary and set credentials."
+            ),
+        )
+    cfg: dict = integration.configuration
+    cloud_name = cfg.get("cloud_name", "").strip()
+    api_key = cfg.get("api_key", "").strip()
+    api_secret = cfg.get("api_secret", "").strip()
+    if not cloud_name or not api_key or not api_secret:
+        raise HTTPException(
+            status_code=400,
+            detail="Cloudinary cloud_name, api_key, and api_secret must all be set.",
+        )
+    return cloud_name, api_key, api_secret
+
+
 @router.post(
     "/upload-media",
     tags=["Settings – Media Upload"],
@@ -1013,32 +1044,7 @@ async def upload_platform_media(
     db: AsyncSession = Depends(get_db),
 ):
     # 1. Resolve Cloudinary credentials from api_integrations
-    result = await db.execute(
-        sa_select(ApiIntegration).where(
-            ApiIntegration.service_type == "CLOUDINARY",
-            ApiIntegration.is_active == True,  # noqa: E712
-        )
-    )
-    integration = result.scalar_one_or_none()
-    if not integration or not integration.configuration:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Cloudinary integration is not configured or not active. "
-                "Go to Settings → API Integrations → Cloudinary and set credentials."
-            ),
-        )
-
-    cfg: dict = integration.configuration
-    cloud_name = cfg.get("cloud_name", "").strip()
-    api_key = cfg.get("api_key", "").strip()
-    api_secret = cfg.get("api_secret", "").strip()
-
-    if not cloud_name or not api_key or not api_secret:
-        raise HTTPException(
-            status_code=400,
-            detail="Cloudinary cloud_name, api_key, and api_secret must all be set.",
-        )
+    cloud_name, api_key, api_secret = await _get_cloudinary_creds_shared(db)
 
     # 2. Build upload params
     spec = ASSET_SPECS.get(asset_type, {})
@@ -1118,6 +1124,131 @@ async def upload_platform_media(
         "asset_type": asset_type,
         "resource_type": resource_type,
     }
+
+
+# ════════════════════════════════════════════════════════════════
+#  MEDIA LIBRARY — Browse & manage existing Cloudinary assets
+#  GET    /admin/settings/media-library                     — list
+#  DELETE /admin/settings/media-library/{public_id}         — delete
+#
+#  Uses the Cloudinary Admin API (same credentials as uploads).
+#  The gallery is read-only browsing plus explicit deletion of
+#  stale assets; nothing here mutates Cloudinary unless the admin
+#  explicitly deletes via the DELETE endpoint.
+# ════════════════════════════════════════════════════════════════
+
+def _cloudinary_basic_auth(api_key: str, api_secret: str) -> str:
+    """Base64 Basic auth header used by the Cloudinary Admin API."""
+    token = f"{api_key}:{api_secret}"
+    return "Basic " + base64.b64encode(token.encode("utf-8")).decode("ascii")
+
+
+async def _cloudinary_admin_get(
+    url: str,
+    api_key: str,
+    api_secret: str,
+    params: Optional[dict] = None,
+) -> dict:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(
+            url,
+            params=params,
+            headers={"Authorization": _cloudinary_basic_auth(api_key, api_secret)},
+        )
+    if resp.status_code not in (200, 201):
+        try:
+            detail = resp.json().get("error", {}).get("message", resp.text)
+        except Exception:
+            detail = resp.text
+        raise HTTPException(status_code=502, detail=f"Cloudinary error: {detail}")
+    return resp.json()
+
+
+@router.get(
+    "/media-library",
+    tags=["Settings – Media Upload"],
+    summary="List existing Cloudinary images (media library / gallery)",
+    description=(
+        "Browses the Cloudinary Admin API for uploaded images under the "
+        "waytero namespace. Supports folder filtering, free-text search on "
+        "public_id, and cursor-based pagination so the admin portal can "
+        "offer a 'pick from gallery' picker."
+    ),
+)
+async def list_media_library(
+    folder: str = Query("", description="Optional Cloudinary folder prefix, e.g. waytero/cms or waytero"),
+    query: str = Query("", description="Optional free-text filter on public_id / filename"),
+    cursor: str = Query("", alias="next_cursor", description="Pagination cursor from a previous page"),
+    page_size: int = Query(30, ge=1, le=100, description="Number of results per page"),
+    db: AsyncSession = Depends(get_db),
+    _user: dict = Depends(require_permission("settings.manage")),
+):
+    cloud_name, api_key, api_secret = await _get_cloudinary_creds_shared(db)
+
+    # Cloudinary Admin API — list image resources by prefix.
+    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/image"
+    params: dict = {"max_results": page_size, "type": "upload"}
+    if folder.strip():
+        prefix = folder.strip().rstrip("/") + "/"
+        params["prefix"] = prefix
+    if cursor.strip():
+        params["next_cursor"] = cursor.strip()
+
+    data = await _cloudinary_admin_get(url, api_key, api_secret, params)
+    resources = data.get("resources", [])
+
+    items = []
+    for r in resources:
+        pub = r.get("public_id", "")
+        if query.strip() and query.strip().lower() not in pub.lower():
+            continue
+        items.append({
+            "public_id": pub,
+            "secure_url": r.get("secure_url"),
+            "width": r.get("width"),
+            "height": r.get("height"),
+            "format": r.get("format"),
+            "folder": r.get("folder") or (pub.rsplit("/", 1)[0] if "/" in pub else ""),
+            "bytes": r.get("bytes"),
+            "created_at": r.get("created_at"),
+        })
+
+    return {
+        "items": items,
+        "next_cursor": data.get("next_cursor") or "",
+        "total_count": data.get("total_count") or len(items),
+    }
+
+
+@router.delete(
+    "/media-library/{public_id:path}",
+    tags=["Settings – Media Upload"],
+    summary="Delete a Cloudinary asset from the media library",
+    description="Destroys a single image/raw asset in Cloudinary. Use with care — "
+                "other records may still reference the URL.",
+)
+async def delete_media_library_item(
+    public_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user: dict = Depends(require_permission("settings.manage")),
+):
+    cloud_name, api_key, api_secret = await _get_cloudinary_creds_shared(db)
+
+    encoded_id = quote(public_id, safe="")
+    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/image/upload/{encoded_id}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.delete(
+            url,
+            headers={"Authorization": _cloudinary_basic_auth(api_key, api_secret)},
+        )
+    if resp.status_code not in (200, 201):
+        try:
+            detail = resp.json().get("error", {}).get("message", resp.text)
+        except Exception:
+            detail = resp.text
+        raise HTTPException(status_code=502, detail=f"Cloudinary error: {detail}")
+    data = resp.json()
+    return {"public_id": public_id, "deleted": data.get("deleted", [])}
 
 
 # ════════════════════════════════════════════════════════════════
