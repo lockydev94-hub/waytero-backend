@@ -5,6 +5,8 @@ customer-care prefixes.  The same package payload is intentionally used by all
 surfaces so an approval edit cannot silently diverge from the customer page.
 """
 
+import re
+
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Optional
@@ -165,10 +167,32 @@ async def _customer_id(db: AsyncSession, user: dict) -> Optional[int]:
 
 
 def _slug(name: str, code: str) -> str:
+    """SEO-friendly, unique slug for a tour package.
+
+    The package name alone (slugified) is preferred — internal codes like
+    ``TP-20260913-0001`` in the URL hurt SEO and CTR. The code is appended
+    only when needed to break collisions between same-named packages.
+    """
     import re
 
-    clean = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-    return f"{clean}-{code.lower()}"
+    base = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "tour"
+    return base
+
+
+async def _unique_slug(db: AsyncSession, base: str, exclude_id: int | None = None) -> str:
+    """Return ``base``, or ``base-2``/``base-3``… until unique among packages."""
+    candidate = base
+    suffix = 2
+    q = select(TourPackage.id).where(TourPackage.slug == candidate)
+    if exclude_id is not None:
+        q = q.where(TourPackage.id != exclude_id)
+    while (await db.scalar(q.limit(1))) is not None:
+        candidate = f"{base}-{suffix}"
+        suffix += 1
+        q = select(TourPackage.id).where(TourPackage.slug == candidate)
+        if exclude_id is not None:
+            q = q.where(TourPackage.id != exclude_id)
+    return candidate
 
 
 async def _new_code(db: AsyncSession) -> str:
@@ -380,7 +404,7 @@ async def _save_package(
     package = TourPackage(
         partner_id=partner_id,
         package_code=code,
-        slug=_slug(payload.package_name, code),
+        slug=await _unique_slug(db, _slug(payload.package_name, code)),
         package_name=payload.package_name,
         package_type=payload.package_type.upper(),
         destination=payload.destination,
@@ -621,7 +645,9 @@ async def admin_update_package(
     for key, value in values.items():
         setattr(package, key, value)
     if payload.package_name:
-        package.slug = _slug(payload.package_name, package.package_code)
+        package.slug = await _unique_slug(
+            db, _slug(payload.package_name, package.package_code), package.id
+        )
     if any(
         x is not None
         for x in (
@@ -1305,7 +1331,9 @@ async def partner_update_package(
     for key, value in values.items():
         setattr(package, key, value)
     if payload.package_name:
-        package.slug = _slug(payload.package_name, package.package_code)
+        package.slug = await _unique_slug(
+            db, _slug(payload.package_name, package.package_code), package.id
+        )
     if any(
         x is not None
         for x in (
@@ -2296,6 +2324,19 @@ async def public_package(slug: str, db: AsyncSession = Depends(get_db)):
             TourPackage.slug == slug, TourPackage.status == "ACTIVE"
         )
     )
+    if not package:
+        # Legacy URL support: migration 0067 removed the package-code
+        # suffix from slugs (…-tp-20260913-0001 → jagannath-dham-…).
+        # Resolve old code-style slugs by package_code so pre-migration
+        # links keep working instead of 404ing.
+        code_match = re.search(r"-?(tp-\d{8}-\d{4,})$", slug.lower())
+        if code_match:
+            package = await db.scalar(
+                select(TourPackage).where(
+                    TourPackage.package_code.ilike(code_match.group(1)),
+                    TourPackage.status == "ACTIVE",
+                )
+            )
     if not package:
         raise HTTPException(404, "Tour package not found")
     data = await _package_payload(db, package, include_private=False)
