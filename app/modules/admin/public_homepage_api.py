@@ -102,17 +102,20 @@ async def get_public_homepage(db: AsyncSession = Depends(get_db)):
 
 
 class PublicPlatformProfileOut(BaseModel):
-    """Platform branding media for the public marketing site.
+    """Platform branding media + public contact for the marketing site.
 
     Read from system_configurations (seeded by migration 0013 and updated
-    by the admin via Settings → Platform Profile uploads). Empty strings
-    when the admin hasn't uploaded the asset yet — customer-web then falls
-    back to its bundled static files.
+    by the admin via Settings → Platform Profile uploads). Media fields are
+    empty strings when the admin hasn't uploaded the asset yet — customer-web
+    then falls back to its bundled static files. support_phone is the contact
+    number saved under Settings → Platform Details (SUPPORT_PHONE key);
+    customer-web falls back to its own default when empty.
     """
 
     logo_url: str = ""
     favicon_url: str = ""
     og_image_url: str = ""
+    support_phone: str = ""
 
 
 @router.get(
@@ -136,7 +139,8 @@ async def get_public_platform_profile(
             text(
                 "SELECT config_key, config_value FROM system_configurations "
                 "WHERE config_key IN ("
-                "'PLATFORM_LOGO_URL', 'PLATFORM_FAVICON_URL', 'PLATFORM_OG_IMAGE_URL'"
+                "'PLATFORM_LOGO_URL', 'PLATFORM_FAVICON_URL', 'PLATFORM_OG_IMAGE_URL', "
+                "'SUPPORT_PHONE'"
                 ")"
             )
         )
@@ -146,6 +150,7 @@ async def get_public_platform_profile(
         logo_url=cfg.get("PLATFORM_LOGO_URL", ""),
         favicon_url=cfg.get("PLATFORM_FAVICON_URL", ""),
         og_image_url=cfg.get("PLATFORM_OG_IMAGE_URL", ""),
+        support_phone=cfg.get("SUPPORT_PHONE", "").strip(),
     )
 
 

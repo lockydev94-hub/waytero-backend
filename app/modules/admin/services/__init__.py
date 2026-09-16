@@ -1654,6 +1654,25 @@ class CmsService:
         header_data = CmsService._merge_header_defaults(header)
         footer_data = CmsService._merge_footer_defaults(footer)
 
+        # The admin-saved contact number under Settings → Platform Details
+        # (system_configurations.SUPPORT_PHONE) is the canonical support line.
+        # Override the CMS header/footer phones so the entire public site
+        # follows one number; CMS keeps its own value only as a fallback.
+        from sqlalchemy import text as _text
+
+        settings_row = (
+            await db.execute(
+                _text(
+                    "SELECT config_value FROM system_configurations "
+                    "WHERE config_key = 'SUPPORT_PHONE'"
+                )
+            )
+        ).first()
+        settings_phone = (settings_row[0] or "").strip() if settings_row else ""
+        if settings_phone:
+            header_data["support_phone"] = settings_phone
+            footer_data["support_phone"] = settings_phone
+
         return PublicHomepageOut(
             header=SiteHeaderOut.model_validate(header_data),
             footer=SiteFooterOut.model_validate(footer_data),
