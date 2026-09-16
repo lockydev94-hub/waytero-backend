@@ -548,6 +548,55 @@ async def admin_create_package(
     return await _package_payload(db, package)
 
 
+@admin_router.post("/partners/{partner_id}/enable-tour-service")
+async def enable_tour_service(
+    partner_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_roles(*ADMIN_ROLES)),
+):
+    """Grant a partner the TOUR service without leaving the tour wizard.
+
+    Mirrors the hotel flow's enable-hotel-service: additive on purpose, since
+    the partner-services PATCH is replace-set semantics and reusing it here
+    would silently drop the partner's CAB/HOTEL grants. Doc Ref: BRD Part 5.
+    """
+    from sqlalchemy import text as _text
+
+    partner = await db.scalar(
+        select(Partner).where(
+            Partner.id == partner_id,
+            Partner.status == "ACTIVE",
+        )
+    )
+    if not partner:
+        raise HTTPException(404, "Active partner not found")
+    await db.execute(
+        _text(
+            "INSERT INTO partner_services (partner_id, service_type, is_active, "
+            "                              created_at) "
+            "VALUES (:pid, 'TOUR', TRUE, NOW()) "
+            "ON CONFLICT (partner_id, service_type) DO UPDATE SET is_active = TRUE"
+        ),
+        {"pid": partner_id},
+    )
+    await db.execute(
+        _text(
+            "INSERT INTO partner_verification_logs (partner_id, action, remarks, "
+            "                                       created_at) "
+            "VALUES (:pid, 'ADMIN_SERVICES_UPDATED', :remarks, NOW())"
+        ),
+        {
+            "pid": partner_id,
+            "remarks": "TOUR service enabled from the tour package editor",
+        },
+    )
+    return {
+        "success": True,
+        "message": "TOUR service enabled for this partner",
+        "data": {"partner_id": partner_id},
+    }
+
+
 @admin_router.get("/packages/{package_id}")
 async def admin_package(
     package_id: int,
