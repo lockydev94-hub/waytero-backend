@@ -797,6 +797,8 @@ class HotelReservation(Base):
     # Billing, invoicing and payment custody (migration 0035)
     coupon_code = Column(String(50), nullable=True)
     coupon_discount = Column(Numeric(12, 2), nullable=False, default=0)
+    # Offer attribution (migration 0077) — server-resolved, never client input.
+    offer_id = Column(BigInteger, ForeignKey("offers.id"), nullable=True)
     overtime_hours = Column(Numeric(6, 2), nullable=False, default=0)
     overtime_charge = Column(Numeric(12, 2), nullable=False, default=0)
     invoice_number = Column(String(50), nullable=True)

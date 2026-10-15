@@ -142,6 +142,9 @@ class BookingIn(BaseModel):
     persons_count: int = Field(ge=1)
     special_requests: Optional[str] = None
     coupon_code: Optional[str] = Field(default=None, max_length=50)
+    # Offer attribution hint (migration 0077) — the server resolves the real
+    # offer from the validated coupon + package; a forged slug is ignored.
+    offer_slug: Optional[str] = Field(default=None, max_length=160)
     participants: list[ParticipantIn] = Field(default_factory=list)
 
     @field_validator("coupon_code")
@@ -224,6 +227,11 @@ async def _validate_booking_coupon(
             customer_id=customer_id,
             customer_mobile=mobile,
             partner_id=package.partner_id,
+            # Offer scope (migration 0077): server-owned booking target.
+            tour_package_id=package.id,
+            vehicle_category_id=None,
+            hotel_id=None,
+            hotel_room_category_id=None,
         ),
         db,
         reserve=True,
@@ -231,6 +239,54 @@ async def _validate_booking_coupon(
     if not validation.valid:
         raise HTTPException(400, validation.message)
     return validation
+
+
+async def _tour_offer_coupon_snapshot(db, tour):
+    """(offer, coupon) display snapshot for badges + partner accept banner
+    (migration 0077). coupon_usages is the immutable financial truth."""
+    from sqlalchemy import text as _text
+
+    offer = None
+    if getattr(tour, "offer_id", None):
+        orow = (
+            (
+                await db.execute(
+                    _text("SELECT title, slug, image_url FROM offers WHERE id = :oid"),
+                    {"oid": tour.offer_id},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if orow:
+            offer = dict(orow)
+    coupon = None
+    crow = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT co.coupon_code, cu.coupon_type, cu.discount_applied,
+                           cu.partner_share, cu.platform_share
+                    FROM coupon_usages cu JOIN coupons co ON co.id = cu.coupon_id
+                    WHERE cu.tour_booking_id = :tid
+                    """
+                ),
+                {"tid": tour.id},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if crow:
+        coupon = {
+            "code": crow["coupon_code"],
+            "type": crow["coupon_type"],
+            "discount_amount": float(crow["discount_applied"]),
+            "partner_share": float(crow["partner_share"]),
+            "platform_share": float(crow["platform_share"]),
+        }
+    return offer, coupon
 
 
 def _slug(name: str, code: str) -> str:
@@ -907,6 +963,7 @@ async def admin_booking_detail(
             .order_by(TourParticipant.id)
         )
     ).all()
+    offer_snap, coupon_snap = await _tour_offer_coupon_snapshot(db, tour)
     return {
         "id": tour.id,
         "uuid": str(tour.uuid),
@@ -942,6 +999,8 @@ async def admin_booking_detail(
         "total_amount": float(tour.total_amount),
         "coupon_code": tour.coupon_code,
         "coupon_discount": float(tour.coupon_discount or 0),
+        "offer": offer_snap,
+        "coupon": coupon_snap,
         "payable_amount": float(tour.payable_amount),
         "platform_commission": float(tour.platform_commission),
         "partner_payout": float(tour.partner_payout),
@@ -1657,6 +1716,7 @@ async def partner_tour_booking_detail(
         .all()
     )
 
+    offer_snap, coupon_snap = await _tour_offer_coupon_snapshot(db, tour)
     return {
         "id": tour.id,
         "uuid": str(tour.uuid),
@@ -1692,6 +1752,8 @@ async def partner_tour_booking_detail(
         "total_amount": float(tour.total_amount),
         "coupon_code": tour.coupon_code,
         "coupon_discount": float(tour.coupon_discount or 0),
+        "offer": offer_snap,
+        "coupon": coupon_snap,
         "payable_amount": float(tour.payable_amount),
         "platform_commission": float(tour.platform_commission),
         "partner_payout": float(tour.partner_payout),
@@ -2656,6 +2718,15 @@ async def create_public_booking(
     discount = validation.discount_amount if validation else Decimal("0.00")
     payable = total - discount
     end_date = payload.travel_start_date + timedelta(days=package.duration_days - 1)
+    offer_id_used = None
+    if validation:
+        from app.modules.admin.offer_service import resolve_offer_for_booking
+
+        offer_id_used = await resolve_offer_for_booking(
+            db, coupon_id=validation.coupon_id, service_type="TOUR",
+            vehicle_category_id=None, hotel_id=None, room_category_id=None,
+            tour_package_id=package.id,
+        )
     master = MasterBooking(
         booking_number=await next_master_booking_number(db),
         customer_id=customer_id,
@@ -2679,6 +2750,7 @@ async def create_public_booking(
         total_amount=total,
         coupon_code=payload.coupon_code.strip().upper() if payload.coupon_code else None,
         coupon_discount=discount,
+        offer_id=offer_id_used,
         payment_status="PAID" if payable == 0 else "PENDING",
         platform_commission=commission,
         partner_payout=payout,
@@ -2867,6 +2939,15 @@ async def care_create_tour(
     discount = validation.discount_amount if validation else Decimal("0.00")
     payable = total - discount
     end_date = payload.travel_start_date + timedelta(days=package.duration_days - 1)
+    offer_id_used = None
+    if validation:
+        from app.modules.admin.offer_service import resolve_offer_for_booking
+
+        offer_id_used = await resolve_offer_for_booking(
+            db, coupon_id=validation.coupon_id, service_type="TOUR",
+            vehicle_category_id=None, hotel_id=None, room_category_id=None,
+            tour_package_id=package.id,
+        )
     master = MasterBooking(
         booking_number=await next_master_booking_number(db),
         customer_id=customer_id,
@@ -2890,6 +2971,7 @@ async def care_create_tour(
         total_amount=total,
         coupon_code=payload.coupon_code.strip().upper() if payload.coupon_code else None,
         coupon_discount=discount,
+        offer_id=offer_id_used,
         payment_status="PAID" if payable == 0 else "PENDING",
         platform_commission=commission,
         partner_payout=payout,

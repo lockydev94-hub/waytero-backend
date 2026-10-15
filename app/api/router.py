@@ -33,6 +33,7 @@ from app.modules.partner.booking_api import router as partner_booking_router
 from app.modules.partner.wallet_api import router as partner_wallet_router
 from app.modules.partner.gst_api import router as partner_gst_router
 from app.modules.partner.hotel_booking_api import router as partner_hotel_booking_router
+from app.modules.partner.offer_api import router as partner_offer_router
 from app.modules.admin.payment_api import router as admin_payment_router
 from app.modules.hotel.admin_api import router as admin_hotel_router
 from app.modules.notification.api import router as notification_router
@@ -54,6 +55,8 @@ from app.modules.admin.email_api import router as admin_email_router
 from app.modules.admin.public_cab_api import router as public_cab_router
 from app.modules.admin.public_hotel_api import router as public_hotel_router
 from app.modules.admin.public_coupon_api import router as public_coupon_router
+from app.modules.admin.offer_api import router as admin_offer_router
+from app.modules.admin.public_offer_api import router as public_offer_router
 from app.modules.admin.landing_page_api import router as admin_landing_router
 from app.modules.admin.public_landing_api import router as public_landing_router
 from app.modules.admin.public_availability import router as public_availability_router
@@ -133,6 +136,14 @@ api_router.include_router(
     coupon_router,
     prefix="/admin/coupons",
     tags=["Coupons"],
+    dependencies=[Depends(require_roles(*SUPER_OR_ADMIN))],
+)
+
+# --- Offers (coupon-backed marketing) ---
+api_router.include_router(
+    admin_offer_router,
+    prefix="/admin/offers",
+    tags=["Offers"],
     dependencies=[Depends(require_roles(*SUPER_OR_ADMIN))],
 )
 
@@ -262,6 +273,11 @@ api_router.include_router(
     partner_hotel_booking_router, prefix="/partners", tags=["Partner Hotel Bookings"]
 )
 
+# --- Partner Offers (My Offers: room types + exit requests) ---
+api_router.include_router(
+    partner_offer_router, prefix="/partners/offers", tags=["Partner Offers"]
+)
+
 # --- Admin Payments ---
 api_router.include_router(
     admin_payment_router,
@@ -327,6 +343,7 @@ api_router.include_router(
 api_router.include_router(
     public_coupon_router, prefix="/public/coupon", tags=["Public Coupons"]
 )
+api_router.include_router(public_offer_router, prefix="/public", tags=["Public Offers"])
 
 # --- Tour Packages ---
 api_router.include_router(

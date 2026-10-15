@@ -228,6 +228,10 @@ class CreateHotelBookingIn(BaseModel):
     estimated_amount: Optional[float] = None
     coupon_code: Optional[str] = None
     coupon_id: Optional[int] = None
+    # Offer attribution hint (migration 0077) — the server resolves the real
+    # offer from the validated coupon + booking target; a forged slug is
+    # ignored, never trusted.
+    offer_slug: Optional[str] = None
 
 
 # ============================================================
@@ -1337,6 +1341,7 @@ async def create_hotel_booking(
     coupon_discount_applied = _HZERO
     coupon_id_used: Optional[int] = None
     coupon_code_used: Optional[str] = None
+    offer_id_used: Optional[int] = None
     if body.coupon_code:
         from app.modules.admin.coupon_api import (
             ValidateRequest,
@@ -1368,6 +1373,9 @@ async def create_hotel_booking(
                 # Server-side fulfilling partner for partner-funded coupons
                 # (migration 0075) — never taken from the client.
                 partner_id=hotel.get("partner_id"),
+                # Offer scope (migration 0077): server-owned booking target.
+                hotel_id=body.hotel_id,
+                hotel_room_category_id=body.room_category_id,
             ),
             db,
             reserve=True,
@@ -1380,17 +1388,29 @@ async def create_hotel_booking(
         coupon_discount_applied = Decimal(str(vres.discount_amount))
         coupon_code_used = body.coupon_code.upper().strip()
         coupon_id_used = vres.coupon_id
+        from app.modules.admin.offer_service import resolve_offer_for_booking
+
+        offer_id_used = await resolve_offer_for_booking(
+            db,
+            coupon_id=coupon_id_used,
+            service_type="HOTEL",
+            vehicle_category_id=None,
+            hotel_id=body.hotel_id,
+            room_category_id=body.room_category_id,
+            tour_package_id=None,
+        )
 
     if coupon_id_used:
         await db.execute(
             text(
                 "UPDATE hotel_reservations "
-                "SET coupon_code = :code, coupon_discount = :disc "
+                "SET coupon_code = :code, coupon_discount = :disc, offer_id = :offer "
                 "WHERE id = :rid"
             ),
             {
                 "code": coupon_code_used,
                 "disc": coupon_discount_applied,
+                "offer": offer_id_used,
                 "rid": res_id,
             },
         )

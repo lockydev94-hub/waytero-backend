@@ -157,6 +157,8 @@ class TourBooking(Base):
     coupon_discount = Column(
         Numeric(12, 2), nullable=False, default=Decimal("0.00"), server_default="0"
     )
+    # Offer attribution (migration 0077) — server-resolved, never client input.
+    offer_id = Column(BigInteger, ForeignKey("offers.id"), nullable=True)
     platform_commission = Column(
         Numeric(12, 2), nullable=False, default=Decimal("0.00")
     )

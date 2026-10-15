@@ -19,7 +19,7 @@ from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import select, func, and_, desc
+from sqlalchemy import select, func, and_, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -270,6 +270,10 @@ class BookingDetail(BaseModel):
         None  # "PENDING" | "ACCEPTED" | "REJECTED" | "TIMEOUT" | None
     )
     pending_partner_id: Optional[int] = None
+    # Offer + coupon snapshot for the accept banner / detail rows
+    # (migration 0077). coupon is None when the booking has no coupon.
+    offer: Optional[dict] = None
+    coupon: Optional[dict] = None
 
 
 class AssignDriverRequest(BaseModel):
@@ -801,6 +805,49 @@ async def get_partner_booking_detail(
         )
     )
     coupon_discount_val = float(coupon_q.scalar() or 0)
+
+    # Offer + coupon snapshot for the accept banner (migration 0077).
+    offer_info = None
+    if getattr(cb, "offer_id", None):
+        orow = (
+            (
+                await db.execute(
+                    text("SELECT title, slug, image_url FROM offers WHERE id = :oid"),
+                    {"oid": cb.offer_id},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if orow:
+            offer_info = dict(orow)
+    coupon_info = None
+    crow = (
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT co.coupon_code, cu.coupon_type, cu.discount_applied,
+                           cu.partner_share, cu.platform_share
+                    FROM coupon_usages cu JOIN coupons co ON co.id = cu.coupon_id
+                    WHERE cu.cab_booking_id = :cbid
+                    """
+                ),
+                {"cbid": cb.id},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if crow:
+        coupon_info = {
+            "code": crow["coupon_code"],
+            "type": crow["coupon_type"],
+            "discount_amount": float(crow["discount_applied"]),
+            "partner_share": float(crow["partner_share"]),
+            "platform_share": float(crow["platform_share"]),
+        }
+
     # Advance comes from advance_payments, not total_paid_amount — that field is
     # a running "paid so far" total and is overwritten at final payment.
     advance_row = await advance_service.get_active_advance(db, cb.id)
@@ -853,6 +900,8 @@ async def get_partner_booking_detail(
         payment_collected_by=cb.payment_collected_by,
         cash_pending_at=cb.cash_pending_at,
         coupon_discount=coupon_discount_val,
+        offer=offer_info,
+        coupon=coupon_info,
         advance_paid=advance_paid_val,
         advance=AdvanceInfo(**advance_summary_val) if advance_summary_val else None,
         invoice_number=cb.invoice_number,

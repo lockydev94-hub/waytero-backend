@@ -238,6 +238,54 @@ async def _sync_reservation_to_master(db: AsyncSession, hr: HotelReservation) ->
     await rollup_hotel_totals_into_master(db, hr.master_booking_id, mb)
 
 
+async def _offer_coupon_snapshot(db: AsyncSession, hr: HotelReservation) -> tuple:
+    """(offer, coupon) display snapshot for the accept banner / detail rows
+    (migration 0077). coupon_usages is the immutable financial truth."""
+    from sqlalchemy import text as _text
+
+    offer = None
+    if getattr(hr, "offer_id", None):
+        orow = (
+            (
+                await db.execute(
+                    _text("SELECT title, slug, image_url FROM offers WHERE id = :oid"),
+                    {"oid": hr.offer_id},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if orow:
+            offer = dict(orow)
+    coupon = None
+    crow = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT co.coupon_code, cu.coupon_type, cu.discount_applied,
+                           cu.partner_share, cu.platform_share
+                    FROM coupon_usages cu JOIN coupons co ON co.id = cu.coupon_id
+                    WHERE cu.hotel_reservation_id = :rid
+                    """
+                ),
+                {"rid": hr.id},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if crow:
+        coupon = {
+            "code": crow["coupon_code"],
+            "type": crow["coupon_type"],
+            "discount_amount": float(crow["discount_applied"]),
+            "partner_share": float(crow["partner_share"]),
+            "platform_share": float(crow["platform_share"]),
+        }
+    return offer, coupon
+
+
 async def _build_detail(
     hr: HotelReservation, db: AsyncSession, *, recompute_bill: bool = False
 ) -> dict:
@@ -340,6 +388,7 @@ async def _build_detail(
         if hr.actual_check_out_at is not None
         else None
     )
+    offer_snap, coupon_snap = await _offer_coupon_snapshot(db, hr)
 
     return {
         "id": hr.id,
@@ -373,6 +422,8 @@ async def _build_detail(
         "discount_amount": float(hr.discount_amount or 0),
         "coupon_code": hr.coupon_code,
         "coupon_discount": float(hr.coupon_discount or 0),
+        "offer": offer_snap,
+        "coupon": coupon_snap,
         # For a closed stay the recomputed bill (nights actually stayed) is
         # authoritative — legacy rows checked out before the recompute feature
         # stored the booked amount, which would disagree with what

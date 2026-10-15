@@ -65,6 +65,23 @@ from app.modules.auth.models.user import User
 from app.modules.tour.models import TourBooking, TourPackage
 
 
+async def _offer_brief(db: AsyncSession, offer_id: Optional[int]):
+    """Offer attribution (migration 0077) → (id, title, slug) or None."""
+    if not offer_id:
+        return None
+    row = (
+        (
+            await db.execute(
+                text("SELECT title, slug FROM offers WHERE id = :oid"),
+                {"oid": offer_id},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    return (offer_id, row["title"], row["slug"]) if row else None
+
+
 async def _customer_email_and_name(
     db: AsyncSession, customer_id: int
 ) -> tuple[str, Optional[str]]:
@@ -241,6 +258,10 @@ class CabBookingOut(BaseModel):
     acceptance_deadline: Optional[datetime] = None
     acceptance_status: Optional[str] = None
     partner_responded_at: Optional[datetime] = None
+    # Offer attribution (migration 0077) — badge on booking records.
+    offer_id: Optional[int] = None
+    offer_title: Optional[str] = None
+    offer_slug: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -264,6 +285,10 @@ class BookingListItem(BaseModel):
     cab_status: Optional[str]  # current cab booking status if any
     hotel_status: Optional[str]  # current hotel reservation status if any
     tour_status: Optional[str]  # current tour booking status if any
+    # Offer attribution (migration 0077) — badge on booking list rows.
+    offer_id: Optional[int] = None
+    offer_title: Optional[str] = None
+    offer_slug: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -328,6 +353,10 @@ class HotelBookingOut(BaseModel):
     # split so the detail-page Payment panel can itemise it like the bill.
     room_tariff: Optional[float] = None
     occupancy: Optional[dict] = None
+    # Offer attribution (migration 0077) — badge on booking records.
+    offer_id: Optional[int] = None
+    offer_title: Optional[str] = None
+    offer_slug: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -683,6 +712,7 @@ async def _build_cab_out(cb: CabBooking, db: AsyncSession) -> CabBookingOut:
     advance = advance_service.advance_summary(
         await advance_service.get_active_advance(db, cb.id)
     )
+    ob = await _offer_brief(db, cb.offer_id)
 
     return CabBookingOut(
         id=cb.id,
@@ -714,6 +744,9 @@ async def _build_cab_out(cb: CabBooking, db: AsyncSession) -> CabBookingOut:
         acceptance_deadline=cb.acceptance_deadline,
         acceptance_status=acceptance_status,
         partner_responded_at=cb.partner_responded_at,
+        offer_id=ob[0] if ob else None,
+        offer_title=ob[1] if ob else None,
+        offer_slug=ob[2] if ob else None,
     )
 
 
@@ -808,6 +841,7 @@ async def _build_hotel_out(hr: HotelReservation, db: AsyncSession) -> HotelBooki
         platform_tz_name = str(get_platform_tz_sync())
     except Exception:
         platform_tz_name = "Asia/Kolkata"
+    ob = await _offer_brief(db, getattr(hr, "offer_id", None))
     check_in_at_local = (
         to_platform_tz(hr.actual_check_in_at).isoformat()
         if hr.actual_check_in_at is not None
@@ -892,6 +926,9 @@ async def _build_hotel_out(hr: HotelReservation, db: AsyncSession) -> HotelBooki
         ),
         room_tariff=_room_tariff,
         occupancy=_occ_out,
+        offer_id=ob[0] if ob else None,
+        offer_title=ob[1] if ob else None,
+        offer_slug=ob[2] if ob else None,
     )
 
 
@@ -1104,6 +1141,38 @@ async def list_bookings(
     )
 
     # Enrich with customer + city names
+    # Offer attribution per master (migration 0077) — one query for the page.
+    offer_by_master: dict[int, tuple] = {}
+    mids = [mb.id for mb in rows]
+    if mids:
+        orows = (
+            (
+                await db.execute(
+                    text(
+                        """
+                        SELECT b.mbid, b.offer_id, o.title, o.slug FROM (
+                            SELECT master_booking_id AS mbid, offer_id FROM cab_bookings
+                              WHERE master_booking_id = ANY(CAST(:ids AS BIGINT[])) AND offer_id IS NOT NULL
+                            UNION ALL
+                            SELECT master_booking_id, offer_id FROM hotel_reservations
+                              WHERE master_booking_id = ANY(CAST(:ids AS BIGINT[])) AND offer_id IS NOT NULL
+                            UNION ALL
+                            SELECT master_booking_id, offer_id FROM tour_bookings
+                              WHERE master_booking_id = ANY(CAST(:ids AS BIGINT[])) AND offer_id IS NOT NULL
+                        ) b JOIN offers o ON o.id = b.offer_id
+                        """
+                    ),
+                    {"ids": mids},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        for r in orows:
+            offer_by_master.setdefault(
+                r["mbid"], (r["offer_id"], r["title"], r["slug"])
+            )
+
     items = []
     for mb in rows:
         cust = (
@@ -1151,6 +1220,7 @@ async def list_bookings(
             )
             tour_status = (await db.execute(tour_q)).scalar_one_or_none()
 
+        ob = offer_by_master.get(mb.id)
         items.append(
             BookingListItem(
                 id=mb.id,
@@ -1174,6 +1244,9 @@ async def list_bookings(
                 cab_status=cab_status,
                 hotel_status=hotel_status,
                 tour_status=tour_status,
+                offer_id=ob[0] if ob else None,
+                offer_title=ob[1] if ob else None,
+                offer_slug=ob[2] if ob else None,
                 created_at=mb.created_at,
             )
         )
@@ -1521,29 +1594,38 @@ async def get_booking(booking_id: int, db: AsyncSession = Depends(get_db)):
             .where(TourBooking.master_booking_id == booking_id)
         )
     ).all()
-    tour_outs = [
-        {
-            "id": tour.id,
-            "booking_number": tour.booking_number,
-            "package_id": tour.package_id,
-            "package_name": package_name,
-            "destination": destination,
-            "travel_start_date": (
-                tour.travel_start_date.isoformat() if tour.travel_start_date else None
-            ),
-            "travel_end_date": (
-                tour.travel_end_date.isoformat() if tour.travel_end_date else None
-            ),
-            "persons_count": tour.persons_count,
-            "total_amount": float(tour.total_amount or 0),
-            "platform_commission": float(tour.platform_commission or 0),
-            "partner_payout": float(tour.partner_payout or 0),
-            "payment_status": tour.payment_status,
-            "booking_status": tour.booking_status,
-            "special_requests": tour.special_requests,
-        }
-        for tour, package_name, destination in tour_rows
-    ]
+    tour_outs = []
+    for tour, package_name, destination in tour_rows:
+        tob = await _offer_brief(db, tour.offer_id)
+        tour_outs.append(
+            {
+                "id": tour.id,
+                "booking_number": tour.booking_number,
+                "package_id": tour.package_id,
+                "package_name": package_name,
+                "destination": destination,
+                "travel_start_date": (
+                    tour.travel_start_date.isoformat()
+                    if tour.travel_start_date
+                    else None
+                ),
+                "travel_end_date": (
+                    tour.travel_end_date.isoformat() if tour.travel_end_date else None
+                ),
+                "persons_count": tour.persons_count,
+                "total_amount": float(tour.total_amount or 0),
+                "coupon_code": tour.coupon_code,
+                "coupon_discount": float(tour.coupon_discount or 0),
+                "platform_commission": float(tour.platform_commission or 0),
+                "partner_payout": float(tour.partner_payout or 0),
+                "payment_status": tour.payment_status,
+                "booking_status": tour.booking_status,
+                "special_requests": tour.special_requests,
+                "offer_id": tob[0] if tob else None,
+                "offer_title": tob[1] if tob else None,
+                "offer_slug": tob[2] if tob else None,
+            }
+        )
 
     timeline = [
         {

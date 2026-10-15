@@ -40,6 +40,10 @@ class PublicCouponValidateIn(BaseModel):
     customer_id: int = 0  # 0 = not-yet-known; per-customer usage cap is skipped
     customer_mobile: Optional[str] = None
     hotel_id: Optional[int] = None
+    hotel_room_category_id: Optional[int] = None
+    # Offer scope (migration 0077): the room category is needed for the
+    # hotel+room-type coverage check inside validate_coupon. The client sends
+    # it for the preview; booking creation re-validates with server-owned ids.
     # For HOTEL previews of partner-funded coupons (migration 0075): the
     # fulfilling partner is resolved from this hotel server-side — a client
     # supplied partner_id would be forgeable.
@@ -76,6 +80,18 @@ async def public_validate_coupon(
                 {"hid": payload.hotel_id},
             )
         ).scalar()
+        if payload.hotel_room_category_id:
+            owns = (
+                await db.execute(
+                    text(
+                        "SELECT 1 FROM hotel_room_categories "
+                        "WHERE id = :rc AND hotel_id = :hid LIMIT 1"
+                    ),
+                    {"rc": payload.hotel_room_category_id, "hid": payload.hotel_id},
+                )
+            ).scalar()
+            if not owns:
+                payload.hotel_room_category_id = None
 
     tour_partner_id = None
     tour_city_id = None
@@ -106,6 +122,9 @@ async def public_validate_coupon(
             customer_id=payload.customer_id,
             customer_mobile=payload.customer_mobile,
             partner_id=hotel_partner_id if payload.hotel_id else tour_partner_id,
+            hotel_id=payload.hotel_id,
+            hotel_room_category_id=payload.hotel_room_category_id,
+            tour_package_id=payload.tour_package_id,
             pickup_datetime=payload.pickup_datetime,
             return_datetime=payload.return_datetime,
         ),

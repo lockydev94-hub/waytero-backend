@@ -162,6 +162,12 @@ class ValidateRequest(BaseModel):
     partner_id: int | None = Field(None, gt=0)
     pickup_datetime: datetime | None = None
     return_datetime: datetime | None = None
+    # Offer scope (migration 0077): when the coupon has a live offer for this
+    # service, the concrete booking target must be covered by that offer. These
+    # are resolved server-side by each caller (never trusted from the client).
+    hotel_id: int | None = Field(None, gt=0)
+    hotel_room_category_id: int | None = Field(None, gt=0)
+    tour_package_id: int | None = Field(None, gt=0)
 
 
 class ValidateResponse(BaseModel):
@@ -417,6 +423,15 @@ async def delete_coupon(coupon_id: int, db: AsyncSession = Depends(get_db)):
         raise ValidationException(
             "Deactivate coupons with redemption history instead of deleting them"
         )
+    if (
+        await db.execute(
+            text("SELECT 1 FROM offers WHERE coupon_id = :cid LIMIT 1"),
+            {"cid": coupon_id},
+        )
+    ).first():
+        raise ValidationException(
+            "Remove the linked offers before deleting this coupon"
+        )
     await db.delete(coupon)
 
 
@@ -480,6 +495,22 @@ async def validate_coupon(
         if city is None:
             return fail("Coupon not valid in your city")
         cap = city.max_discount_override
+    # Offer scope (migration 0077): when this coupon backs a live offer for the
+    # service, the concrete booking target must be covered by one of the offer
+    # links. Lazily imported to avoid a module cycle with offer_service.
+    from app.modules.admin import offer_service
+
+    scope_msg = await offer_service.booking_scope_block(
+        db,
+        coupon.id,
+        payload.service_type,
+        vehicle_category_id=payload.vehicle_category_id,
+        hotel_id=payload.hotel_id,
+        room_category_id=payload.hotel_room_category_id,
+        tour_package_id=payload.tour_package_id,
+    )
+    if scope_msg:
+        return fail(scope_msg)
     cohort = []
     if coupon.coupon_type in PARTNER_FUNDED_TYPES:
         joined = sorted(r.partner_id for r in coupon.partner_rules if r.is_active)

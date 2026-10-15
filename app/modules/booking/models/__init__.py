@@ -338,6 +338,8 @@ class CabBooking(Base):
         BigInteger, ForeignKey("coupons.id", ondelete="SET NULL"), nullable=True
     )
     coupon_discount = Column(Numeric(12, 2), nullable=True, default=Decimal("0.00"))
+    # Offer attribution (migration 0077) — server-resolved, never client input.
+    offer_id = Column(BigInteger, ForeignKey("offers.id"), nullable=True)
     # ── Vehicle breakdown / swap audit (added migration 0041) ────────────────
     # is_breakdown_swap is True once at least one swap has happened. swap_count
     # tracks how many. original_partner_id is set on the FIRST handover so the

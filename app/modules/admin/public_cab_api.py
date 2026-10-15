@@ -154,6 +154,10 @@ class CreateCabBookingIn(BaseModel):
     # Coupon id at preview time (optional, helps the server skip the lookup
     # when the FE already has it — e.g. after the validate-coupon call).
     coupon_id: Optional[int] = None
+    # Offer attribution hint (migration 0077) — the server resolves the real
+    # offer from the validated coupon + booking target; a forged slug is
+    # ignored, never trusted.
+    offer_slug: Optional[str] = None
 
 
 class PublicCityFareMatrixOut(BaseModel):
@@ -807,6 +811,7 @@ async def create_cab_booking(
     coupon_discount_applied = Decimal("0.00")
     coupon_id_used: Optional[int] = None
     coupon_code_used: Optional[str] = None
+    offer_id_used: Optional[int] = None
     if body.coupon_code:
         from app.modules.admin.coupon_api import (
             ValidateRequest,
@@ -854,6 +859,17 @@ async def create_cab_booking(
         coupon_discount_applied = Decimal(str(vres.discount_amount))
         coupon_code_used = body.coupon_code.upper().strip()
         coupon_id_used = vres.coupon_id
+        from app.modules.admin.offer_service import resolve_offer_for_booking
+
+        offer_id_used = await resolve_offer_for_booking(
+            db,
+            coupon_id=coupon_id_used,
+            service_type="CAB",
+            vehicle_category_id=body.vehicle_category_id,
+            hotel_id=None,
+            room_category_id=None,
+            tour_package_id=None,
+        )
 
     # 1. Insert master booking — total_amount is the pre-coupon fare so the
     # master row stays the "fare" view. The coupon discount is tracked on
@@ -899,7 +915,7 @@ async def create_cab_booking(
             pickup_location, pickup_latitude, pickup_longitude,
             drop_location, drop_latitude, drop_longitude,
             pickup_datetime, return_datetime, estimated_distance, estimated_amount,
-            coupon_code, coupon_id, coupon_discount,
+            coupon_code, coupon_id, coupon_discount, offer_id,
             booking_status, created_at
         ) VALUES (
             :uuid, :master_id, :booking_number,
@@ -907,7 +923,7 @@ async def create_cab_booking(
             :pickup_location, :pickup_lat, :pickup_lng,
             :drop_location, :drop_lat, :drop_lng,
             :pickup_datetime, :return_datetime, :distance, :estimated,
-            :coupon_code, :coupon_id, :coupon_discount,
+            :coupon_code, :coupon_id, :coupon_discount, :offer_id,
             'PENDING_ASSIGNMENT', NOW()
         )
     """
@@ -931,6 +947,7 @@ async def create_cab_booking(
             "coupon_code": coupon_code_used,
             "coupon_id": coupon_id_used,
             "coupon_discount": coupon_discount_applied,
+            "offer_id": offer_id_used,
         },
     )
 
