@@ -230,6 +230,12 @@ async def _booking_dict(
         ),
         "persons_count": booking.persons_count,
         "total_amount": float(booking.total_amount),
+        "coupon_code": booking.coupon_code,
+        "coupon_discount": float(booking.coupon_discount or 0),
+        "payable_amount": float(booking.payable_amount),
+        "balance_due": float(
+            max(booking.payable_amount - _q(booking.advance_total), 0)
+        ),
         "platform_commission": float(booking.platform_commission),
         "partner_payout": float(booking.partner_payout),
         "additional_amount": float(booking.additional_amount or 0),
@@ -461,7 +467,8 @@ async def build_invoice(db: AsyncSession, *, tour_booking_id: int) -> dict:
         partner_payout=float(booking.partner_payout),
         additional_amount=float(booking.additional_amount or 0),
         advance_total=float(paid),
-        balance_due=float(max(total - paid, 0)),
+        coupon_discount=float(booking.coupon_discount or 0),
+        balance_due=float(max(booking.payable_amount - paid, 0)),
         charges=[{"label": c.label, "amount": float(c.amount)} for c in charges],
         **await _platform_branding(db),
     )
@@ -569,7 +576,8 @@ async def build_itinerary(db: AsyncSession, *, tour_booking_id: int) -> dict:
         total_amount=float(total),
         additional_amount=float(booking.additional_amount or 0),
         advance_total=float(paid),
-        balance_due=float(max(total - paid, 0)),
+        coupon_discount=float(booking.coupon_discount or 0),
+        balance_due=float(max(booking.payable_amount - paid, 0)),
         invoice_number=booking.invoice_number,
         itinerary=itinerary,
         vehicle=vehicle,
@@ -592,7 +600,7 @@ def _ensure_manageable(booking: TourBooking) -> None:
 def _refresh_payment_status(booking: TourBooking) -> None:
     """Recompute payment_status from what has been collected vs the current
     total (which grows when charges are added or the trip is repriced)."""
-    total = _q(booking.total_amount)
+    total = _q(booking.payable_amount)
     paid = _q(booking.advance_total or 0)
     booking.payment_status = (
         "PAID" if paid >= total else ("PARTIAL" if paid > 0 else "PENDING")
@@ -658,7 +666,7 @@ async def collect_advance(
         raise BusinessException(
             "Advance amount must be positive", code="INVALID_AMOUNT"
         )
-    balance_due = max(_q(booking.total_amount) - _q(booking.advance_total or 0), 0)
+    balance_due = max(_q(booking.payable_amount) - _q(booking.advance_total or 0), 0)
     if amount_d > balance_due:
         raise BusinessException(
             f"Amount ₹{float(amount_d):,.2f} exceeds the outstanding balance of ₹{float(balance_due):,.2f}.",
@@ -707,7 +715,7 @@ async def collect_advance(
         "payment_mode": mode,
         "received_by": receiver,
         "advance_total": float(new_total),
-        "balance_after_advance": float(max(_q(booking.total_amount) - new_total, 0)),
+        "balance_after_advance": float(max(_q(booking.payable_amount) - new_total, 0)),
         "payment_status": booking.payment_status,
     }
 
@@ -943,6 +951,12 @@ async def update_trip(
         ),
         "persons_count": booking.persons_count,
         "total_amount": float(booking.total_amount),
+        "coupon_code": booking.coupon_code,
+        "coupon_discount": float(booking.coupon_discount or 0),
+        "payable_amount": float(booking.payable_amount),
+        "balance_due": float(
+            max(booking.payable_amount - _q(booking.advance_total), 0)
+        ),
         "platform_commission": float(booking.platform_commission),
         "partner_payout": float(booking.partner_payout),
         "pickup_location": booking.pickup_location,
@@ -1020,6 +1034,12 @@ async def add_charge(
         "label": label.strip(),
         "amount": float(amount_d),
         "total_amount": float(booking.total_amount),
+        "coupon_code": booking.coupon_code,
+        "coupon_discount": float(booking.coupon_discount or 0),
+        "payable_amount": float(booking.payable_amount),
+        "balance_due": float(
+            max(booking.payable_amount - _q(booking.advance_total), 0)
+        ),
         "platform_commission": float(booking.platform_commission),
         "partner_payout": float(booking.partner_payout),
     }
@@ -1106,7 +1126,35 @@ async def settle_booking(
     )
 
     payout = _q(booking.partner_payout)
-    net = (payout - partner_held).quantize(Q, rounding=ROUND_HALF_UP)
+    # Coupon funding: read the immutable redemption, never the editable coupon.
+    # The full discount is netted from the partner position here; the platform
+    # share is reimbursed later through pending_coupon_disbursements — same
+    # arithmetic as cab/hotel settlement (migration 0075).
+    from app.modules.admin.settlement_api import (
+        _coupon_funding_split,
+        _existing_coupon_disbursement,
+        _record_coupon_disbursement,
+    )
+
+    coupon_discount, coupon_platform_share, coupon_partner_share = (
+        await _coupon_funding_split(
+            db,
+            booking.master_booking_id,
+            service_type="TOUR",
+            service_id=booking.id,
+            coupon_discount=booking.coupon_discount,
+        )
+    )
+    funding = (coupon_discount, coupon_platform_share, coupon_partner_share)
+    existing_cpd = await _existing_coupon_disbursement(
+        db,
+        service_type="TOUR",
+        service_id=booking.id,
+        master_booking_id=booking.master_booking_id,
+        partner_id=partner_id,
+        funding=funding,
+    )
+    net = (payout - partner_held - coupon_discount).quantize(Q, rounding=ROUND_HALF_UP)
 
     wallet_row = (
         (
@@ -1136,7 +1184,16 @@ async def settle_booking(
     ref = booking.booking_number
     workings = (
         f"Payout ₹{float(payout):.2f} | Collected ₹{float(total_paid):.2f} "
-        f"(partner holds ₹{float(partner_held):.2f}) | Net = ₹{float(net):.2f}"
+        f"(partner holds ₹{float(partner_held):.2f}) | "
+        f"Coupon ₹{float(coupon_discount):.2f}"
+        + (
+            f" (platform ₹{float(coupon_platform_share):.2f} / "
+            f"partner ₹{float(coupon_partner_share):.2f})"
+            if coupon_partner_share > 0
+            else ""
+        )
+        + f" | Net = {float(payout):.2f} − {float(partner_held):.2f} "
+        f"− {float(coupon_discount):.2f} = ₹{float(net):.2f}"
     )
     new_bal = balance
     settlement_note = ""
@@ -1195,6 +1252,24 @@ async def settle_booking(
         )
     else:
         settlement_note = "No wallet movement — what the partner holds exactly matches what they are owed."
+
+    # Full coupon was netted above; reimburse only the platform share later.
+    _, coupon_note = await _record_coupon_disbursement(
+        db,
+        service_type="TOUR",
+        service_id=booking.id,
+        master_booking_id=booking.master_booking_id,
+        partner_id=partner_id,
+        customer_id=await db.scalar(
+            text("SELECT customer_id FROM master_bookings WHERE id = :mb"),
+            {"mb": booking.master_booking_id},
+        ),
+        booking_number=booking.booking_number,
+        invoice_number=booking.invoice_number,
+        funding=funding,
+        existing_id=existing_cpd,
+    )
+    settlement_note += coupon_note
 
     booking.booking_status = "SETTLED"
     booking.payment_status = "PAID"

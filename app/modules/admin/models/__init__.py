@@ -520,3 +520,95 @@ class AuditLog(Base):
         Index("idx_audit_entity", "entity_name", "entity_id"),
         Index("idx_audit_created_at", "created_at"),
     )
+
+
+class LandingPage(Base):
+    """
+    Admin-editable city / state × service-type marketing page.
+    Doc Ref: Migration 0069_landing_pages
+
+    One row per (page_type × scope). `slug` IS the whole URL segment on the
+    website's root [slug] engine, so `/hotel-booking-in-bhubaneswar` is one
+    row — the frontend never parses the slug to work out what it means.
+
+    page_type decides the scope column, the service_type and the URL
+    prefix; the three are locked together by DB CHECKs, so a row can't claim
+    to be a state cab page (cab fares are priced per city — there would be
+    no honest number to show).
+
+    Copy slots are NULL-means-derive: the service fills them from the scope
+    name, `service_types.label` and live counts. Never regenerate a slug when
+    a city or state is renamed — that would 404 every indexed URL.
+    """
+
+    __tablename__ = "landing_pages"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    slug = Column(String(120), nullable=False, unique=True)
+    page_type = Column(String(30), nullable=False)
+    city_id = Column(BigInteger, ForeignKey("cities.id", ondelete="CASCADE"))
+    state_id = Column(BigInteger, ForeignKey("states.id", ondelete="CASCADE"))
+    place_id = Column(BigInteger, ForeignKey("places.id", ondelete="CASCADE"))  # 0070
+    service_type = Column(String(20))
+    display_name = Column(String(150), nullable=False)
+
+    # Copy slots (NULL → derived template)
+    eyebrow = Column(String(100))
+    headline = Column(String(300))
+    subheadline = Column(String(500))
+    body_text = Column(Text)
+
+    # Banner / social imagery
+    banner_image_url = Column(Text)
+    banner_mobile_url = Column(Text)
+    banner_video_url = Column(Text)
+    banner_alt_text = Column(String(150))
+    og_image_url = Column(Text)
+    overlay_opacity = Column(Numeric(3, 2))
+
+    # Structured content
+    gallery = Column(JSONB, nullable=False, default=list)
+    highlights = Column(JSONB, nullable=False, default=list)
+    stats = Column(JSONB, nullable=False, default=list)
+    blocks = Column(JSONB, nullable=False, default=list)
+    faqs = Column(JSONB, nullable=False, default=list)
+
+    cta_text = Column(String(100))
+    cta_link = Column(String(500))
+    cta2_text = Column(String(100))
+    cta2_link = Column(String(500))
+
+    seo_title = Column(String(120))
+    seo_description = Column(String(320))
+    seo_keywords = Column(String(500))
+
+    is_published = Column(Boolean, nullable=False, default=False)
+    starts_at = Column(DateTime(timezone=True))
+    ends_at = Column(DateTime(timezone=True))
+    display_order = Column(Integer, nullable=False, default=0)
+
+    created_by_user_id = Column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    updated_by_user_id = Column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("uix_landing_pages_city_type", "page_type", "city_id", unique=True),
+        Index("uix_landing_pages_state_type", "page_type", "state_id", unique=True),
+        Index("idx_landing_pages_public", "is_published", "page_type", "display_order"),
+        Index("idx_landing_pages_city", "city_id"),
+        Index("idx_landing_pages_state", "state_id"),
+    )

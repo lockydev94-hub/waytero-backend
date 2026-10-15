@@ -45,6 +45,8 @@ from app.modules.admin.schemas import (
     ApiIntegrationOut,
     ApiIntegrationCreate,
     ApiIntegrationUpdate,
+    PlaceCreate,
+    PlaceUpdate,
     SettingsResponse,
     CityOut,
     CityCreate,
@@ -73,6 +75,7 @@ from app.modules.admin.services import (
     CmsService,
     DefaultPricingService,
 )
+from app.modules.admin.services.places import PlaceService
 from app.core.dependencies import require_permission
 
 from app.modules.admin.schemas import (
@@ -627,6 +630,50 @@ async def delete_city(city_id: int, db: AsyncSession = Depends(get_db)):
     if not deleted:
         raise HTTPException(status_code=404, detail="City not found")
     return SettingsResponse(message="City deleted")
+
+
+# ── Place Management (airports / railway stations — migration 0070) ──────────
+#  Doc Ref: Place-Level Landing Pages §Phase 1 (plan: rosy-vent-shrew)
+#  Creating a place provisions its PLACE_CABS landing page (unpublished);
+#  renaming never moves a live slug.
+
+
+@router.get("/master/places", response_model=List[dict], tags=["Master Data"])
+async def list_places(
+    city_id: Optional[int] = Query(None, ge=1),
+    active_only: bool = Query(False),
+    search: Optional[str] = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """Airports & railway stations with their city and landing-page state."""
+    return await PlaceService.list_all(
+        db, city_id=city_id, active_only=active_only, search=search
+    )
+
+
+@router.post(
+    "/master/places", response_model=dict, status_code=201, tags=["Master Data"]
+)
+async def create_place(payload: PlaceCreate, db: AsyncSession = Depends(get_db)):
+    """Create a place and provision its (unpublished) place landing page."""
+    return await PlaceService.create(db, payload)
+
+
+@router.patch("/master/places/{place_id}", response_model=dict, tags=["Master Data"])
+async def update_place(
+    place_id: int, payload: PlaceUpdate, db: AsyncSession = Depends(get_db)
+):
+    return await PlaceService.update(db, place_id, payload)
+
+
+@router.delete(
+    "/master/places/{place_id}",
+    response_model=SettingsResponse,
+    tags=["Master Data"],
+)
+async def delete_place(place_id: int, db: AsyncSession = Depends(get_db)):
+    await PlaceService.delete(db, place_id)
+    return SettingsResponse(message="Place deleted")
 
 
 # ── Geocode helper for the City editor ───────────────────────────────────────

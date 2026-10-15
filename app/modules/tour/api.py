@@ -13,7 +13,7 @@ from typing import Any, Optional
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import desc, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -56,6 +56,10 @@ class PricingIn(BaseModel):
 class PackageIn(BaseModel):
     partner_id: Optional[int] = None
     package_name: str = Field(min_length=3, max_length=255)
+    slug: Optional[str] = Field(default=None, max_length=120)
+    seo_title: Optional[str] = Field(default=None, max_length=120)
+    seo_description: Optional[str] = Field(default=None, max_length=320)
+    seo_keywords: Optional[str] = Field(default=None, max_length=500)
     package_type: str = "FIXED"
     destination: str = Field(min_length=2, max_length=255)
     city_id: int
@@ -72,9 +76,24 @@ class PackageIn(BaseModel):
     pricing: list[PricingIn] = Field(default_factory=list)
     media: list[dict[str, Any]] = Field(default_factory=list)
 
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug(cls, v: Optional[str]) -> Optional[str]:
+        from app.modules.hotel.validators import SLUG_REGEX
+
+        if v is not None and not SLUG_REGEX.match(v):
+            raise ValueError(
+                "slug must be lowercase letters, digits and single hyphens"
+            )
+        return v
+
 
 class PackageUpdate(BaseModel):
     package_name: Optional[str] = Field(default=None, min_length=3, max_length=255)
+    slug: Optional[str] = Field(default=None, max_length=120)
+    seo_title: Optional[str] = Field(default=None, max_length=120)
+    seo_description: Optional[str] = Field(default=None, max_length=320)
+    seo_keywords: Optional[str] = Field(default=None, max_length=500)
     package_type: Optional[str] = None
     destination: Optional[str] = None
     city_id: Optional[int] = None
@@ -90,6 +109,17 @@ class PackageUpdate(BaseModel):
     exclusions: Optional[list[str]] = None
     pricing: Optional[list[PricingIn]] = None
     media: Optional[list[dict[str, Any]]] = None
+
+    @field_validator("slug")
+    @classmethod
+    def _validate_slug(cls, v: Optional[str]) -> Optional[str]:
+        from app.modules.hotel.validators import SLUG_REGEX
+
+        if v is not None and not SLUG_REGEX.match(v):
+            raise ValueError(
+                "slug must be lowercase letters, digits and single hyphens"
+            )
+        return v
 
 
 class StatusIn(BaseModel):
@@ -111,7 +141,13 @@ class BookingIn(BaseModel):
     travel_start_date: date
     persons_count: int = Field(ge=1)
     special_requests: Optional[str] = None
+    coupon_code: Optional[str] = Field(default=None, max_length=50)
     participants: list[ParticipantIn] = Field(default_factory=list)
+
+    @field_validator("coupon_code")
+    @classmethod
+    def _normalize_coupon(cls, value: Optional[str]) -> Optional[str]:
+        return value.strip().upper() or None if value is not None else None
 
 
 class TourAdvanceIn(BaseModel):
@@ -166,6 +202,37 @@ async def _customer_id(db: AsyncSession, user: dict) -> Optional[int]:
     return await db.scalar(select(Customer.id).where(Customer.user_id == actor))
 
 
+async def _validate_booking_coupon(
+    db: AsyncSession, *, code: Optional[str], customer_id: int,
+    package: TourPackage, total: Decimal,
+):
+    if not code:
+        return None
+    from app.modules.admin.coupon_api import ValidateRequest, validate_coupon
+
+    mobile = await db.scalar(
+        select(User.mobile)
+        .join(Customer, Customer.user_id == User.id)
+        .where(Customer.id == customer_id)
+    )
+    validation = await validate_coupon(
+        ValidateRequest(
+            coupon_code=code,
+            service_type="TOUR",
+            city_id=package.city_id,
+            booking_amount=total,
+            customer_id=customer_id,
+            customer_mobile=mobile,
+            partner_id=package.partner_id,
+        ),
+        db,
+        reserve=True,
+    )
+    if not validation.valid:
+        raise HTTPException(400, validation.message)
+    return validation
+
+
 def _slug(name: str, code: str) -> str:
     """SEO-friendly, unique slug for a tour package.
 
@@ -179,7 +246,9 @@ def _slug(name: str, code: str) -> str:
     return base
 
 
-async def _unique_slug(db: AsyncSession, base: str, exclude_id: int | None = None) -> str:
+async def _unique_slug(
+    db: AsyncSession, base: str, exclude_id: int | None = None
+) -> str:
     """Return ``base``, or ``base-2``/``base-3``… until unique among packages."""
     candidate = base
     suffix = 2
@@ -193,6 +262,18 @@ async def _unique_slug(db: AsyncSession, base: str, exclude_id: int | None = Non
         if exclude_id is not None:
             q = q.where(TourPackage.id != exclude_id)
     return candidate
+
+
+async def _ensure_slug_unique(
+    db: AsyncSession, slug: str, exclude_id: int | None = None
+) -> None:
+    from app.core.exceptions import DuplicateResourceException
+
+    q = select(TourPackage.id).where(TourPackage.slug == slug)
+    if exclude_id is not None:
+        q = q.where(TourPackage.id != exclude_id)
+    if (await db.scalar(q.limit(1))) is not None:
+        raise DuplicateResourceException("Tour package", "slug")
 
 
 async def _new_code(db: AsyncSession) -> str:
@@ -318,6 +399,9 @@ async def _package_payload(
         "package_code": package.package_code,
         "slug": package.slug,
         "package_name": package.package_name,
+        "seo_title": package.seo_title,
+        "seo_description": package.seo_description,
+        "seo_keywords": package.seo_keywords,
         "package_type": package.package_type,
         "destination": package.destination,
         "city_id": package.city_id,
@@ -401,11 +485,16 @@ async def _save_package(
     status_value: str,
 ) -> TourPackage:
     code = await _new_code(db)
+    slug = payload.slug or await _unique_slug(db, _slug(payload.package_name, code))
+    await _ensure_slug_unique(db, slug)
     package = TourPackage(
         partner_id=partner_id,
         package_code=code,
-        slug=await _unique_slug(db, _slug(payload.package_name, code)),
+        slug=slug,
         package_name=payload.package_name,
+        seo_title=payload.seo_title,
+        seo_description=payload.seo_description,
+        seo_keywords=payload.seo_keywords,
         package_type=payload.package_type.upper(),
         destination=payload.destination,
         city_id=payload.city_id,
@@ -489,6 +578,7 @@ async def _list_packages(
     partner_id: Optional[int] = None,
     search: Optional[str] = None,
     city_id: Optional[int] = None,
+    state_id: Optional[int] = None,
     include_private: bool = True,
 ) -> list[dict[str, Any]]:
     stmt = select(TourPackage).order_by(desc(TourPackage.created_at))
@@ -498,6 +588,12 @@ async def _list_packages(
         stmt = stmt.where(TourPackage.partner_id == partner_id)
     if city_id is not None:
         stmt = stmt.where(TourPackage.city_id == city_id)
+    if state_id is not None:
+        # Packages are keyed to a city, so a state filter has to walk through
+        # cities — tour_packages has no state_id column.
+        stmt = stmt.where(
+            TourPackage.city_id.in_(select(City.id).where(City.state_id == state_id))
+        )
     if search:
         term = f"%{search.strip()}%"
         stmt = stmt.where(
@@ -644,10 +740,10 @@ async def admin_update_package(
     )
     for key, value in values.items():
         setattr(package, key, value)
-    if payload.package_name:
-        package.slug = await _unique_slug(
-            db, _slug(payload.package_name, package.package_code), package.id
-        )
+    # Slug NEVER auto-regenerates on rename — that silently breaks published
+    # URLs/SEO. It changes only when explicitly provided (validated unique).
+    if "slug" in values and values["slug"]:
+        await _ensure_slug_unique(db, values["slug"], package.id)
     if any(
         x is not None
         for x in (
@@ -844,6 +940,9 @@ async def admin_booking_detail(
         "travel_end_date": tour.travel_end_date,
         "persons_count": tour.persons_count,
         "total_amount": float(tour.total_amount),
+        "coupon_code": tour.coupon_code,
+        "coupon_discount": float(tour.coupon_discount or 0),
+        "payable_amount": float(tour.payable_amount),
         "platform_commission": float(tour.platform_commission),
         "partner_payout": float(tour.partner_payout),
         "payment_status": tour.payment_status,
@@ -1330,10 +1429,10 @@ async def partner_update_package(
     )
     for key, value in values.items():
         setattr(package, key, value)
-    if payload.package_name:
-        package.slug = await _unique_slug(
-            db, _slug(payload.package_name, package.package_code), package.id
-        )
+    # Slug NEVER auto-regenerates on rename — that silently breaks published
+    # URLs/SEO. It changes only when explicitly provided (validated unique).
+    if "slug" in values and values["slug"]:
+        await _ensure_slug_unique(db, values["slug"], package.id)
     if any(
         x is not None
         for x in (
@@ -1591,6 +1690,9 @@ async def partner_tour_booking_detail(
         "travel_end_date": tour.travel_end_date,
         "persons_count": tour.persons_count,
         "total_amount": float(tour.total_amount),
+        "coupon_code": tour.coupon_code,
+        "coupon_discount": float(tour.coupon_discount or 0),
+        "payable_amount": float(tour.payable_amount),
         "platform_commission": float(tour.platform_commission),
         "partner_payout": float(tour.partner_payout),
         "payment_status": tour.payment_status,
@@ -2140,41 +2242,87 @@ async def partner_tour_stats(
 
 
 @public_router.get("/popular-destinations")
-async def public_popular_destinations(db: AsyncSession = Depends(get_db)):
-    """Top 6 cities with the most ACTIVE tour packages — used by the customer
-    homepage destinations grid and the listing page sidebar."""
+async def public_popular_destinations(
+    limit: int = Query(
+        6,
+        ge=1,
+        le=300,
+        description=(
+            "Cities to return. Default 6 (the homepage grid); the website's "
+            "landing-page feeds pass a higher value."
+        ),
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    """Cities with the most ACTIVE tour packages — homepage grid, listing
+    sidebar, and the tour landing pages' destination index.
+
+    Was hard-capped at 6, which silently capped how many /tour-packages-in-*
+    pages could exist at all. The cap is now a parameter; the default keeps
+    the homepage's behaviour byte-for-byte.
+
+    One query, including the representative image: the per-city media lookup
+    used to be a scalar subquery per row, so a 300-city feed cost 300
+    round trips.
+    """
     rows = (
-        await db.execute(
-            select(City.id, City.name, func.count(TourPackage.id).label("cnt"))
-            .join(TourPackage, TourPackage.city_id == City.id)
-            .where(TourPackage.status == "ACTIVE", City.is_active.is_(True))
-            .group_by(City.id, City.name)
-            .order_by(desc("cnt"), City.name)
-            .limit(6)
-        )
-    ).all()
-    items = []
-    for cid, name, cnt in rows:
-        # Pull a representative primary image from any package in this city
-        media_url = await db.scalar(
-            select(TourPackageMedia.media_url)
-            .join(TourPackage, TourPackage.id == TourPackageMedia.package_id)
-            .where(
-                TourPackage.city_id == cid,
-                TourPackage.status == "ACTIVE",
-                TourPackageMedia.is_primary.is_(True),
+        (
+            await db.execute(
+                text(
+                    """
+            SELECT d.city_id, d.name, d.state_id, d.state_name,
+                   d.package_count, d.from_price, img.media_url AS image_url
+              FROM (
+                SELECT c.id                AS city_id,
+                       c.name              AS name,
+                       st.id               AS state_id,
+                       st.name             AS state_name,
+                       COUNT(DISTINCT tp.id) AS package_count,
+                       MIN(p.package_price) AS from_price
+                  FROM cities c
+                  JOIN states st        ON st.id = c.state_id
+                  JOIN tour_packages tp ON tp.city_id = c.id
+                       AND tp.status = 'ACTIVE'
+             LEFT JOIN tour_package_pricing p ON p.package_id = tp.id
+                 WHERE c.is_active = TRUE
+                 GROUP BY c.id, c.name, st.id, st.name
+                 ORDER BY package_count DESC, c.name
+                 LIMIT :limit
+              ) d
+              LEFT JOIN LATERAL (
+                SELECT m.media_url
+                  FROM tour_package_media m
+                  JOIN tour_packages tp2 ON tp2.id = m.package_id
+                 WHERE tp2.city_id = d.city_id
+                   AND tp2.status = 'ACTIVE'
+                   AND m.media_url IS NOT NULL
+                 ORDER BY (m.is_primary IS NOT TRUE), tp2.created_at DESC
+                 LIMIT 1
+              ) img ON TRUE
+             ORDER BY d.package_count DESC, d.name
+            """
+                ),
+                {"limit": limit},
             )
-            .order_by(desc(TourPackage.created_at))
-            .limit(1)
         )
-        items.append(
-            {
-                "city_id": cid,
-                "name": name,
-                "package_count": int(cnt),
-                "image_url": media_url,
-            }
-        )
+        .mappings()
+        .all()
+    )
+
+    items = [
+        {
+            "city_id": int(r["city_id"]),
+            "name": r["name"],
+            "package_count": int(r["package_count"]),
+            "image_url": r["image_url"],
+            "state_id": int(r["state_id"]),
+            "state_name": r["state_name"],
+            "from_price": (
+                float(r["from_price"]) if r["from_price"] is not None else None
+            ),
+        }
+        for r in rows
+    ]
     return {"items": items}
 
 
@@ -2251,6 +2399,7 @@ async def public_tour_suggestions(
 async def public_packages(
     destination: Optional[str] = None,
     city_id: Optional[int] = None,
+    state_id: Optional[int] = None,
     persons: Optional[int] = None,
     duration: Optional[str] = None,
     min_price: Optional[float] = None,
@@ -2266,6 +2415,7 @@ async def public_packages(
         statuses=["ACTIVE"],
         search=destination,
         city_id=city_id,
+        state_id=state_id,
         include_private=False,
     )
     if duration:
@@ -2497,6 +2647,14 @@ async def create_public_booking(
     if len(payload.participants) > payload.persons_count:
         raise HTTPException(422, "Participant list cannot exceed traveller count")
     total, commission, payout, _ = await _price_for(db, package, payload.persons_count)
+    # Reserve before any booking writes; the shared helper records funding
+    # under this lock in the same transaction, without committing internally.
+    validation = await _validate_booking_coupon(
+        db, code=payload.coupon_code, customer_id=customer_id,
+        package=package, total=total,
+    )
+    discount = validation.discount_amount if validation else Decimal("0.00")
+    payable = total - discount
     end_date = payload.travel_start_date + timedelta(days=package.duration_days - 1)
     master = MasterBooking(
         booking_number=await next_master_booking_number(db),
@@ -2519,6 +2677,9 @@ async def create_public_booking(
         travel_end_date=end_date,
         persons_count=payload.persons_count,
         total_amount=total,
+        coupon_code=payload.coupon_code.strip().upper() if payload.coupon_code else None,
+        coupon_discount=discount,
+        payment_status="PAID" if payable == 0 else "PENDING",
         platform_commission=commission,
         partner_payout=payout,
         special_requests=payload.special_requests,
@@ -2536,6 +2697,17 @@ async def create_public_booking(
     )
     for p in payload.participants:
         db.add(TourParticipant(tour_booking_id=tour.id, **p.model_dump()))
+    if validation:
+        from app.modules.admin.coupon_api import record_coupon_usage
+
+        await record_coupon_usage(
+            db, validation=validation, customer_id=customer_id,
+            master_booking_id=master.id, tour_booking_id=tour.id,
+        )
+    if payable == 0:
+        master.payment_status = "PAID"
+    # Financial writes must succeed before any outbound notification.
+    await db.flush()
 
     # ── Realtime: notify admins (accept modal) + the package's partner ──
     # The package's owner partner is the FIXED assignee for tour bookings —
@@ -2561,7 +2733,7 @@ async def create_public_booking(
                 "package_name": package.package_name,
                 "travel_start_date": payload.travel_start_date.isoformat(),
                 "persons_count": payload.persons_count,
-                "amount": float(total),
+                "amount": float(payable),
             },
         )
         if package.partner_id:
@@ -2574,7 +2746,7 @@ async def create_public_booking(
                 package_name=package.package_name or "",
                 travel_start_date=payload.travel_start_date.isoformat(),
                 persons_count=payload.persons_count,
-                total_amount=float(total),
+                total_amount=float(payable),
             )
     except Exception:  # pragma: no cover - never block the booking
         pass
@@ -2621,7 +2793,7 @@ async def create_public_booking(
                         ("Travel end", end_date.strftime("%d %b %Y")),
                         ("Travellers", str(payload.persons_count)),
                     ],
-                    "amount": float(total),
+                    "amount": float(payable),
                     "amount_label": "Tour fare",
                 },
                 related_type="TOUR_BOOKING",
@@ -2639,6 +2811,9 @@ async def create_public_booking(
         "travel_end_date": tour.travel_end_date,
         "persons_count": tour.persons_count,
         "total_amount": float(total),
+        "coupon_code": tour.coupon_code,
+        "coupon_discount": float(discount),
+        "payable_amount": float(payable),
         "booking_status": tour.booking_status,
         "payment_status": tour.payment_status,
     }
@@ -2683,6 +2858,14 @@ async def care_create_tour(
     if not package:
         raise HTTPException(404, "Active tour package not found")
     total, commission, payout, _ = await _price_for(db, package, payload.persons_count)
+    # Reserve before any booking writes; the shared helper records funding
+    # under this lock in the same transaction, without committing internally.
+    validation = await _validate_booking_coupon(
+        db, code=payload.coupon_code, customer_id=customer_id,
+        package=package, total=total,
+    )
+    discount = validation.discount_amount if validation else Decimal("0.00")
+    payable = total - discount
     end_date = payload.travel_start_date + timedelta(days=package.duration_days - 1)
     master = MasterBooking(
         booking_number=await next_master_booking_number(db),
@@ -2705,6 +2888,9 @@ async def care_create_tour(
         travel_end_date=end_date,
         persons_count=payload.persons_count,
         total_amount=total,
+        coupon_code=payload.coupon_code.strip().upper() if payload.coupon_code else None,
+        coupon_discount=discount,
+        payment_status="PAID" if payable == 0 else "PENDING",
         platform_commission=commission,
         partner_payout=payout,
         booking_status="CONFIRMED",
@@ -2723,10 +2909,24 @@ async def care_create_tour(
     )
     for p in payload.participants:
         db.add(TourParticipant(tour_booking_id=tour.id, **p.model_dump()))
+    if validation:
+        from app.modules.admin.coupon_api import record_coupon_usage
+
+        await record_coupon_usage(
+            db, validation=validation, customer_id=customer_id,
+            master_booking_id=master.id, tour_booking_id=tour.id,
+        )
+    if payable == 0:
+        master.payment_status = "PAID"
+    # Financial writes must succeed before any outbound notification.
+    await db.flush()
     return {
         "id": tour.id,
         "booking_number": tour.booking_number,
         "master_booking_number": master.booking_number,
         "total_amount": float(total),
+        "coupon_code": tour.coupon_code,
+        "coupon_discount": float(discount),
+        "payable_amount": float(payable),
         "booking_status": tour.booking_status,
     }

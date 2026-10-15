@@ -10,6 +10,7 @@ from decimal import Decimal
 from typing import Optional, List, Any, Dict
 from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
+from app.shared.utilities.seo import SlugValidatorMixin
 
 
 # ── System Configuration ──────────────────────────────────────────────────────
@@ -327,6 +328,56 @@ class StateOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# ── Place (airport / railway station — migration 0070) ───────────────────────
+
+
+class PlaceOut(BaseModel):
+    id: int
+    city_id: int
+    kind: str
+    name: str
+    code: Optional[str]
+    address: Optional[str]
+    latitude: Optional[float]
+    longitude: Optional[float]
+    is_active: bool
+    seo_title: Optional[str]
+    seo_description: Optional[str]
+    seo_keywords: Optional[str]
+    city_name: Optional[str] = None  # populated manually in service
+    page_slug: Optional[str] = None  # its PLACE_CABS landing page, if any
+    page_published: Optional[bool] = None
+
+    model_config = {"from_attributes": True}
+
+
+class PlaceCreate(BaseModel):
+    city_id: int
+    kind: str = Field(..., pattern="^(AIRPORT|RAILWAY_STATION)$")
+    name: str = Field(..., max_length=200)
+    code: Optional[str] = Field(None, max_length=10)
+    address: Optional[str] = None
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    is_active: bool = True
+    seo_title: Optional[str] = Field(None, max_length=120)
+    seo_description: Optional[str] = Field(None, max_length=320)
+    seo_keywords: Optional[str] = Field(None, max_length=500)
+
+
+class PlaceUpdate(BaseModel):
+    kind: Optional[str] = Field(None, pattern="^(AIRPORT|RAILWAY_STATION)$")
+    name: Optional[str] = Field(None, max_length=200)
+    code: Optional[str] = Field(None, max_length=10)
+    address: Optional[str] = None
+    latitude: Optional[float] = Field(None, ge=-90, le=90)
+    longitude: Optional[float] = Field(None, ge=-180, le=180)
+    is_active: Optional[bool] = None
+    seo_title: Optional[str] = Field(None, max_length=120)
+    seo_description: Optional[str] = Field(None, max_length=320)
+    seo_keywords: Optional[str] = Field(None, max_length=500)
+
+
 # ── Vehicle Category ──────────────────────────────────────────────────────────
 
 
@@ -335,6 +386,7 @@ class VehicleCategoryOut(BaseModel):
 
     id: int
     category_name: str
+    slug: Optional[str] = None
     seating_capacity: Optional[int]
     luggage_capacity: Optional[int]
     is_active: bool
@@ -351,8 +403,9 @@ class VehicleCategoryOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class VehicleCategoryCreate(BaseModel):
+class VehicleCategoryCreate(SlugValidatorMixin, BaseModel):
     category_name: str = Field(..., max_length=100)
+    slug: Optional[str] = Field(None, max_length=120)
     seating_capacity: Optional[int] = Field(None, ge=1)
     luggage_capacity: Optional[int] = Field(None, ge=0)
     is_active: bool = True
@@ -366,8 +419,9 @@ class VehicleCategoryCreate(BaseModel):
     display_order: int = 0
 
 
-class VehicleCategoryUpdate(BaseModel):
+class VehicleCategoryUpdate(SlugValidatorMixin, BaseModel):
     category_name: Optional[str] = Field(None, max_length=100)
+    slug: Optional[str] = Field(None, max_length=120)
     seating_capacity: Optional[int] = Field(None, ge=1)
     luggage_capacity: Optional[int] = Field(None, ge=0)
     is_active: Optional[bool] = None
@@ -462,6 +516,7 @@ class ServiceTypeOut(BaseModel):
     id: int
     type_code: str
     label: str
+    slug: Optional[str] = None
     description: Optional[str] = None
     icon_url: Optional[str] = None
     image_url: Optional[str] = None
@@ -475,10 +530,11 @@ class ServiceTypeOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class ServiceTypeUpdate(BaseModel):
+class ServiceTypeUpdate(SlugValidatorMixin, BaseModel):
     """Admins may update everything except type_code (immutable business key)."""
 
     label: Optional[str] = Field(None, max_length=150)
+    slug: Optional[str] = Field(None, max_length=120)
     description: Optional[str] = None
     icon_url: Optional[str] = None
     image_url: Optional[str] = None
@@ -489,11 +545,12 @@ class ServiceTypeUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class ServiceTypeCreate(BaseModel):
+class ServiceTypeCreate(SlugValidatorMixin, BaseModel):
     """Create a brand-new platform service type."""
 
     type_code: str = Field(..., min_length=2, max_length=50, pattern=r"^[A-Z0-9_]+$")
     label: str = Field(..., min_length=1, max_length=150)
+    slug: Optional[str] = Field(None, max_length=120)
     description: Optional[str] = None
     icon_url: Optional[str] = None
     image_url: Optional[str] = None
@@ -855,6 +912,11 @@ class BlogPostListOut(BaseModel):
     tags: list[str] = []
     is_published: bool = False
     published_at: Optional[datetime] = None
+    # SEO summary — lets the list show an SEO-readiness badge without
+    # shipping the post body to every row.
+    seo_title: Optional[str] = None
+    seo_description: Optional[str] = None
+    seo_keywords: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
@@ -879,8 +941,8 @@ class BlogPostCreate(BaseModel):
     tags: Optional[list[str]] = None
     is_published: bool = False
     published_at: Optional[datetime] = None
-    seo_title: Optional[str] = Field(None, max_length=300)
-    seo_description: Optional[str] = Field(None, max_length=500)
+    seo_title: Optional[str] = Field(None, max_length=120)
+    seo_description: Optional[str] = Field(None, max_length=320)
     seo_keywords: Optional[str] = Field(None, max_length=500)
 
 
@@ -902,6 +964,6 @@ class BlogPostUpdate(BaseModel):
     tags: Optional[list[str]] = None
     is_published: Optional[bool] = None
     published_at: Optional[datetime] = None
-    seo_title: Optional[str] = Field(None, max_length=300)
-    seo_description: Optional[str] = Field(None, max_length=500)
+    seo_title: Optional[str] = Field(None, max_length=120)
+    seo_description: Optional[str] = Field(None, max_length=320)
     seo_keywords: Optional[str] = Field(None, max_length=500)

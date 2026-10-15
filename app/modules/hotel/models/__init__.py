@@ -52,6 +52,7 @@ class HotelCategory(Base):
     image_url = Column(Text, nullable=True)
     icon_url = Column(Text, nullable=True)
 
+    slug = Column(String(120), nullable=True)
     seo_title = Column(String(120), nullable=True)
     seo_description = Column(String(320), nullable=True)
     seo_keywords = Column(String(500), nullable=True)

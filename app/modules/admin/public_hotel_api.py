@@ -59,10 +59,26 @@ class PublicHotelCityOut(BaseModel):
     id: int
     name: str
     city_code: Optional[str] = None
+    state_id: Optional[int] = None
     state_name: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
     hotel_count: int = 0
+    # "Starts from ₹X" and the guest rating for city tiles and landing pages.
+    # None (not 0) when a city has no priced/reviewed supply, so the UI can
+    # omit the claim rather than render "from ₹0".
+    from_price: Optional[float] = None
+    avg_rating: Optional[float] = None
+
+
+class PublicHotelStateOut(BaseModel):
+    id: int
+    name: str
+    state_code: Optional[str] = None
+    hotel_count: int = 0
+    city_count: int = 0
+    from_price: Optional[float] = None
+    avg_rating: Optional[float] = None
 
 
 class PublicHotelSearchItem(BaseModel):
@@ -484,15 +500,31 @@ def _assert_available(avail: dict[str, Any], rooms_count: int) -> None:
 )
 async def list_hotel_cities(db: AsyncSession = Depends(get_db)):
     """Cities with at least one ACTIVE, non-deleted hotel — drives the hotel
-    search form's city dropdown and the popular-destinations strip."""
+    search form's city dropdown, the popular-destinations strip and the
+    city landing pages.
+
+    `from_price` / `avg_rating` stay NULL (not 0) when a city has no priced or
+    reviewed supply so callers can omit the claim instead of rendering
+    "from ₹0" / "0/5".
+    """
     result = await db.execute(
         text(
             """
-        SELECT c.id, c.name, c.city_code, s.name AS state_name,
+        SELECT c.id, c.name, c.city_code, c.state_id, s.name AS state_name,
                c.latitude, c.longitude,
                (SELECT COUNT(*) FROM hotels h
                  WHERE h.city_id = c.id AND h.status = 'ACTIVE'
-                   AND h.deleted_at IS NULL) AS hotel_count
+                   AND h.deleted_at IS NULL) AS hotel_count,
+               (SELECT MIN(rc.base_price) FROM hotels h
+                 JOIN hotel_room_categories rc ON rc.hotel_id = h.id
+                 WHERE h.city_id = c.id AND h.status = 'ACTIVE'
+                   AND h.deleted_at IS NULL
+                   AND rc.is_active = TRUE AND rc.base_price > 0) AS from_price,
+               (SELECT AVG(hr.average_rating) FROM hotels h
+                 JOIN hotel_ratings hr ON hr.hotel_id = h.id
+                 WHERE h.city_id = c.id AND h.status = 'ACTIVE'
+                   AND h.deleted_at IS NULL
+                   AND hr.total_reviews > 0) AS avg_rating
         FROM cities c
         LEFT JOIN states s ON s.id = c.state_id
         WHERE c.is_active = TRUE
@@ -510,10 +542,72 @@ async def list_hotel_cities(db: AsyncSession = Depends(get_db)):
             id=r.id,
             name=r.name,
             city_code=r.city_code,
+            state_id=r.state_id,
             state_name=r.state_name,
             latitude=float(r.latitude) if r.latitude is not None else None,
             longitude=float(r.longitude) if r.longitude is not None else None,
             hotel_count=int(r.hotel_count or 0),
+            from_price=float(r.from_price) if r.from_price is not None else None,
+            avg_rating=round(float(r.avg_rating), 2) if r.avg_rating else None,
+        )
+        for r in result.fetchall()
+    ]
+
+
+# ============================================================
+# GET /public/hotel/states
+# ============================================================
+
+
+@router.get(
+    "/states",
+    response_model=List[PublicHotelStateOut],
+    summary="States that have bookable hotels, with counts and price floor (no auth)",
+)
+async def list_hotel_states(db: AsyncSession = Depends(get_db)):
+    """State-level hotel supply for the state landing pages.
+
+    hotels.state_id is nullable while city_id is NOT NULL, so the aggregate
+    walks cities — that is the same path the hotel landing pages use to pick
+    their scope, which keeps the number on the page and the number in the
+    list of hotels agreeing.
+    """
+    result = await db.execute(
+        text(
+            """
+        SELECT s.id, s.name, s.state_code,
+               COUNT(h.id) AS hotel_count,
+               COUNT(DISTINCT h.city_id) AS city_count,
+               MIN(rc.min_rate) AS from_price,
+               AVG(hr.average_rating) FILTER (WHERE hr.total_reviews > 0)
+                   AS avg_rating
+        FROM states s
+        JOIN cities c ON c.state_id = s.id AND c.is_active = TRUE
+        JOIN hotels h
+          ON h.city_id = c.id AND h.status = 'ACTIVE' AND h.deleted_at IS NULL
+        LEFT JOIN (
+            SELECT hotel_id, MIN(base_price) AS min_rate
+            FROM hotel_room_categories
+            WHERE is_active = TRUE AND base_price > 0
+            GROUP BY hotel_id
+        ) rc ON rc.hotel_id = h.id
+        LEFT JOIN hotel_ratings hr ON hr.hotel_id = h.id
+        WHERE s.is_active = TRUE
+        GROUP BY s.id, s.name, s.state_code
+        HAVING COUNT(h.id) > 0
+        ORDER BY hotel_count DESC, s.name
+        """
+        )
+    )
+    return [
+        PublicHotelStateOut(
+            id=r.id,
+            name=r.name,
+            state_code=r.state_code,
+            hotel_count=int(r.hotel_count or 0),
+            city_count=int(r.city_count or 0),
+            from_price=float(r.from_price) if r.from_price is not None else None,
+            avg_rating=round(float(r.avg_rating), 2) if r.avg_rating else None,
         )
         for r in result.fetchall()
     ]
@@ -531,6 +625,11 @@ async def list_hotel_cities(db: AsyncSession = Depends(get_db)):
 )
 async def search_hotels(
     city_id: Optional[int] = Query(None, description="Filter by city"),
+    state_id: Optional[int] = Query(
+        None,
+        description="Filter by state — expands to every city in that state "
+        "(hotels.state_id is nullable, so the city link is the reliable path)",
+    ),
     q: Optional[str] = Query(
         None,
         description="Free-text place search — matches hotel name, landmark, "
@@ -561,6 +660,12 @@ async def search_hotels(
     if city_id is not None:
         where.append("h.city_id = :city_id")
         params["city_id"] = city_id
+    if state_id is not None:
+        where.append(
+            "h.city_id IN (SELECT c2.id FROM cities c2 "
+            "WHERE c2.state_id = :state_id AND c2.is_active = TRUE)"
+        )
+        params["state_id"] = state_id
     if q and q.strip():
         where.append(
             "(h.hotel_name ILIKE :q OR h.address ILIKE :q "
@@ -1235,6 +1340,7 @@ async def create_hotel_booking(
     if body.coupon_code:
         from app.modules.admin.coupon_api import (
             ValidateRequest,
+            record_coupon_usage,
             validate_coupon,
         )
 
@@ -1259,8 +1365,12 @@ async def create_hotel_booking(
                 booking_amount=q["total_amount"],
                 customer_id=customer_id,
                 customer_mobile=cust_mobile,
+                # Server-side fulfilling partner for partner-funded coupons
+                # (migration 0075) — never taken from the client.
+                partner_id=hotel.get("partner_id"),
             ),
             db,
+            reserve=True,
         )
         if not vres.valid:
             raise HTTPException(
@@ -1269,11 +1379,7 @@ async def create_hotel_booking(
             )
         coupon_discount_applied = Decimal(str(vres.discount_amount))
         coupon_code_used = body.coupon_code.upper().strip()
-        coupon_id_row = await db.execute(
-            text("SELECT id FROM coupons WHERE coupon_code = :code"),
-            {"code": coupon_code_used},
-        )
-        coupon_id_used = coupon_id_row.scalar()
+        coupon_id_used = vres.coupon_id
 
     if coupon_id_used:
         await db.execute(
@@ -1288,31 +1394,12 @@ async def create_hotel_booking(
                 "rid": res_id,
             },
         )
-        await db.execute(
-            text(
-                """
-                INSERT INTO coupon_usages
-                    (coupon_id, customer_id, master_booking_id, discount_applied, used_at)
-                VALUES (:cid, :cust, :mbid, :disc, NOW())
-                """
-            ),
-            {
-                "cid": coupon_id_used,
-                "cust": customer_id,
-                "mbid": mb_id,
-                "disc": coupon_discount_applied,
-            },
-        )
-        await db.execute(
-            text(
-                """
-                UPDATE coupons
-                SET current_usage_count = current_usage_count + 1,
-                    updated_at = NOW()
-                WHERE id = :cid
-                """
-            ),
-            {"cid": coupon_id_used},
+        await record_coupon_usage(
+            db,
+            validation=vres,
+            customer_id=customer_id,
+            master_booking_id=mb_id,
+            hotel_reservation_id=res_id,
         )
 
     # ── Primary guest roster row ──────────────────────────────────────────

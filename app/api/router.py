@@ -54,6 +54,9 @@ from app.modules.admin.email_api import router as admin_email_router
 from app.modules.admin.public_cab_api import router as public_cab_router
 from app.modules.admin.public_hotel_api import router as public_hotel_router
 from app.modules.admin.public_coupon_api import router as public_coupon_router
+from app.modules.admin.landing_page_api import router as admin_landing_router
+from app.modules.admin.public_landing_api import router as public_landing_router
+from app.modules.admin.public_availability import router as public_availability_router
 from app.modules.tour.api import (
     admin_router as admin_tour_router,
     partner_router as partner_tour_router,
@@ -223,6 +226,28 @@ api_router.include_router(
     dependencies=[Depends(require_roles(*SUPER_OR_ADMIN))],
 )
 api_router.include_router(public_blog_router, prefix="/public", tags=["Public Blog"])
+
+# --- Landing Pages (city / state × service-type marketing pages) ---
+# Doc Ref: Migration 0069_landing_pages
+# Admin CRUD for the CMS; the public bundle is what customer-web's [slug]
+# engine, sitemap.xml and llms.txt all read from.
+api_router.include_router(
+    admin_landing_router,
+    prefix="/admin/settings",
+    tags=["Admin Landing Pages"],
+    dependencies=[Depends(require_roles(*SUPER_OR_ADMIN))],
+)
+api_router.include_router(
+    public_landing_router, prefix="/public", tags=["Public Landing Pages"]
+)
+
+# --- Public Service Availability (hard hide of inactive / zero-supply verticals) ---
+# Doc Ref: Hard Service Availability (plan: rosy-vent-shrew)
+# One consistent snapshot so nav, footer, homepage, pages→404, sitemap and
+# llms.txt all agree on whether a vertical is live.
+api_router.include_router(
+    public_availability_router, prefix="/public", tags=["Public Availability"]
+)
 
 # --- Partner Wallet ---
 api_router.include_router(

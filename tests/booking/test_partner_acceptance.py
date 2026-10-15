@@ -39,6 +39,20 @@ class _StubScalarResult:
     def scalar_one_or_none(self) -> Any:
         return self._value
 
+    def scalar(self) -> Any:
+        return self._value
+
+    def mappings(self) -> Any:
+        return self
+
+    def first(self) -> Any:
+        if isinstance(self._value, list):
+            return self._value[0] if self._value else None
+        return self._value
+
+    def one_or_none(self) -> Any:
+        return self._value
+
 
 class _StubDb:
     """Just enough surface for the four code paths under test."""
@@ -56,8 +70,23 @@ class _StubDb:
     def add(self, obj: Any) -> None:
         self.added.append(obj)
 
-    async def execute(self, _stmt: Any) -> _StubScalarResult:
+    async def execute(
+        self, _stmt: Any = None, *_args: Any, **_kwargs: Any
+    ) -> _StubScalarResult:
         self.executed.append(_stmt)
+        # Coupon participation bookkeeping (migration 0075) and the offer-time
+        # free-cab snapshot are orthogonal to these assertions — answer them
+        # with empty results so queued rows stay in position.
+        try:
+            sql = str(_stmt)
+        except Exception:  # pragma: no cover - defensive
+            sql = ""
+        if (
+            "coupon_usages" in sql
+            or "coupon_partner_rules" in sql
+            or "FROM vehicles v" in sql
+        ):
+            return _StubScalarResult(None)
         if self.queue:
             return self.queue.pop(0)
         return _StubScalarResult(None)
@@ -82,6 +111,10 @@ def _cab(status: str = "PENDING_ASSIGNMENT") -> SimpleNamespace:
         acceptance_deadline=None,
         partner_responded_at=None,
         pending_partner_id=None,
+        vehicle_category_id=None,
+        pickup_datetime=None,
+        return_datetime=None,
+        trip_type=None,
         assignments=[],
     )
 

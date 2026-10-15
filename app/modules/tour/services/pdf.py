@@ -687,6 +687,7 @@ def build_tour_invoice_pdf(
     partner_name: str | None,
     invoice_date: datetime | None,
     total_amount: float,
+    coupon_discount: float = 0,
     platform_commission: float,
     partner_payout: float,
     additional_amount: float,
@@ -790,12 +791,22 @@ def build_tour_invoice_pdf(
                 ),
             ]
         )
+    if coupon_discount > 0:
+        rows.append(
+            [
+                Paragraph("Coupon discount", _ps("fi", 8.5, SUCCESS)),
+                Paragraph(
+                    f"- Rs. {coupon_discount:,.2f}",
+                    _ps("fv", 8.5, SUCCESS, align=TA_RIGHT),
+                ),
+            ]
+        )
     total_row_idx = len(rows)
     rows.append(
         [
             Paragraph("TOTAL PAYABLE", _ps("gtl", 10, BRAND_DARK, bold=True)),
             Paragraph(
-                f"Rs. {total_amount:,.2f}",
+                f"Rs. {max(total_amount - coupon_discount, 0):,.2f}",
                 _ps("gtv", 11, BRAND_DARK, bold=True, align=TA_RIGHT),
             ),
         ]
@@ -938,6 +949,7 @@ def build_tour_itinerary_pdf(
     booking_status: str | None,
     payment_status: str | None,
     total_amount: float,
+    coupon_discount: float = 0,
     additional_amount: float,
     advance_total: float,
     balance_due: float,
@@ -1212,12 +1224,22 @@ def build_tour_itinerary_pdf(
                 ),
             ]
         )
+    if coupon_discount > 0:
+        rows.append(
+            [
+                Paragraph("Coupon discount", _ps("fi", 8.5, SUCCESS)),
+                Paragraph(
+                    f"- Rs. {coupon_discount:,.2f}",
+                    _ps("fv", 8.5, SUCCESS, align=TA_RIGHT),
+                ),
+            ]
+        )
     total_row_idx = len(rows)
     rows.append(
         [
             Paragraph("TOTAL PAYABLE", _ps("gtl", 10, BRAND_DARK, bold=True)),
             Paragraph(
-                f"Rs. {total_amount:,.2f}",
+                f"Rs. {max(total_amount - coupon_discount, 0):,.2f}",
                 _ps("gtv", 11, BRAND_DARK, bold=True, align=TA_RIGHT),
             ),
         ]

@@ -627,10 +627,10 @@ async def handover_to_new_partner(
     ).scalar_one_or_none()
     if new_partner is None:
         raise ResourceNotFoundException("Partner", new_partner_id)
-    if new_partner.partner_status not in {"APPROVED", "ACTIVE"}:
+    if new_partner.status not in {"APPROVED", "ACTIVE"}:
         raise BusinessException(
             f"Partner {new_partner.business_name} is in status "
-            f"'{new_partner.partner_status}' and cannot accept new bookings.",
+            f"'{new_partner.status}' and cannot accept new bookings.",
             code="PARTNER_NOT_ACTIVE",
         )
     if new_partner.id == active.partner_id:
@@ -639,6 +639,15 @@ async def handover_to_new_partner(
             "Use swap_vehicle_same_partner instead.",
             code="SAME_PARTNER_USE_SWAP",
         )
+
+    # A partner-funded coupon booking may only move to a partner inside the
+    # redemption cohort — the handover partner's settlement carries the coupon
+    # share (migration 0075).
+    from app.modules.booking.services.coupon_dispatch import (
+        ensure_coupon_partner_eligible,
+    )
+
+    await ensure_coupon_partner_eligible(db, cb, new_partner.id)
 
     now = datetime.now(timezone.utc)
     current_km = _current_km(cb)

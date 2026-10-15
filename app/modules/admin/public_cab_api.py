@@ -8,7 +8,8 @@
 #   API Doc §7 — Create Cab Booking
 #
 # Endpoints (no auth required):
-#   GET /public/cab/cities               — active cities list
+#   GET /public/cab/cities               — active cities + bookable supply
+#   GET /public/cab/cities/{id}/fare-matrix — whole-city fare sheet at a sample km
 #   GET /public/cab/vehicle-categories   — active vehicle categories
 #   GET /public/cab/fare-estimate        — multi-category fare estimate
 #   GET /public/cab/google-maps-key      — Maps API key (admin-controlled)
@@ -16,7 +17,7 @@
 # ============================================================
 
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -25,6 +26,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
+from app.modules.admin.schemas.landing_pages import LandingFareRow
 from app.modules.admin.services import DefaultPricingService
 from app.modules.booking.services.fare import calculate_fare_breakdown
 
@@ -52,9 +54,18 @@ class PublicCityOut(BaseModel):
     id: int
     name: str
     city_code: Optional[str] = None
+    state_id: Optional[int] = None
     state_name: Optional[str] = None
     latitude: Optional[float] = None
     longitude: Optional[float] = None
+    # Bookable supply for this city, so a landing page or hub can link the cab
+    # vertical only where a fare can actually be quoted.
+    vehicle_count: int = 0
+    has_pricing: bool = False
+    # city_specific — the city has its own fare rules
+    # default       — only platform-standard rules apply here
+    # none          — nothing to quote
+    pricing_source: Literal["city_specific", "default", "none"] = "none"
 
 
 class PublicVehicleCategoryOut(BaseModel):
@@ -145,6 +156,20 @@ class CreateCabBookingIn(BaseModel):
     coupon_id: Optional[int] = None
 
 
+class PublicCityFareMatrixOut(BaseModel):
+    """Whole-city fare sheet for one sample distance — one call, no per-pair
+    round trips."""
+
+    city_id: int
+    city_name: str
+    distance_km: float
+    fare_from: Optional[float] = None
+    vehicle_count: int = 0
+    trip_types: List[str] = []
+    pricing_source: Literal["city_specific", "default", "none"] = "none"
+    rows: List[LandingFareRow] = []
+
+
 # ── GET /public/cab/cities ────────────────────────────────────────────────────
 
 
@@ -154,12 +179,34 @@ class CreateCabBookingIn(BaseModel):
     summary="List active cities for cab booking (no auth)",
 )
 async def list_cab_cities(db: AsyncSession = Depends(get_db)):
-    """Active cities with state name — used by the customer cab search form."""
+    """Active cities with state name — used by the customer cab search form.
+
+    Also carries the bookable-supply signal (``vehicle_count`` /
+    ``pricing_source``) so city landing pages only link the cab vertical where
+    a fare can actually be quoted. A city with no own rules is still bookable
+    on platform-standard pricing (BRD §36), which is why ``pricing_source``
+    distinguishes the two cases rather than hiding the link.
+    """
     result = await db.execute(
         text(
             """
-        SELECT c.id, c.name, c.city_code, s.name AS state_name,
-               c.latitude, c.longitude
+        SELECT c.id, c.name, c.city_code, c.state_id, s.name AS state_name,
+               c.latitude, c.longitude,
+               (
+                 SELECT COUNT(*)
+                   FROM vehicle_categories vc
+                  WHERE vc.is_active = TRUE
+                    AND (
+                      EXISTS (SELECT 1 FROM vehicle_pricing_rules r
+                               WHERE r.city_id = c.id
+                                 AND r.vehicle_category_id = vc.id)
+                      OR EXISTS (SELECT 1 FROM default_vehicle_pricing_rules d
+                                  WHERE d.vehicle_category_id = vc.id)
+                    )
+               ) AS vehicle_count,
+               EXISTS (SELECT 1 FROM vehicle_pricing_rules r
+                        WHERE r.city_id = c.id) AS has_city_rules,
+               EXISTS (SELECT 1 FROM default_vehicle_pricing_rules) AS has_default_rules
         FROM cities c
         LEFT JOIN states s ON s.id = c.state_id
         WHERE c.is_active = TRUE
@@ -168,17 +215,94 @@ async def list_cab_cities(db: AsyncSession = Depends(get_db)):
         )
     )
     rows = result.fetchall()
-    return [
-        PublicCityOut(
-            id=r.id,
-            name=r.name,
-            city_code=r.city_code,
-            state_name=r.state_name,
-            latitude=float(r.latitude) if r.latitude is not None else None,
-            longitude=float(r.longitude) if r.longitude is not None else None,
+    out: List[PublicCityOut] = []
+    for r in rows:
+        vehicle_count = int(r.vehicle_count or 0)
+        source = (
+            "city_specific"
+            if r.has_city_rules
+            else ("default" if vehicle_count and r.has_default_rules else "none")
         )
-        for r in rows
-    ]
+        out.append(
+            PublicCityOut(
+                id=r.id,
+                name=r.name,
+                city_code=r.city_code,
+                state_id=r.state_id,
+                state_name=r.state_name,
+                latitude=float(r.latitude) if r.latitude is not None else None,
+                longitude=float(r.longitude) if r.longitude is not None else None,
+                vehicle_count=vehicle_count,
+                has_pricing=vehicle_count > 0,
+                pricing_source=source,
+            )
+        )
+    return out
+
+
+# ── GET /public/cab/cities/{city_id}/fare-matrix ──────────────────────────────
+
+
+@router.get(
+    "/cities/{city_id}/fare-matrix",
+    response_model=PublicCityFareMatrixOut,
+    summary="Full fare sheet for a city at a sample distance (no auth)",
+    description=(
+        "Every active vehicle category × every bookable trip type, priced "
+        "through the same fare engine the booking flow uses (city-specific "
+        "rule first, platform default second — BRD §35, §36). Each row keeps "
+        "its `source`, so the UI can say honestly when a city is quoted on "
+        "platform-standard pricing rather than its own rates. "
+        "This is the SSR-safe replacement for calling /fare-estimate once per "
+        "trip type from a marketing page."
+    ),
+)
+async def get_city_fare_matrix(
+    city_id: int,
+    distance_km: float = Query(
+        10, gt=0, le=500, description="Sample distance in km for the estimate"
+    ),
+    db: AsyncSession = Depends(get_db),
+):
+    from app.modules.admin.services.landing_pages import LandingPageService
+
+    city = (
+        (
+            await db.execute(
+                text(
+                    "SELECT id, name FROM cities "
+                    "WHERE id = :city_id AND is_active = TRUE"
+                ),
+                {"city_id": city_id},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if not city:
+        raise HTTPException(status_code=404, detail="City not found")
+
+    # Wider than the marketing cap: this endpoint is a fare sheet, so callers
+    # get every trip type the city can quote instead of a trimmed table.
+    matrix = await LandingPageService.cab_fare_matrix(
+        db, city_id, distance_km, max_rows=100
+    )
+    sources = {row["source"] for row in matrix["rows"]}
+    pricing_source = (
+        "city_specific"
+        if "city_specific" in sources
+        else ("default" if sources else "none")
+    )
+    return PublicCityFareMatrixOut(
+        city_id=int(city["id"]),
+        city_name=city["name"],
+        distance_km=matrix["sample_distance_km"],
+        fare_from=matrix["fare_from"],
+        vehicle_count=matrix["vehicle_count"],
+        trip_types=matrix["trip_types"],
+        pricing_source=pricing_source,
+        rows=matrix["rows"],
+    )
 
 
 # ── GET /public/cab/vehicle-categories ───────────────────────────────────────
@@ -686,6 +810,7 @@ async def create_cab_booking(
     if body.coupon_code:
         from app.modules.admin.coupon_api import (
             ValidateRequest,
+            record_coupon_usage,
             validate_coupon,
         )
 
@@ -703,6 +828,9 @@ async def create_cab_booking(
             )
         ).scalar()
 
+        # reserve=True locks the coupon (and, for partner-funded coupons, the
+        # cohort partners) for this transaction so concurrent redemptions
+        # cannot overshoot the usage cap or double-book the same fleet.
         vres = await validate_coupon(
             ValidateRequest(
                 coupon_code=body.coupon_code,
@@ -712,8 +840,11 @@ async def create_cab_booking(
                 booking_amount=server_estimated_amount,
                 customer_id=customer_id,
                 customer_mobile=cust_mobile,
+                pickup_datetime=pickup_dt,
+                return_datetime=return_dt,
             ),
             db,
+            reserve=True,
         )
         if not vres.valid:
             raise HTTPException(
@@ -722,12 +853,7 @@ async def create_cab_booking(
             )
         coupon_discount_applied = Decimal(str(vres.discount_amount))
         coupon_code_used = body.coupon_code.upper().strip()
-        # Resolve the coupon id by code — validate_coupon doesn't return it.
-        coupon_id_row = await db.execute(
-            text("SELECT id FROM coupons WHERE coupon_code = :code"),
-            {"code": coupon_code_used},
-        )
-        coupon_id_used = coupon_id_row.scalar()
+        coupon_id_used = vres.coupon_id
 
     # 1. Insert master booking — total_amount is the pre-coupon fare so the
     # master row stays the "fare" view. The coupon discount is tracked on
@@ -824,35 +950,20 @@ async def create_cab_booking(
     )
 
     # 4. Record coupon usage (coupon_usages is the source of truth for
-    # close-trip / invoice math, and drives the per-coupon usage_count).
-    # Increment the coupon's global usage counter atomically; rollback the
-    # whole booking if this fails (rare — concurrent redemptions).
+    # close-trip / invoice math, the per-coupon usage counter, and the
+    # immutable funding/cohort snapshot the assignment lock reads).
     if coupon_id_used:
-        await db.execute(
-            text(
-                """
-                INSERT INTO coupon_usages
-                    (coupon_id, customer_id, master_booking_id, discount_applied, used_at)
-                VALUES (:cid, :cust, :mbid, :disc, NOW())
-                """
-            ),
-            {
-                "cid": coupon_id_used,
-                "cust": customer_id,
-                "mbid": master_id,
-                "disc": coupon_discount_applied,
-            },
+        cab_id_row = await db.execute(
+            text("SELECT id FROM cab_bookings WHERE uuid = :uuid"),
+            {"uuid": cab_uuid},
         )
-        await db.execute(
-            text(
-                """
-                UPDATE coupons
-                SET current_usage_count = current_usage_count + 1,
-                    updated_at = NOW()
-                WHERE id = :cid
-                """
-            ),
-            {"cid": coupon_id_used},
+        cab_id = cab_id_row.scalar()
+        await record_coupon_usage(
+            db,
+            validation=vres,
+            customer_id=customer_id,
+            master_booking_id=master_id,
+            cab_booking_id=cab_id,
         )
 
     await db.commit()

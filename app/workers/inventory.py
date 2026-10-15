@@ -29,7 +29,7 @@ from datetime import date, timedelta
 
 from sqlalchemy import select
 
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, run_worker_async
 from app.modules.hotel.constants import CONFIG_HOTEL_INVENTORY_HORIZON_DAYS
 from app.modules.hotel.services import get_config_int
 from app.modules.hotel.models import Hotel, HotelInventory, HotelRoomCategory
@@ -46,9 +46,9 @@ def extend_hotel_inventory_horizon() -> dict[str, int]:
     operator can inspect with `celery result`. Numbers reflect one run
     across the whole platform, not per-hotel.
     """
-    import asyncio
+    import asyncio  # noqa: F401  (kept for reference)
 
-    return asyncio.run(_extend_async())
+    return run_worker_async(_extend_async())
 
 
 async def _extend_async() -> dict[str, int]:

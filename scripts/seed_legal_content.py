@@ -33,7 +33,11 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from sqlalchemy import text  # noqa: E402
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine  # noqa: E402
+from sqlalchemy.ext.asyncio import (
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)  # noqa: E402
 
 from app.core.config import settings  # noqa: E402
 
@@ -49,7 +53,7 @@ LEGAL_PAGES = {
             {
                 "heading": "1. Data we collect",
                 "body": (
-                    "WayTero Travel Technologies Pvt Ltd (\"WayTero\", \"we\", \"us\") collects only the "
+                    'WayTero Travel Technologies Pvt Ltd ("WayTero", "we", "us") collects only the '
                     "data needed to deliver your travel services: account information (name, email, "
                     "mobile number), trip information (pickup, drop, dates, passengers), payment "
                     "metadata (processed by our payment partners — card numbers are never stored by us), "
@@ -93,7 +97,7 @@ LEGAL_PAGES = {
                 "heading": "6. Your rights",
                 "body": (
                     "You can request an export of your data, correction, or deletion by raising an "
-                    "account deletion request or emailing privacy@waytero.com. We respond within 30 days."
+                    "account deletion request or emailing support@waytero.com. We respond within 30 days."
                 ),
             },
             {
@@ -337,7 +341,9 @@ async def main() -> None:
             )
         await db.commit()
     await engine.dispose()
-    print("legal_content_seeded: 5 pages (privacy, terms, refund, cookies, booking-instructions)")
+    print(
+        "legal_content_seeded: 5 pages (privacy, terms, refund, cookies, booking-instructions)"
+    )
 
 
 if __name__ == "__main__":

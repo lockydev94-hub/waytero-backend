@@ -366,7 +366,7 @@ async def list_available_vehicles_for_swap(
             ORDER BY d.id ASC
             LIMIT 1
         ) da ON TRUE
-        WHERE p.partner_status IN ('APPROVED','ACTIVE')
+        WHERE p.status IN ('APPROVED','ACTIVE')
           AND p.id <> :pid
           AND p.city_id = :city_id
           AND {" AND ".join(base_filter)}
@@ -458,7 +458,7 @@ async def list_available_partners_for_handover(
                ON v.partner_id = p.id
               AND v.status = 'ACTIVE'
               {cat_filter}
-        WHERE p.partner_status IN ('APPROVED','ACTIVE')
+        WHERE p.status IN ('APPROVED','ACTIVE')
           AND p.id <> :pid
           AND p.city_id = :city_id
         GROUP BY p.id, p.business_name, p.partner_code, p.mobile, p.city_id, ci.name

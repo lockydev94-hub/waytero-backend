@@ -24,6 +24,7 @@ from app.core.exceptions import (
 from app.modules.hotel.models import HotelAmenity, HotelCategory, HotelGstSlab
 from app.modules.hotel.repositories import HotelMasterRepository
 from app.modules.hotel.validators import slugify
+from app.shared.utilities.seo import ensure_slug_unique, unique_slug
 
 
 class HotelMasterService:
@@ -51,10 +52,14 @@ class HotelMasterService:
         if await self.repo.get_category_by_code(code) is not None:
             raise DuplicateResourceException("Property category", "code")
 
+        slug = payload.slug or await unique_slug(self.db, HotelCategory, payload.label)
+        await ensure_slug_unique(self.db, HotelCategory, slug)
+
         return await self.repo.add_category(
             HotelCategory(
                 category_code=code,
                 label=payload.label.strip(),
+                slug=slug,
                 description=payload.description,
                 image_url=payload.image_url,
                 icon_url=payload.icon_url,
@@ -72,6 +77,10 @@ class HotelMasterService:
             raise ResourceNotFoundException("Property category", category_id)
 
         data = payload.model_dump(exclude_unset=True)
+        if data.get("slug"):
+            await ensure_slug_unique(
+                self.db, HotelCategory, data["slug"], exclude_id=category_id
+            )
         # Deactivating a category that hotels still point at would leave those
         # hotels with a category the admin can no longer see or reassign from.
         if data.get("is_active") is False and await self._category_in_use(category_id):

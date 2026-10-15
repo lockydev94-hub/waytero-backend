@@ -41,6 +41,9 @@ class TourPackage(Base):
     package_code = Column(String(50), unique=True, nullable=False)
     slug = Column(String(255), unique=True, nullable=False)
     package_name = Column(String(255), nullable=False)
+    seo_title = Column(String(120))
+    seo_description = Column(String(320))
+    seo_keywords = Column(String(500))
     package_type = Column(String(50), nullable=False, default="FIXED")
     destination = Column(String(255), nullable=False)
     city_id = Column(BigInteger, ForeignKey("cities.id"), nullable=False)
@@ -150,6 +153,10 @@ class TourBooking(Base):
     travel_end_date = Column(Date, nullable=False)
     persons_count = Column(Integer, nullable=False)
     total_amount = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
+    coupon_code = Column(String(50), nullable=True)
+    coupon_discount = Column(
+        Numeric(12, 2), nullable=False, default=Decimal("0.00"), server_default="0"
+    )
     platform_commission = Column(
         Numeric(12, 2), nullable=False, default=Decimal("0.00")
     )
@@ -189,6 +196,15 @@ class TourBooking(Base):
         Index("idx_tour_bookings_vehicle", "vehicle_id"),
         Index("idx_tour_bookings_driver", "driver_id"),
     )
+
+    @property
+    def payable_amount(self) -> Decimal:
+        """Customer liability; gross fare remains the commission base."""
+        return max(
+            Decimal(str(self.total_amount or 0))
+            - Decimal(str(self.coupon_discount or 0)),
+            Decimal("0.00"),
+        )
 
 
 class TourParticipant(Base):

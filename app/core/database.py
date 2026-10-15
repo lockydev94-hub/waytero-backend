@@ -8,6 +8,9 @@
 
 from collections.abc import AsyncGenerator
 
+import asyncio
+import atexit
+
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     create_async_engine,
@@ -79,6 +82,52 @@ async def create_all_tables() -> None:
     """Create all tables. Called on application startup (dev only)."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+
+# --- Loop-safe async runner for Celery workers ───────────────────────────
+# The module-level async engine pools TCP connections bound to the event
+# loop that first used them. Celery's default pool executes each task on a
+# NEW event loop (asyncio.run), so a pooled asyncpg connection from a
+# previous run raises "Future attached to a different loop" / "Event loop
+# is closed" on the next task. run_worker_async() runs the coroutine on a
+# dedicated loop and disposes the engine's pooled connections afterwards,
+# so every task execution starts with loop-clean connections.
+_worker_loop: asyncio.AbstractEventLoop | None = None
+
+
+def _dispose_engine_sync() -> None:
+    """Best-effort engine disposal at interpreter exit (worker shutdown)."""
+    try:
+        asyncio.run(engine.dispose())
+    except Exception:  # pragma: no cover - shutdown best effort
+        pass
+
+
+def run_worker_async(coro) -> object:
+    """Run an async coroutine from synchronous Celery task code safely."""
+    global _worker_loop
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is not None:
+        # Already inside a loop (should not happen for Celery tasks) —
+        # just await the coroutine directly.
+        return coro  # pragma: no cover - defensive
+    if _worker_loop is None:
+        _worker_loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_worker_loop)
+        atexit.register(_dispose_engine_sync)
+    try:
+        return _worker_loop.run_until_complete(coro)
+    finally:
+        # Drop pooled connections after every task run so the next run
+        # (or a different loop) never reuses connections bound to a dead
+        # loop. New connections are created lazily on demand.
+        try:
+            _worker_loop.run_until_complete(engine.dispose())
+        except Exception:  # pragma: no cover - disposal best effort
+            pass
 
 
 async def drop_all_tables() -> None:

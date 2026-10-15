@@ -82,6 +82,45 @@ class City(Base):
     __table_args__ = (Index("idx_cities_state", "state_id"),)
 
 
+class Place(Base):
+    """
+    Airport / railway-station registry per city.
+    Migration 0070 — places. Backs the PLACE_CABS landing pages
+    ("bhubaneswar-airport-cab"). SEO columns are per-place overrides; the
+    landing page row remains the published source of truth for the URL.
+    """
+
+    __tablename__ = "places"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    city_id = Column(BigInteger, ForeignKey("cities.id"), nullable=False)
+    kind = Column(String(30), nullable=False)  # AIRPORT | RAILWAY_STATION
+    name = Column(String(200), nullable=False)
+    code = Column(String(10), nullable=True)  # IATA / station code
+    address = Column(sa.Text, nullable=True)
+    latitude = Column(sa.Numeric(10, 7), nullable=True)
+    longitude = Column(sa.Numeric(10, 7), nullable=True)
+    is_active = Column(Boolean, nullable=False, default=True)
+    seo_title = Column(String(120), nullable=True)
+    seo_description = Column(String(320), nullable=True)
+    seo_keywords = Column(String(500), nullable=True)
+    created_at = Column(
+        sa.DateTime(timezone=True), nullable=False, server_default=sa.text("now()")
+    )
+    updated_at = Column(
+        sa.DateTime(timezone=True),
+        nullable=False,
+        server_default=sa.text("now()"),
+        onupdate=lambda: __import__("datetime").datetime.now(
+            __import__("datetime").timezone.utc
+        ),
+    )
+
+    city = relationship("City")
+
+    __table_args__ = (Index("idx_places_city", "city_id"),)
+
+
 class ServiceType(Base):
     """
     Dynamic service type master table.
@@ -98,6 +137,7 @@ class ServiceType(Base):
     description = Column(sa.Text, nullable=True)
     icon_url = Column(sa.Text, nullable=True)
     image_url = Column(sa.Text, nullable=True)
+    slug = Column(String(120), nullable=True)
     seo_title = Column(String(120), nullable=True)
     seo_description = Column(String(320), nullable=True)
     seo_keywords = Column(String(500), nullable=True)

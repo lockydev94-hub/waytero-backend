@@ -957,6 +957,15 @@ async def partner_accept_booking(
     sweeper would have moved it back by now, but guard explicitly).
     """
     partner_id = await _resolve_partner_id(db, current_user["sub"])
+    # Serialize against rejection, admin reassignment and the timeout worker
+    # BEFORE loading assignments or testing the current offer.
+    await db.execute(
+        select(CabBooking)
+        .options(selectinload(CabBooking.assignments))
+        .where(CabBooking.booking_number == booking_number.strip().upper())
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     _, cb, partner_assigns = await _get_partner_cab_booking(
         db, booking_number, partner_id
     )
@@ -978,25 +987,23 @@ async def partner_accept_booking(
             "Please refresh — admin will reassign.",
         )
 
-    # The latest assignment is the one in the acceptance window — must be
-    # the still-open one (closed_at IS NULL).
-    latest = sorted(
-        [a for a in partner_assigns if a.closed_at is None],
-        key=lambda a: a.assigned_at,
-        reverse=True,
-    )[0]
-    if latest.accepted_at is not None or latest.rejected_at is not None:
-        # Already responded to in a previous attempt — idempotent re-call is
-        # safe and returns the existing state.
-        return {
-            "success": True,
-            "message": "Booking already responded to",
-            "cab_status": cb.booking_status,
-            "accepted_at": (
-                latest.accepted_at.isoformat() if latest.accepted_at else None
-            ),
-        }
+    latest = max(cb.assignments, key=lambda a: (a.assigned_at, a.id), default=None)
+    if (
+        cb.pending_partner_id != partner_id
+        or latest is None
+        or latest.partner_id != partner_id
+        or latest.closed_at is not None
+        or latest.accepted_at is not None
+        or latest.rejected_at is not None
+        or latest.rejection_reason_code is not None
+    ):
+        raise HTTPException(410, "This offer is no longer current. Please refresh.")
 
+    from app.modules.booking.services.coupon_dispatch import (
+        ensure_coupon_partner_eligible,
+    )
+
+    await ensure_coupon_partner_eligible(db, cb, partner_id)
     latest.accepted_at = now
     cb.booking_status = "ASSIGNED"
     cb.partner_responded_at = now
@@ -1009,7 +1016,8 @@ async def partner_accept_booking(
         "PARTNER_ACCEPTED",
         f"Partner accepted cab {cb.booking_number}. Awaiting driver assignment.",
     )
-    # get_db auto-commits on success.
+    # Notification dispatch may commit internally. Finish the lifecycle first.
+    await db.commit()
 
     # ── Realtime: notify any other open partner tabs (Doc Ref: BRD Part 7 §155) ──
     try:
@@ -1086,8 +1094,19 @@ async def partner_reject_booking(
     Returns the cab to PENDING_ASSIGNMENT so admin can reassign.
     """
     from app.modules.partner.constants import REJECT_REASON_CODES
+    from app.modules.booking.services.coupon_dispatch import (
+        cancel_if_coupon_exhausted,
+        record_coupon_response_availability,
+    )
 
     partner_id = await _resolve_partner_id(db, current_user["sub"])
+    await db.execute(
+        select(CabBooking)
+        .options(selectinload(CabBooking.assignments))
+        .where(CabBooking.booking_number == booking_number.strip().upper())
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
     mb, cb, partner_assigns = await _get_partner_cab_booking(
         db, booking_number, partner_id
     )
@@ -1110,20 +1129,34 @@ async def partner_reject_booking(
     if payload.reason_code == "OTHER" and not notes:
         raise HTTPException(400, "notes is required when reason_code is OTHER.")
 
-    latest = sorted(
-        [a for a in partner_assigns if a.closed_at is None],
-        key=lambda a: a.assigned_at,
-        reverse=True,
-    )[0]
+    latest = max(cb.assignments, key=lambda a: (a.assigned_at, a.id), default=None)
     now = datetime.now(timezone.utc)
+    if (
+        cb.pending_partner_id != partner_id
+        or latest is None
+        or latest.partner_id != partner_id
+        or latest.closed_at is not None
+        or latest.accepted_at is not None
+        or latest.rejected_at is not None
+        or latest.rejection_reason_code is not None
+    ):
+        raise HTTPException(410, "This offer is no longer current. Please refresh.")
+    if cb.acceptance_deadline is None or cb.acceptance_deadline <= now:
+        # An expired offer is a timeout, never evidence of a human refusal.
+        raise HTTPException(410, "Acceptance window has expired. Please refresh.")
+
+    await record_coupon_response_availability(db, cb, latest)
     latest.rejected_at = now
     latest.rejection_reason_code = payload.reason_code
     latest.rejection_notes = notes or None
+    latest.closed_at = now
+    latest.close_reason = "PARTNER_REJECTED"
 
     cb.booking_status = "PENDING_ASSIGNMENT"
     cb.partner_responded_at = now
     cb.acceptance_deadline = None
     cb.pending_partner_id = None
+    cancelled = await cancel_if_coupon_exhausted(db, cb)
 
     label = payload.reason_code
     notes_part = f" | notes: {notes}" if notes else ""
@@ -1132,9 +1165,9 @@ async def partner_reject_booking(
         mb.id,
         "PARTNER_REJECTED",
         f"Partner rejected cab {cb.booking_number}. Reason: {label}{notes_part}. "
-        f"Returned to PENDING_ASSIGNMENT for admin reassignment.",
+        f"Cab status: {cb.booking_status}.",
     )
-    # get_db auto-commits on success.
+    await db.commit()
 
     # ── Realtime: notify any other open partner tabs (Doc Ref: BRD Part 7 §155) ──
     try:
@@ -1150,7 +1183,7 @@ async def partner_reject_booking(
                     "master_booking_id": mb.id,
                     "decision": "REJECTED",
                     "reason_code": payload.reason_code,
-                    "cab_status": "PENDING_ASSIGNMENT",
+                    "cab_status": cb.booking_status,
                 },
             },
         )
@@ -1160,7 +1193,7 @@ async def partner_reject_booking(
                 "data": {
                     "cab_booking_number": cb.booking_number,
                     "master_booking_id": mb.id,
-                    "new_status": "PENDING_ASSIGNMENT",
+                    "new_status": cb.booking_status,
                     "reason": "PARTNER_REJECTED",
                     "rejection_reason_code": payload.reason_code,
                 },
@@ -1179,15 +1212,19 @@ async def partner_reject_booking(
         master_booking_id=mb.id,
         service_id=cb.id,
         booking_number=cb.booking_number,
-        service_status="PENDING_ASSIGNMENT",
+        service_status=cb.booking_status,
         action="PARTNER_REJECTED",
         partner_ids=[partner_id],
     )
 
     return {
         "success": True,
-        "message": "Booking rejected; returned to PENDING_ASSIGNMENT",
-        "cab_status": "PENDING_ASSIGNMENT",
+        "message": (
+            "Booking cancelled; all eligible coupon partners declined or timed out"
+            if cancelled
+            else "Booking rejected; returned to PENDING_ASSIGNMENT"
+        ),
+        "cab_status": cb.booking_status,
         "rejected_at": now.isoformat(),
         "reason_code": payload.reason_code,
     }

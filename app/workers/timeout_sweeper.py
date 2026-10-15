@@ -27,7 +27,7 @@ from typing import Optional
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.core.database import AsyncSessionLocal
+from app.core.database import AsyncSessionLocal, run_worker_async
 from app.modules.booking.models import (
     CabBooking,
     CabBookingAssignment,
@@ -39,8 +39,8 @@ from app.workers.celery_app import celery_app
 logger = logging.getLogger("waytero.sweeper")
 
 
-async def _publish_timeout_events(cabs: list[CabBooking]) -> None:
-    """Push WS events for the cabs we just reverted.
+async def _publish_timeout_events(cabs: list[tuple[CabBooking, Optional[int]]]) -> None:
+    """Push WS events using the recipient saved before clearing the offer.
 
     Uses a fresh session for the partner lookup so we don't extend the
     original transaction. Best-effort — a failure here must not break
@@ -54,13 +54,13 @@ async def _publish_timeout_events(cabs: list[CabBooking]) -> None:
         return
 
     async with AsyncSessionLocal() as db:
-        for cb in cabs:
+        for cb, recipient_partner_id in cabs:
             partner_user_id = None
-            if cb.pending_partner_id is not None:
+            if recipient_partner_id is not None:
                 partner_user_id = (
                     await db.execute(
                         select(Partner.user_id).where(
-                            Partner.id == cb.pending_partner_id
+                            Partner.id == recipient_partner_id
                         )
                     )
                 ).scalar_one_or_none()
@@ -74,7 +74,7 @@ async def _publish_timeout_events(cabs: list[CabBooking]) -> None:
                             "cab_booking_number": cb.booking_number,
                             "master_booking_id": cb.master_booking_id,
                             "decision": "TIMED_OUT",
-                            "cab_status": "PENDING_ASSIGNMENT",
+                            "cab_status": cb.booking_status,
                         },
                     },
                 )
@@ -88,7 +88,7 @@ async def _publish_timeout_events(cabs: list[CabBooking]) -> None:
                     "data": {
                         "cab_booking_number": cb.booking_number,
                         "master_booking_id": cb.master_booking_id,
-                        "new_status": "PENDING_ASSIGNMENT",
+                        "new_status": cb.booking_status,
                         "reason": "PARTNER_ACCEPTANCE_TIMEOUT",
                     },
                 }
@@ -103,7 +103,12 @@ async def _expire_pending_acceptances_async() -> int:
     Run inside its own AsyncSession because Celery worker processes
     don't share the FastAPI request session.
     """
-    affected_cabs: list[CabBooking] = []
+    from app.modules.booking.services.coupon_dispatch import (
+        cancel_if_coupon_exhausted,
+        record_coupon_response_availability,
+    )
+
+    affected_cabs: list[tuple[CabBooking, Optional[int]]] = []
     async with AsyncSessionLocal() as db:
         now = datetime.now(timezone.utc)
 
@@ -125,25 +130,35 @@ async def _expire_pending_acceptances_async() -> int:
             return 0
 
         for cb in cabs:
-            latest: Optional[CabBookingAssignment] = None
-            if cb.assignments:
-                latest = sorted(
-                    cb.assignments,
-                    key=lambda a: a.assigned_at,
-                    reverse=True,
-                )[0]
-            if latest and latest.accepted_at is None and latest.rejected_at is None:
-                latest.rejected_at = now
-                latest.rejection_reason_code = SYSTEM_REJECT_REASON_TIMEOUT
-                latest.rejection_notes = (
-                    f"Auto-rejected by sweeper after deadline "
-                    f"{cb.acceptance_deadline.isoformat() if cb.acceptance_deadline else 'n/a'}"
-                )
+            latest: Optional[CabBookingAssignment] = max(
+                cb.assignments, key=lambda a: (a.assigned_at, a.id), default=None
+            )
+            if (
+                latest is None
+                or latest.partner_id != cb.pending_partner_id
+                or latest.closed_at is not None
+                or latest.accepted_at is not None
+                or latest.rejected_at is not None
+                or latest.rejection_reason_code is not None
+            ):
+                # Never overwrite a response/reassignment with a synthetic timeout.
+                continue
+            recipient_partner_id = cb.pending_partner_id
+            await record_coupon_response_availability(db, cb, latest)
+            latest.rejected_at = now
+            latest.rejection_reason_code = SYSTEM_REJECT_REASON_TIMEOUT
+            latest.rejection_notes = (
+                f"Auto-rejected by sweeper after deadline "
+                f"{cb.acceptance_deadline.isoformat()}"
+            )
+            latest.closed_at = now
+            latest.close_reason = SYSTEM_REJECT_REASON_TIMEOUT
 
             cb.booking_status = "PENDING_ASSIGNMENT"  # type: ignore[assignment]
             cb.partner_responded_at = now  # type: ignore[assignment]
             cb.acceptance_deadline = None  # type: ignore[assignment]
             cb.pending_partner_id = None  # type: ignore[assignment]
+            await cancel_if_coupon_exhausted(db, cb)
 
             db.add(
                 BookingTimeline(
@@ -151,12 +166,12 @@ async def _expire_pending_acceptances_async() -> int:
                     event_type="PARTNER_ACCEPTANCE_TIMEOUT",
                     event_description=(
                         f"Partner did not respond within the acceptance window. "
-                        f"Cab {cb.booking_number} returned to PENDING_ASSIGNMENT."
+                        f"Cab {cb.booking_number}: {cb.booking_status}."
                     ),
                     event_timestamp=now,
                 )
             )
-            affected_cabs.append(cb)
+            affected_cabs.append((cb, recipient_partner_id))
 
         await db.commit()
 
@@ -176,11 +191,11 @@ def expire_pending_partner_acceptances(self) -> int:
     """
     Celery task entry-point. Runs every minute via the beat schedule.
     Synchronous wrapper around the async core because Celery's default
-    worker pool expects sync callables.
+    worker pool expects sync callables. Uses the loop-safe runner so the
+    pooled asyncpg connections are never reused across event loops
+    (fixes "Future attached to a different loop" retries every minute).
     """
-    import asyncio
-
     try:
-        return asyncio.run(_expire_pending_acceptances_async())
+        return run_worker_async(_expire_pending_acceptances_async())
     except Exception as exc:  # pragma: no cover - defensive retry path
         raise self.retry(exc=exc)

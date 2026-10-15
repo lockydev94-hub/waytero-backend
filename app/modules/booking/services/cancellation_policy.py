@@ -36,6 +36,12 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.exceptions import (
+    BusinessException,
+    FinancialException,
+    ResourceNotFoundException,
+)
+
 
 # ════════════════════════════════════════════════════════════════
 # Result type
@@ -982,9 +988,14 @@ async def apply_cab_cancellation(
     cancelled_by_role: str,
     cancelled_source: str,
     is_no_show: bool = False,
+    supplier_failure: bool = False,
     now: Optional[datetime] = None,
 ) -> Dict[str, Any]:
     """Compute the policy math, persist the cancellation rows, auto-refund.
+
+    supplier_failure=True overrides the customer ladder: the platform could not
+    deliver a driver (every coupon-partner offer declined/timed out), so the
+    customer owes nothing and every rupee of the advance comes back.
 
     Returns a dict with: charge, refund_amount, refund_percent, tier_label,
     policy_snapshot, advance_refunded_total, new_wallet_balance (if any),
@@ -1029,6 +1040,17 @@ async def apply_cab_cancellation(
         is_post_assignment=post_assignment,
         now=now,
     )
+    if supplier_failure:
+        quote = CancellationQuote(
+            charge=Decimal("0"),
+            refund_amount=advance_total,
+            refund_percent=Decimal("100"),
+            tier_label="SUPPLIER_FAILURE",
+            policy_snapshot={
+                "basis": "supplier_failure",
+                "rule": "No eligible coupon partner delivered a cab; full advance refund, zero charge.",
+            },
+        )
 
     # 2. Auto-refund to customer wallet — capped at the live advance total.
     refunded = Decimal("0")

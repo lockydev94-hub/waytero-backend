@@ -13,6 +13,8 @@ from decimal import Decimal
 from typing import Any, Optional
 from uuid import UUID
 
+from app.shared.utilities.seo import SlugValidatorMixin
+
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 ORM = ConfigDict(from_attributes=True)
@@ -23,9 +25,10 @@ ORM = ConfigDict(from_attributes=True)
 # ============================================================
 
 
-class HotelCategoryCreate(BaseModel):
+class HotelCategoryCreate(SlugValidatorMixin, BaseModel):
     category_code: str = Field(..., max_length=50)
     label: str = Field(..., max_length=150)
+    slug: Optional[str] = Field(None, max_length=120)
     description: Optional[str] = None
     image_url: Optional[str] = None
     icon_url: Optional[str] = None
@@ -36,8 +39,9 @@ class HotelCategoryCreate(BaseModel):
     is_active: bool = True
 
 
-class HotelCategoryUpdate(BaseModel):
+class HotelCategoryUpdate(SlugValidatorMixin, BaseModel):
     label: Optional[str] = Field(None, max_length=150)
+    slug: Optional[str] = Field(None, max_length=120)
     description: Optional[str] = None
     image_url: Optional[str] = None
     icon_url: Optional[str] = None
@@ -52,6 +56,7 @@ class HotelCategoryResponse(BaseModel):
     id: int
     category_code: str
     label: str
+    slug: Optional[str] = None
     description: Optional[str] = None
     image_url: Optional[str] = None
     icon_url: Optional[str] = None

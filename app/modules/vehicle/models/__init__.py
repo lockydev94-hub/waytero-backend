@@ -52,6 +52,7 @@ class VehicleCategory(Base):
     icon_url = Column(sa.Text, nullable=True)  # small icon for cards/filters
 
     # SEO metadata for website category pages — added in migration 0018
+    slug = Column(String(120), nullable=True)
     seo_title = Column(String(120), nullable=True)
     seo_description = Column(String(320), nullable=True)
     seo_keywords = Column(String(500), nullable=True)

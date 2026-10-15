@@ -416,6 +416,9 @@ class CabBookingAssignment(Base):
     rejection_reason_code = Column(String(50), nullable=True)
     rejection_notes = Column(Text, nullable=True)
     acceptance_deadline = Column(DateTime(timezone=True), nullable=True)
+    available_cabs_at_offer = Column(Integer, nullable=True)
+    available_cabs_at_decline = Column(Integer, nullable=True)
+    availability_checked_at = Column(DateTime(timezone=True), nullable=True)
     # ── Swap lifecycle (added migration 0041) ───────────────────────────────
     # closed_at IS NULL means this is the *currently active* assignment.
     # close_reason explains how it ended:

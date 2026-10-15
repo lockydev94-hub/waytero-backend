@@ -53,6 +53,9 @@ class _StubScalarResult:
     def scalar_one_or_none(self) -> Any:
         return self._value
 
+    def scalar(self) -> Any:
+        return self._value
+
     def scalars(self) -> Any:
         # Mimic SQLAlchemy: .scalars().all() returns the list as-is.
         # If a single object was queued, treat it as a single-row list.
@@ -61,6 +64,22 @@ class _StubScalarResult:
         if self._value is None:
             return _Scalars([])
         return _Scalars([self._value])
+
+    def mappings(self) -> Any:
+        return self
+
+    def first(self) -> Any:
+        if isinstance(self._value, list):
+            return self._value[0] if self._value else None
+        return self._value
+
+    def one_or_none(self) -> Any:
+        return self._value
+
+    def all(self) -> Any:
+        if isinstance(self._value, list):
+            return self._value
+        return [] if self._value is None else [self._value]
 
 
 class _Scalars:
@@ -96,6 +115,15 @@ class _StubDb:
         self, _stmt: Any = None, *_args: Any, **_kwargs: Any
     ) -> _StubScalarResult:
         self.executed.append(_stmt)
+        # Coupon participation bookkeeping (migration 0075) is orthogonal to
+        # what these tests assert — answer it with an empty result so the
+        # queued rows for the real flow stay in position.
+        try:
+            sql = str(_stmt)
+        except Exception:  # pragma: no cover - defensive
+            sql = ""
+        if "coupon_usages" in sql or "coupon_partner_rules" in sql:
+            return _StubScalarResult(None)
         if self.queue:
             result = self.queue.pop(0)
             self.loaded.append(result._value)
@@ -222,7 +250,7 @@ def _partner(
     return SimpleNamespace(
         id=partner_id,
         business_name=business_name,
-        partner_status="APPROVED",
+        status="APPROVED",
         city_id=1,
     )
 

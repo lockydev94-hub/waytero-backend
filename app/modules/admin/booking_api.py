@@ -1587,6 +1587,74 @@ async def get_booking(booking_id: int, db: AsyncSession = Depends(get_db)):
 
 
 # ════════════════════════════════════════════════════════════════
+# PARTNER-FUNDED COUPON LOCK (migration 0075) — helpers
+# ════════════════════════════════════════════════════════════════
+
+
+async def _partner_coupon_lock(db: AsyncSession, cab_booking_id: int):
+    """Return the redemption snapshot for this cab's partner-funded coupon:
+    {coupon_id, coupon_code, coupon_type, eligible_partner_ids} — or None.
+
+    Reads coupon_usages (immutable, per-booking), never coupons' mutable
+    config: editing a coupon after booking must not re-lock live bookings."""
+    row = (
+        (
+            await db.execute(
+                text(
+                    """
+                SELECT cu.coupon_id, co.coupon_code, cu.coupon_type,
+                       cu.eligible_partner_ids
+                FROM coupon_usages cu
+                JOIN coupons co ON co.id = cu.coupon_id
+                WHERE cu.cab_booking_id = :cbid
+                  AND cu.coupon_type IN ('PARTNER_ONLY', 'PLATFORM_PARTNER')
+                """
+                ),
+                {"cbid": cab_booking_id},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if row is None or not (row["eligible_partner_ids"] or []):
+        return None
+    return row
+
+
+async def _count_partner_free_cabs(
+    db: AsyncSession, partner_id: int, vehicle_category_id: Optional[int]
+) -> int:
+    """Free (not on an active trip) APPROVED/ACTIVE vehicles a partner has for
+    the booking category — snapshotted on the assignment row as the decline
+    record for the coupon partners screen."""
+    return (
+        (
+            await db.execute(
+                text(
+                    """
+                SELECT COUNT(v.id)
+                FROM vehicles v
+                WHERE v.partner_id = :pid
+                  AND v.status IN ('APPROVED', 'ACTIVE')
+                  AND (:cat_id IS NULL OR v.vehicle_category_id = :cat_id)
+                  AND NOT EXISTS (
+                        SELECT 1
+                        FROM cab_booking_assignments cba2
+                        JOIN cab_bookings cb2 ON cb2.id = cba2.cab_booking_id
+                        WHERE cba2.vehicle_id = v.id
+                          AND cb2.booking_status IN
+                              ('ASSIGNED', 'DRIVER_ASSIGNED', 'STARTED')
+                  )
+                """
+                ),
+                {"pid": partner_id, "cat_id": vehicle_category_id},
+            )
+        ).scalar()
+        or 0
+    )
+
+
+# ════════════════════════════════════════════════════════════════
 # ASSIGN PARTNER — POST /admin/bookings/{booking_id}/cab/{cab_id}/assign-partner
 # Doc Ref: Admin API §11, Booking API §16
 # Guard: cab must be PENDING_ASSIGNMENT
@@ -1645,6 +1713,29 @@ async def assign_partner(
             f"Partner is not eligible for assignment (status: {partner.status}). Partner must be APPROVED or ACTIVE.",
         )
 
+    # ── Partner-funded coupon assignment lock (migration 0075) ─────────────
+    # A booking created with a PARTNER_ONLY / PLATFORM_PARTNER coupon must be
+    # fulfilled by a partner joined to that coupon — the discount is deducted
+    # from this partner's settlement, so assigning an unjoined partner would
+    # charge the wrong wallet.
+    coupon_lock = await _partner_coupon_lock(db, cb.id)
+    if coupon_lock:
+        cohort = coupon_lock["eligible_partner_ids"] or []
+        if payload.partner_id not in cohort:
+            raise HTTPException(
+                400,
+                f"Cannot assign: this cab carries the partner-funded coupon "
+                f"'{coupon_lock['coupon_code']}' — only partners that joined "
+                "the coupon when the customer redeemed it can be assigned "
+                "(admin → Coupons → Partners).",
+            )
+
+    # Snapshot free-cab count for the offered partner (decline record used by
+    # the coupon partners screen — migration 0075).
+    available_cabs_at_offer = await _count_partner_free_cabs(
+        db, payload.partner_id, cb.vehicle_category_id
+    )
+
     # If the cab is already sitting with a partner in the acceptance window,
     # close that row first so it doesn't linger as an open accepted_at.
     if cb.booking_status == "PENDING_PARTNER_ACCEPTANCE":
@@ -1672,6 +1763,7 @@ async def assign_partner(
         assigned_at=datetime.now(timezone.utc),
         assignment_type="MANUAL",
         acceptance_deadline=deadline,
+        available_cabs_at_offer=int(available_cabs_at_offer),
     )
     db.add(assignment)
 
@@ -1821,6 +1913,36 @@ async def assign_driver(
 
 
 # ════════════════════════════════════════════════════════════════
+# COUPON LOCK (read) — GET /admin/bookings/{booking_id}/cab/{cab_id}/coupon-lock
+# Migration 0075: the assign-partner dialog filters joined partners when the
+# booking redeemed a partner-funded coupon.
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/{booking_id}/cab/{cab_id}/coupon-lock", tags=["Admin Bookings"])
+async def get_cab_coupon_lock(
+    booking_id: int,
+    cab_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_roles("ADMIN", "SUPER_ADMIN", "CCO")),
+):
+    mb = await _get_master_booking(db, booking_id)
+    cb = next((c for c in mb.cab_bookings if c.id == cab_id), None)
+    if not cb:
+        raise HTTPException(404, "Cab booking not found")
+    lock = await _partner_coupon_lock(db, cb.id)
+    if lock is None:
+        return {"locked": False}
+    return {
+        "locked": True,
+        "coupon_id": lock["coupon_id"],
+        "coupon_code": lock["coupon_code"],
+        "coupon_type": lock["coupon_type"],
+        "eligible_partner_ids": lock["eligible_partner_ids"] or [],
+    }
+
+
+# ════════════════════════════════════════════════════════════════
 # REASSIGN PARTNER — POST /admin/bookings/{booking_id}/cab/{cab_id}/reassign
 # Doc Ref: Admin API §11
 # Guard: Cannot reassign if trip has STARTED
@@ -1876,6 +1998,23 @@ async def reassign_partner(
             f"Partner is not eligible for reassignment (status: {partner.status}). Partner must be APPROVED or ACTIVE.",
         )
 
+    # Partner-funded coupon assignment lock (migration 0075) — same rule as
+    # assign-partner: only joined partners may take over a coupon-bound cab.
+    coupon_lock = await _partner_coupon_lock(db, cb.id)
+    if coupon_lock:
+        cohort = coupon_lock["eligible_partner_ids"] or []
+        if payload.partner_id not in cohort:
+            raise HTTPException(
+                400,
+                f"Cannot reassign: this cab carries the partner-funded coupon "
+                f"'{coupon_lock['coupon_code']}' — only partners that joined "
+                "the coupon when the customer redeemed it can take over "
+                "(admin → Coupons → Partners).",
+            )
+    available_cabs_at_offer = await _count_partner_free_cabs(
+        db, payload.partner_id, cb.vehicle_category_id
+    )
+
     # Close any pending row first so the audit trail is consistent.
     if cb.booking_status == "PENDING_PARTNER_ACCEPTANCE":
         from app.modules.partner.constants import SYSTEM_REJECT_REASON_ADMIN_REASSIGN
@@ -1902,6 +2041,7 @@ async def reassign_partner(
         assigned_at=datetime.now(timezone.utc),
         assignment_type="MANUAL",
         acceptance_deadline=deadline,
+        available_cabs_at_offer=int(available_cabs_at_offer),
     )
     db.add(assignment)
     cb.booking_status = "PENDING_PARTNER_ACCEPTANCE"

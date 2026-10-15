@@ -109,13 +109,19 @@ class PublicPlatformProfileOut(BaseModel):
     empty strings when the admin hasn't uploaded the asset yet — customer-web
     then falls back to its bundled static files. support_phone is the contact
     number saved under Settings → Platform Details (SUPPORT_PHONE key);
-    customer-web falls back to its own default when empty.
+    support_email/office_address/tagline/social_links come from the brand
+    master keys seeded by migration 0072. customer-web falls back to its own
+    brand master when a value is empty.
     """
 
     logo_url: str = ""
     favicon_url: str = ""
     og_image_url: str = ""
     support_phone: str = ""
+    support_email: str = ""
+    office_address: str = ""
+    tagline: str = ""
+    social_links: dict = {}
 
 
 @router.get(
@@ -128,7 +134,10 @@ class PublicPlatformProfileOut(BaseModel):
         "admin uploaded under Settings → Platform Profile. The customer-web "
         "uses favicon_url for the browser tab icon and og_image_url for "
         "social shares; empty strings mean the admin hasn't uploaded yet. "
-        "No authentication required."
+        "Also returns contact/brand fields from system_configurations "
+        "(SUPPORT_PHONE, SUPPORT_EMAIL, OFFICE_ADDRESS, PLATFORM_TAGLINE, "
+        "SOCIAL_* keys) — customer-web falls back to its owner-approved "
+        "brand master when a value is empty. No authentication required."
     ),
 )
 async def get_public_platform_profile(
@@ -140,18 +149,71 @@ async def get_public_platform_profile(
                 "SELECT config_key, config_value FROM system_configurations "
                 "WHERE config_key IN ("
                 "'PLATFORM_LOGO_URL', 'PLATFORM_FAVICON_URL', 'PLATFORM_OG_IMAGE_URL', "
-                "'SUPPORT_PHONE'"
+                "'SUPPORT_PHONE', 'SUPPORT_EMAIL', 'OFFICE_ADDRESS', "
+                "'PLATFORM_TAGLINE', 'SOCIAL_YOUTUBE', 'SOCIAL_INSTAGRAM', 'SOCIAL_FACEBOOK'"
                 ")"
             )
         )
     ).all()
     cfg = {key: (value or "") for key, value in rows}
+    socials = {
+        platform: url.strip()
+        for platform, url in (
+            ("youtube", cfg.get("SOCIAL_YOUTUBE", "")),
+            ("instagram", cfg.get("SOCIAL_INSTAGRAM", "")),
+            ("facebook", cfg.get("SOCIAL_FACEBOOK", "")),
+        )
+        if url.strip()
+    }
     return PublicPlatformProfileOut(
         logo_url=cfg.get("PLATFORM_LOGO_URL", ""),
         favicon_url=cfg.get("PLATFORM_FAVICON_URL", ""),
         og_image_url=cfg.get("PLATFORM_OG_IMAGE_URL", ""),
         support_phone=cfg.get("SUPPORT_PHONE", "").strip(),
+        support_email=cfg.get("SUPPORT_EMAIL", "").strip(),
+        office_address=cfg.get("OFFICE_ADDRESS", "").strip(),
+        tagline=cfg.get("PLATFORM_TAGLINE", "").strip(),
+        social_links=socials,
     )
+
+
+@router.get(
+    "/site-seo",
+    tags=["Public Homepage"],
+    summary="Per-page head metadata authored in system configurations",
+    description=(
+        "Returns {page_key: {title, description}} for every SEO_PAGE_* "
+        "key in system_configurations (seeded by migration 0072, editable "
+        "by the admin). customer-web uses these for static-page <head> "
+        "metadata and falls back to its brand master when a page has no "
+        "DB row. No authentication required."
+    ),
+)
+async def get_public_site_seo(db: AsyncSession = Depends(get_db)) -> dict:
+    rows = (
+        await db.execute(
+            text(
+                "SELECT config_key, config_value FROM system_configurations "
+                "WHERE config_key LIKE 'SEO_PAGE\\_%'"
+            )
+        )
+    ).all()
+    out: dict = {}
+    for key, value in rows:
+        try:
+            data = json.loads(value or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        slug = key.removeprefix("SEO_PAGE_").lower()
+        title = data.get("title")
+        description = data.get("description")
+        title = title.strip() if isinstance(title, str) else ""
+        description = description.strip() if isinstance(description, str) else ""
+        if title or description:
+            out[slug] = {"title": title, "description": description}
+    return out
 
 
 class PublicAuthModalImagesOut(BaseModel):

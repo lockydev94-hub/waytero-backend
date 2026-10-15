@@ -63,6 +63,7 @@ from app.modules.admin.schemas import (
     VehicleCategoryCreate,
     VehicleCategoryUpdate,
 )
+from app.shared.utilities.seo import ensure_slug_unique, unique_slug
 
 
 # ── System Configuration ──────────────────────────────────────────────────────
@@ -589,7 +590,14 @@ class VehicleCategoryService:
     async def create(
         db: AsyncSession, payload: VehicleCategoryCreate
     ) -> VehicleCategory:
-        cat = VehicleCategory(**payload.model_dump())
+        data = payload.model_dump()
+        if data.get("slug"):
+            await ensure_slug_unique(db, VehicleCategory, data["slug"])
+        else:
+            data["slug"] = await unique_slug(
+                db, VehicleCategory, data.get("category_name") or ""
+            )
+        cat = VehicleCategory(**data)
         db.add(cat)
         await db.flush()
         await db.refresh(cat)
@@ -605,7 +613,12 @@ class VehicleCategoryService:
         cat = result.scalar_one_or_none()
         if not cat:
             return None
-        for field, val in payload.model_dump(exclude_unset=True).items():
+        data = payload.model_dump(exclude_unset=True)
+        if data.get("slug"):
+            await ensure_slug_unique(
+                db, VehicleCategory, data["slug"], exclude_id=cat_id
+            )
+        for field, val in data.items():
             setattr(cat, field, val)
         await db.flush()
         await db.refresh(cat)
@@ -784,6 +797,8 @@ class ServiceTypeService:
         if not obj:
             return None
         data = payload.model_dump(exclude_unset=True)
+        if data.get("slug"):
+            await ensure_slug_unique(db, ServiceType, data["slug"], exclude_id=st_id)
         for field, val in data.items():
             setattr(obj, field, val)
         await db.flush()
@@ -806,9 +821,15 @@ class ServiceTypeService:
         ).scalar_one_or_none()
         if existing:
             raise ValueError(f"Service type '{type_code}' already exists")
+        if payload.slug:
+            await ensure_slug_unique(db, ServiceType, payload.slug)
+            slug = payload.slug
+        else:
+            slug = await unique_slug(db, ServiceType, payload.label or type_code)
         obj = ServiceType(
             type_code=type_code,
             label=payload.label,
+            slug=slug,
             description=payload.description,
             icon_url=payload.icon_url,
             image_url=payload.image_url,
@@ -1280,12 +1301,15 @@ class CmsService:
     _HEADER_DEFAULTS: dict = {
         "logo_url": None,  # frontend uses SVG wordmark fallback
         "logo_alt_text": "WayTero",
-        "tagline": "India's Travel OS",
+        "tagline": "Explore More. Travel Better.",
         "show_search_bar": True,
         "show_login_button": True,
         "cta_text": "Book a Cab",
         "cta_link": "/cabs",
-        "support_phone": "1800-WAYTERO",
+        # Empty on purpose: the real number lives in
+        # system_configurations.SUPPORT_PHONE (migration 0072); the website
+        # shows its brand-master fallback when nothing is configured.
+        "support_phone": "",
         "contact_email": "support@waytero.com",
         "nav_links": [
             {"label": "Cabs", "href": "/cabs", "icon": "car"},
@@ -1293,12 +1317,11 @@ class CmsService:
             {"label": "Tours", "href": "/tours", "icon": "compass"},
             {"label": "Track", "href": "/track", "icon": "navigation"},
         ],
+        # Owner-approved official profiles only (WAYTERO-PROJECT-MASTER).
         "social_links": {
-            "facebook": "https://facebook.com/waytero",
-            "twitter": "https://twitter.com/waytero",
-            "instagram": "https://instagram.com/waytero",
-            "linkedin": "https://linkedin.com/company/waytero",
-            "youtube": "https://youtube.com/@waytero",
+            "youtube": "https://www.youtube.com/@WayTero",
+            "instagram": "https://www.instagram.com/waytero.official/",
+            "facebook": "https://www.facebook.com/WayTero",
         },
         "background_color": None,
         "text_color": None,
@@ -1311,12 +1334,10 @@ class CmsService:
             "India's Travel Operating System — connecting customers, partners, "
             "drivers, hotels, and tour operators on one seamless platform."
         ),
-        "copyright_text": (
-            "© 2025 WayTero Travel Technologies Pvt Ltd · "
-            "CIN U63090OR2023PTC · Built in Bhubaneswar, Odisha"
-        ),
-        "company_address": "Bhubaneswar, Odisha, India",
-        "support_phone": "1800-WAYTERO",
+        # No invented company registration numbers — plain brand line.
+        "copyright_text": "WayTero · waytero.com · All rights reserved.",
+        "company_address": "Avinue Appartment, Gothapatana, Bhubaneswar - 751003",
+        "support_phone": "",  # real value: system_configurations.SUPPORT_PHONE
         "contact_email": "support@waytero.com",
         "quick_links": [
             {"label": "Book a Cab", "href": "/cabs"},
@@ -1332,11 +1353,9 @@ class CmsService:
             {"label": "Cookie Policy", "href": "/cookies"},
         ],
         "social_links": {
-            "facebook": "https://facebook.com/waytero",
-            "twitter": "https://twitter.com/waytero",
-            "instagram": "https://instagram.com/waytero",
-            "linkedin": "https://linkedin.com/company/waytero",
-            "youtube": "https://youtube.com/@waytero",
+            "youtube": "https://www.youtube.com/@WayTero",
+            "instagram": "https://www.instagram.com/waytero.official/",
+            "facebook": "https://www.facebook.com/WayTero",
         },
         "payment_icons": [],
         "app_store_links": {},

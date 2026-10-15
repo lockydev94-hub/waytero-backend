@@ -26,11 +26,13 @@
 #   Plain cash still nets to −commission and plain online still nets to the full
 #   payout, so the familiar cases are unchanged. See _compute_position.
 #
-# Coupon record:
-#   If a coupon was used, admin owes the discount amount to the partner
-#   (coupon discount should not reduce partner's earnings).
-#   A pending_coupon_disbursements record is written.
-#   Separate "Coupon Disbursements" page shows these for admin to approve.
+# Coupon record (migration 0075 made coupons cost-bearer aware):
+#   PLATFORM coupons: admin owes the full discount to the partner — a
+#   pending_coupon_disbursements record is written and the "Coupon
+#   Disbursements" page shows it for admin approval.
+#   PARTNER_ONLY / PLATFORM_PARTNER coupons: the partner-funded share is
+#   NOT reimbursed (it stays deducted from the partner payout via the net
+#   formula); only the platform share is recorded for disbursement.
 #
 # Doc Ref: BRD Part 6 §129, §137-143, §147
 # ============================================================
@@ -56,7 +58,6 @@ from app.modules.booking.models import (
 from app.modules.customer.models import Customer
 from app.modules.partner.models import Partner
 from app.modules.auth.models.user import User
-from app.modules.admin.coupon_models import CouponUsage
 
 router = APIRouter()
 
@@ -143,12 +144,14 @@ async def _get_partner_wallet(db: AsyncSession, partner_id: int):
 async def _credit_partner_wallet(
     db: AsyncSession,
     wallet_id: int,
-    amount: float,
-    current_balance: float,
+    amount: float | Decimal,
+    current_balance: float | Decimal,
     reference: str,
     narration: str,
     reference_type: str = "SETTLEMENT",
 ):
+    if isinstance(amount, Decimal):
+        current_balance = Decimal(str(current_balance))
     new_bal = round(current_balance + amount, 2)
     await db.execute(
         text("UPDATE wallets SET available_balance = :bal WHERE id = :wid"),
@@ -178,12 +181,14 @@ async def _credit_partner_wallet(
 async def _debit_partner_wallet(
     db: AsyncSession,
     wallet_id: int,
-    amount: float,
-    current_balance: float,
+    amount: float | Decimal,
+    current_balance: float | Decimal,
     reference: str,
     narration: str,
     reference_type: str = "COMMISSION_DEBIT",
 ):
+    if isinstance(amount, Decimal):
+        current_balance = Decimal(str(current_balance))
     new_bal = round(current_balance - amount, 2)
     await db.execute(
         text("UPDATE wallets SET available_balance = :bal WHERE id = :wid"),
@@ -229,8 +234,11 @@ async def _debit_partner_wallet(
 #   net < 0  → the partner is holding ours    → debit the wallet
 #   net == 0 → everything already nets out    → no wallet movement
 #
-# Coupon is subtracted because it is platform-funded and reimbursed separately
-# through pending_coupon_disbursements; leaving it in paid the partner twice.
+# Coupon is subtracted in full because whatever the customer did not pay due
+# to a coupon was never collected; the platform share is then reimbursed
+# separately through pending_coupon_disbursements, while the partner share
+# (migration 0075) stays deducted — that is how the partner funds the discount.
+# Leaving the full coupon in paid the partner twice for platform-funded rows.
 #
 # On a GST booking the cash the partner holds includes the GST the customer
 # paid, while partner_payout does not — so GST correctly lands on the debit
@@ -259,7 +267,8 @@ def _compute_position(
 
     balance_due = advance_service.compute_balance_due(
         final_amount=final,
-        coupon_discount=coupon_discount,
+        # Compatibility boundary for the existing float-based fare calculator.
+        coupon_discount=float(coupon_discount),
         advance_paid=advance_amount,
         gst_amount=gst_amount,
         is_tax_invoice=is_tax_invoice,
@@ -278,7 +287,14 @@ def _compute_position(
     )
 
     partner_held = round(advance_held + balance_held, 2)
-    net = round(partner_payout - partner_held - coupon_discount, 2)
+    net = float(
+        round(
+            Decimal(str(partner_payout))
+            - Decimal(str(partner_held))
+            - Decimal(str(coupon_discount)),
+            2,
+        )
+    )
 
     return {
         "advance_paid": advance_amount,
@@ -291,6 +307,215 @@ def _compute_position(
         "partner_payout": partner_payout,
         "net_settlement": net,
         "wallet_direction": "CREDIT" if net > 0 else ("DEBIT" if net < 0 else "NONE"),
+    }
+
+
+_COUPON_SERVICES = {
+    "CAB": ("cab_booking_id", "cab_bookings"),
+    "HOTEL": ("hotel_reservation_id", "hotel_reservations"),
+    "TOUR": ("tour_booking_id", "tour_bookings"),
+}
+
+
+def _coupon_error(reason: str) -> HTTPException:
+    return HTTPException(409, f"Coupon funding reconciliation required: {reason}")
+
+
+def _coupon_decimal(value, label: str) -> Decimal:
+    """Validate money without rounding away a snapshot discrepancy."""
+    from decimal import InvalidOperation
+
+    try:
+        amount = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError):
+        raise _coupon_error(f"{label} is missing or invalid.") from None
+    if not amount.is_finite() or amount < 0:
+        raise _coupon_error(f"{label} must be a finite, non-negative amount.")
+    if amount != amount.quantize(Decimal("0.01")):
+        raise _coupon_error(f"{label} must be an exact currency amount.")
+    return amount
+
+
+def _validate_coupon_split(total, platform_share, partner_share):
+    funding = (
+        _coupon_decimal(total, "discount"),
+        _coupon_decimal(platform_share, "platform share"),
+        _coupon_decimal(partner_share, "partner share"),
+    )
+    if funding[1] + funding[2] != funding[0]:
+        raise _coupon_error(
+            "platform and partner shares do not sum to the full discount."
+        )
+    return funding
+
+
+async def _coupon_funding_split(
+    db: AsyncSession,
+    master_booking_id: int,
+    *,
+    service_type: str,
+    service_id: int,
+    coupon_discount,
+) -> tuple[Decimal, Decimal, Decimal]:
+    """Read the exact service's immutable redemption, never the editable coupon.
+
+    Migration 0075 backfills legacy PLATFORM funding and unambiguous service
+    links. Unresolved discounted bookings require reconciliation, not a new
+    funding assumption. Only a zero-discount booking may have no usage.
+    """
+    expected = _coupon_decimal(coupon_discount or 0, "booking discount")
+    column, _ = _COUPON_SERVICES[service_type]
+    rows = (
+        (
+            await db.execute(
+                text(
+                    f"SELECT master_booking_id, cab_booking_id, hotel_reservation_id, "
+                    f"tour_booking_id, discount_applied, coupon_type, platform_share, partner_share "
+                    f"FROM coupon_usages WHERE {column} = :service_id"
+                ),
+                {"service_id": service_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    if not rows and expected == 0:
+        return Decimal("0.00"), Decimal("0.00"), Decimal("0.00")
+    if len(rows) != 1:
+        raise _coupon_error(
+            f"{service_type} #{service_id} requires exactly one linked usage; found {len(rows)}."
+        )
+    row = rows[0]
+    if row["master_booking_id"] != master_booking_id or any(
+        row[key] is not None for key, _ in _COUPON_SERVICES.values() if key != column
+    ):
+        raise _coupon_error(
+            f"{service_type} #{service_id} usage has mismatching service/master linkage."
+        )
+    funding = _validate_coupon_split(
+        row["discount_applied"], row["platform_share"], row["partner_share"]
+    )
+    if funding[0] != expected:
+        raise _coupon_error(
+            f"{service_type} #{service_id} booking discount {expected} differs from usage {funding[0]}."
+        )
+    owner = row["coupon_type"]
+    if owner not in {"PLATFORM", "PARTNER_ONLY", "PLATFORM_PARTNER"}:
+        raise _coupon_error("usage has an invalid or missing coupon type.")
+    if (owner == "PLATFORM" and funding[2] != 0) or (
+        owner == "PARTNER_ONLY" and funding[1] != 0
+    ):
+        raise _coupon_error("usage shares disagree with its immutable coupon type.")
+    return funding
+
+
+async def _existing_coupon_disbursement(
+    db, *, service_type, service_id, master_booking_id, partner_id, funding
+):
+    """Validate an existing record BEFORE any settlement wallet writes."""
+    _validate_coupon_split(*funding)
+    column, _ = _COUPON_SERVICES[service_type]
+    row = (
+        (
+            await db.execute(
+                text(
+                    f"SELECT * FROM pending_coupon_disbursements WHERE {column} = :service_id"
+                ),
+                {"service_id": service_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if row:
+        recorded = _validate_coupon_split(
+            row["coupon_discount_amount"], row["platform_share"], row["partner_share"]
+        )
+        if (
+            recorded != funding
+            or row["master_booking_id"] != master_booking_id
+            or row["partner_id"] != partner_id
+            or row["service_type"] != service_type
+            or any(
+                row[key] is not None
+                for key, _ in _COUPON_SERVICES.values()
+                if key != column
+            )
+        ):
+            raise _coupon_error(
+                "existing disbursement does not match this service's funding."
+            )
+        if row["status"] != "PENDING":
+            raise _coupon_error(
+                "a disbursement was already processed for this unsettled service."
+            )
+    return row["id"] if row else None
+
+
+async def _record_coupon_disbursement(
+    db,
+    *,
+    service_type,
+    service_id,
+    master_booking_id,
+    partner_id,
+    customer_id,
+    booking_number,
+    invoice_number,
+    funding,
+    existing_id,
+):
+    total, platform, partner = _validate_coupon_split(*funding)
+    if platform == 0:
+        note = (
+            f" Coupon ₹{total:.2f} is partner-funded — already netted out; nothing to disburse."
+            if total
+            else ""
+        )
+        return None, note
+    column, _ = _COUPON_SERVICES[service_type]
+    if existing_id is None:
+        result = await db.execute(
+            text(
+                f"INSERT INTO pending_coupon_disbursements "
+                f"({column}, master_booking_id, partner_id, customer_id, coupon_discount_amount, "
+                f"platform_share, partner_share, booking_number, invoice_number, service_type, status, created_at) "
+                f"VALUES (:sid, :mbid, :pid, :cid, :amt, :pshare, :ushare, :bn, :inv, :service, 'PENDING', NOW()) "
+                f"RETURNING id"
+            ),
+            {
+                "sid": service_id,
+                "mbid": master_booking_id,
+                "pid": partner_id,
+                "cid": customer_id,
+                "amt": total,
+                "pshare": platform,
+                "ushare": partner,
+                "bn": booking_number,
+                "inv": invoice_number,
+                "service": service_type,
+            },
+        )
+        existing_id = result.scalar_one()
+    return existing_id, (
+        f" Coupon disbursement of ₹{platform:.2f} (platform share of ₹{total:.2f}) "
+        "recorded (pending admin approval on Coupon Disbursements page)."
+    )
+
+
+def _coupon_disbursement_detail(row):
+    if not row:
+        return None
+    total, platform, partner = _validate_coupon_split(
+        row["coupon_discount_amount"], row["platform_share"], row["partner_share"]
+    )
+    return {
+        "id": row["id"],
+        "amount": float(platform),
+        "coupon_discount_amount": float(total),
+        "platform_share": float(platform),
+        "partner_share": float(partner),
+        "status": row["status"],
     }
 
 
@@ -348,13 +573,16 @@ async def _build_settlement_detail(
         if w:
             partner_wallet_balance = float(w["available_balance"] or 0)
 
-    # Coupon discount
-    coupon_q = await db.execute(
-        select(func.sum(CouponUsage.discount_applied)).where(
-            CouponUsage.master_booking_id == mb.id
+    # Coupon discount + funding split (migration 0075)
+    coupon_discount, coupon_platform_share, coupon_partner_share = (
+        await _coupon_funding_split(
+            db,
+            mb.id,
+            service_type="CAB",
+            service_id=cb.id,
+            coupon_discount=cb.coupon_discount,
         )
     )
-    coupon_discount = float(coupon_q.scalar() or 0)
 
     final = float(cb.final_amount or 0)
     commission = float(cb.platform_commission or 0)
@@ -379,7 +607,8 @@ async def _build_settlement_detail(
         (
             await db.execute(
                 text(
-                    "SELECT id, coupon_discount_amount, status FROM pending_coupon_disbursements WHERE cab_booking_id = :bid"
+                    "SELECT id, coupon_discount_amount, platform_share, partner_share, "
+                    "status FROM pending_coupon_disbursements WHERE cab_booking_id = :bid"
                 ),
                 {"bid": cb.id},
             )
@@ -387,13 +616,7 @@ async def _build_settlement_detail(
         .mappings()
         .one_or_none()
     )
-    coupon_disbursement = None
-    if cpd:
-        coupon_disbursement = {
-            "id": cpd["id"],
-            "amount": float(cpd["coupon_discount_amount"] or 0),
-            "status": cpd["status"],
-        }
+    coupon_disbursement = _coupon_disbursement_detail(cpd)
 
     return {
         # Step 1: Booking details
@@ -410,7 +633,11 @@ async def _build_settlement_detail(
         "invoice_url": cb.invoice_url,
         # Step 2: Payment details
         "final_amount": final,
-        "coupon_discount": coupon_discount,
+        "coupon_discount": float(coupon_discount),
+        "coupon_platform_share": float(coupon_platform_share),
+        "coupon_partner_share": float(coupon_partner_share),
+        # Entitlement after coupon funding, before custody/TDS (not another debit).
+        "net_partner_entitlement": float(Decimal(str(payout)) - coupon_partner_share),
         "advance_paid": advance_paid,
         "advance": advance_service.advance_summary(advance),
         "balance_due": balance_due,
@@ -631,13 +858,27 @@ async def settle_booking(
     if not partner_id:
         raise HTTPException(400, "No partner assigned to this booking. Cannot settle.")
 
-    # Coupon discount
-    coupon_q = await db.execute(
-        select(func.sum(CouponUsage.discount_applied)).where(
-            CouponUsage.master_booking_id == mb.id
-        )
+    # Coupon discount + funding split (migration 0075)
+    (
+        coupon_discount,
+        coupon_platform_share,
+        coupon_partner_share,
+    ) = await _coupon_funding_split(
+        db,
+        mb.id,
+        service_type="CAB",
+        service_id=cb.id,
+        coupon_discount=cb.coupon_discount,
     )
-    coupon_discount = float(coupon_q.scalar() or 0)
+    funding = (coupon_discount, coupon_platform_share, coupon_partner_share)
+    existing_cpd = await _existing_coupon_disbursement(
+        db,
+        service_type="CAB",
+        service_id=cb.id,
+        master_booking_id=mb.id,
+        partner_id=partner_id,
+        funding=funding,
+    )
 
     wallet_row = await _get_partner_wallet(db, partner_id)
     if not wallet_row:
@@ -673,7 +914,14 @@ async def settle_booking(
     # The arithmetic, spelled out — this is the trail finance reads back.
     workings = (
         f"Fare ₹{final:.2f} | Commission ₹{commission:.2f} | Payout ₹{payout:.2f} | "
-        f"Coupon ₹{coupon_discount:.2f} | "
+        f"Coupon ₹{coupon_discount:.2f}"
+        + (
+            f" (platform ₹{coupon_platform_share:.2f} / "
+            f"partner ₹{coupon_partner_share:.2f})"
+            if coupon_partner_share > 0
+            else ""
+        )
+        + " | "
         f"Advance ₹{position['advance_paid']:.2f}"
         + (f" received by {position['advance_received_by']}" if advance else " (none)")
         + f" | Balance ₹{position['balance_due']:.2f} via {mode}"
@@ -750,46 +998,20 @@ async def settle_booking(
             "— partner must collect it via the Partner Portal."
         )
 
-    # ── Write coupon disbursement record ─────────────────────────────────────
-    coupon_disbursement_id = None
-    if coupon_discount > 0:
-        # Check if already exists
-        existing_cpd = (
-            await db.execute(
-                text(
-                    "SELECT id FROM pending_coupon_disbursements WHERE cab_booking_id = :bid"
-                ),
-                {"bid": cb.id},
-            )
-        ).scalar_one_or_none()
-        if not existing_cpd:
-            res = await db.execute(
-                text(
-                    """
-                    INSERT INTO pending_coupon_disbursements
-                        (cab_booking_id, master_booking_id, partner_id, customer_id,
-                         coupon_discount_amount, booking_number, invoice_number,
-                         status, created_at)
-                    VALUES
-                        (:bid, :mbid, :pid, :cid, :amt, :bn, :inv, 'PENDING', NOW())
-                    RETURNING id
-                """
-                ),
-                {
-                    "bid": cb.id,
-                    "mbid": mb.id,
-                    "pid": partner_id,
-                    "cid": mb.customer_id,
-                    "amt": coupon_discount,
-                    "bn": cb.booking_number,
-                    "inv": cb.invoice_number,
-                },
-            )
-            coupon_disbursement_id = res.scalar_one()
-            settlement_note += (
-                f" Coupon disbursement of ₹{coupon_discount:.2f} recorded "
-                f"(pending admin approval on Coupon Disbursements page)."
-            )
+    # Full coupon was netted above; reimburse only the platform share later.
+    coupon_disbursement_id, coupon_note = await _record_coupon_disbursement(
+        db,
+        service_type="CAB",
+        service_id=cb.id,
+        master_booking_id=mb.id,
+        partner_id=partner_id,
+        customer_id=mb.customer_id,
+        booking_number=cb.booking_number,
+        invoice_number=cb.invoice_number,
+        funding=funding,
+        existing_id=existing_cpd,
+    )
+    settlement_note += coupon_note
 
     # ── TDS Deduction (Section 194C — COMPANY partners only) ─────────────────
     # TDS @ 1% deducted from partner payout when TDS_ENABLED = true.
@@ -956,7 +1178,11 @@ async def settle_booking(
         "final_amount": final,
         "platform_commission": commission,
         "partner_payout": payout,
-        "coupon_discount": coupon_discount,
+        "coupon_discount": float(coupon_discount),
+        "coupon_platform_share": float(coupon_platform_share),
+        "coupon_partner_share": float(coupon_partner_share),
+        # Entitlement after coupon funding, before custody/TDS (not another debit).
+        "net_partner_entitlement": float(Decimal(str(payout)) - coupon_partner_share),
         "position": position,
         "partner_wallet_balance": new_bal,
         "coupon_disbursement_id": coupon_disbursement_id,
@@ -1117,7 +1343,15 @@ def _compute_hotel_position(
     partner_held = round(partner_held, 2)
     platform_held = round(total_paid - partner_held, 2)
     balance_due = round(max(grand_total - total_paid, 0.0), 2)
-    net = round(partner_payout - partner_held - coupon_discount - tds_deducted, 2)
+    net = float(
+        round(
+            Decimal(str(partner_payout))
+            - Decimal(str(partner_held))
+            - Decimal(str(coupon_discount))
+            - Decimal(str(tds_deducted)),
+            2,
+        )
+    )
     return {
         "grand_total": round(grand_total, 2),
         "total_paid": round(total_paid, 2),
@@ -1175,15 +1409,23 @@ async def _build_hotel_settlement_detail(
         if w:
             partner_wallet_balance = float(w["available_balance"] or 0)
 
-    coupon_discount = float(hr.coupon_discount or 0)
+    coupon_discount, coupon_platform_share, coupon_partner_share = (
+        await _coupon_funding_split(
+            db,
+            mb.id,
+            service_type="HOTEL",
+            service_id=hr.id,
+            coupon_discount=hr.coupon_discount,
+        )
+    )
     gst_amount = float(hr.gst_amount or 0)
     grand_total = float(hr.total_amount or 0)
 
     # Commission: use the frozen figures once settled, otherwise resolve live.
-    if hr.reservation_status == "SETTLED" and float(hr.partner_payout or 0) > 0:
+    if hr.reservation_status == "SETTLED":
         commission = float(hr.platform_commission or 0)
         payout = float(hr.partner_payout or 0)
-        gross_taxable = float(hr.taxable_amount or 0) + coupon_discount
+        gross_taxable = float(Decimal(str(hr.taxable_amount or 0)) + coupon_discount)
     else:
         commission, payout, _snap, gross_taxable = (
             await _resolve_hotel_commission_amounts(db, hr, hotel)
@@ -1214,7 +1456,8 @@ async def _build_hotel_settlement_detail(
         (
             await db.execute(
                 text(
-                    "SELECT id, coupon_discount_amount, status FROM pending_coupon_disbursements "
+                    "SELECT id, coupon_discount_amount, platform_share, partner_share, "
+                    "status FROM pending_coupon_disbursements "
                     "WHERE hotel_reservation_id = :hid"
                 ),
                 {"hid": hr.id},
@@ -1223,13 +1466,7 @@ async def _build_hotel_settlement_detail(
         .mappings()
         .one_or_none()
     )
-    coupon_disbursement = None
-    if cpd:
-        coupon_disbursement = {
-            "id": cpd["id"],
-            "amount": float(cpd["coupon_discount_amount"] or 0),
-            "status": cpd["status"],
-        }
+    coupon_disbursement = _coupon_disbursement_detail(cpd)
 
     return {
         "service_type": "HOTEL",
@@ -1250,7 +1487,11 @@ async def _build_hotel_settlement_detail(
         "taxable_amount": gross_taxable,
         "gst_amount": gst_amount,
         "grand_total": grand_total,
-        "coupon_discount": coupon_discount,
+        "coupon_discount": float(coupon_discount),
+        "coupon_platform_share": float(coupon_platform_share),
+        "coupon_partner_share": float(coupon_partner_share),
+        # Entitlement after coupon funding, before custody/TDS (not another debit).
+        "net_partner_entitlement": float(Decimal(str(payout)) - coupon_partner_share),
         "advance_paid": position["advance_paid"],
         "balance_due": position["balance_due"],
         "payment_mode": hr.payment_mode,
@@ -1309,7 +1550,15 @@ async def _settle_hotel_reservation(
     commission, payout, snap, gross_taxable = await _resolve_hotel_commission_amounts(
         db, hr, hotel
     )
-    coupon_discount = float(hr.coupon_discount or 0)
+    coupon_discount, coupon_platform_share, coupon_partner_share = (
+        await _coupon_funding_split(
+            db,
+            mb.id,
+            service_type="HOTEL",
+            service_id=hr.id,
+            coupon_discount=hr.coupon_discount,
+        )
+    )
     gst_amount = float(hr.gst_amount or 0)
     grand_total = float(hr.total_amount or 0)
 
@@ -1335,6 +1584,15 @@ async def _settle_hotel_reservation(
         tds_deducted=tds_deducted,
     )
     net = position["net_settlement"]
+    funding = (coupon_discount, coupon_platform_share, coupon_partner_share)
+    existing_cpd = await _existing_coupon_disbursement(
+        db,
+        service_type="HOTEL",
+        service_id=hr.id,
+        master_booking_id=mb.id,
+        partner_id=partner_id,
+        funding=funding,
+    )
 
     wallet_row = await _get_partner_wallet(db, partner_id)
     if not wallet_row:
@@ -1358,6 +1616,11 @@ async def _settle_hotel_reservation(
         f"Net = {payout:.2f} − {partner_held:.2f} − {coupon_discount:.2f}"
         f"{tds_clause} = ₹{net:.2f}"
     )
+    if coupon_partner_share > 0:
+        workings += (
+            f" | Coupon split: platform ₹{coupon_platform_share:.2f} / "
+            f"partner ₹{coupon_partner_share:.2f}"
+        )
 
     new_bal = partner_wallet_balance
     if net > 0:
@@ -1403,45 +1666,19 @@ async def _settle_hotel_reservation(
     else:
         settlement_note = "No wallet movement — what the property holds exactly matches what they are owed. "
 
-    # ── Coupon disbursement (platform-funded, reimbursed separately) ─────────
-    coupon_disbursement_id = None
-    if coupon_discount > 0:
-        existing_cpd = (
-            await db.execute(
-                text(
-                    "SELECT id FROM pending_coupon_disbursements WHERE hotel_reservation_id = :hid"
-                ),
-                {"hid": hr.id},
-            )
-        ).scalar_one_or_none()
-        if not existing_cpd:
-            res = await db.execute(
-                text(
-                    """
-                    INSERT INTO pending_coupon_disbursements
-                        (hotel_reservation_id, master_booking_id, partner_id, customer_id,
-                         coupon_discount_amount, booking_number, invoice_number,
-                         service_type, status, created_at)
-                    VALUES
-                        (:hid, :mbid, :pid, :cid, :amt, :bn, :inv, 'HOTEL', 'PENDING', NOW())
-                    RETURNING id
-                """
-                ),
-                {
-                    "hid": hr.id,
-                    "mbid": mb.id,
-                    "pid": partner_id,
-                    "cid": hr.customer_id or mb.customer_id,
-                    "amt": coupon_discount,
-                    "bn": ref,
-                    "inv": hr.invoice_number,
-                },
-            )
-            coupon_disbursement_id = res.scalar_one()
-            settlement_note += (
-                f" Coupon disbursement of ₹{coupon_discount:.2f} recorded "
-                f"(pending admin approval on Coupon Disbursements page)."
-            )
+    coupon_disbursement_id, coupon_note = await _record_coupon_disbursement(
+        db,
+        service_type="HOTEL",
+        service_id=hr.id,
+        master_booking_id=mb.id,
+        partner_id=partner_id,
+        customer_id=hr.customer_id or mb.customer_id,
+        booking_number=ref,
+        invoice_number=hr.invoice_number,
+        funding=funding,
+        existing_id=existing_cpd,
+    )
+    settlement_note += coupon_note
 
     # ── TDS Deduction (Section 194C — COMPANY partners only) ─────────────────
     # TDS is already folded into `net` above, so no separate wallet debit here —
@@ -1573,7 +1810,11 @@ async def _settle_hotel_reservation(
         "grand_total": grand_total,
         "platform_commission": commission,
         "partner_payout": payout,
-        "coupon_discount": coupon_discount,
+        "coupon_discount": float(coupon_discount),
+        "coupon_platform_share": float(coupon_platform_share),
+        "coupon_partner_share": float(coupon_partner_share),
+        # Entitlement after coupon funding, before custody/TDS (not another debit).
+        "net_partner_entitlement": float(Decimal(str(payout)) - coupon_partner_share),
         "position": position,
         "partner_wallet_balance": new_bal,
         "coupon_disbursement_id": coupon_disbursement_id,
@@ -1700,21 +1941,27 @@ def _compute_tour_position(
     partner_payout: float,
     total_paid: float,
     partner_held: float,
+    coupon_discount: float = 0.0,
 ) -> dict:
     """Pure tour settlement arithmetic — no DB, no writes. Mirrors the hotel
     position: custody (who received the money) drives the wallet direction.
 
-      net = partner_payout − partner_held
+      net = partner_payout − partner_held − coupon_discount
         net > 0  → CREDIT partner wallet   (platform holds money it owes)
         net < 0  → DEBIT  partner wallet   (partner holds more than owed)
         net = 0  → no movement
+
+    The platform's share of the coupon comes back via the disbursement queue,
+    exactly like cab/hotel (migration 0075).
     """
+    coupon_discount = round(coupon_discount, 2)
     partner_held = round(partner_held, 2)
     platform_held = round(total_paid - partner_held, 2)
-    balance_due = round(max(total_amount - total_paid, 0.0), 2)
-    net = round(partner_payout - partner_held, 2)
+    balance_due = round(max(total_amount - coupon_discount - total_paid, 0.0), 2)
+    net = round(partner_payout - partner_held - coupon_discount, 2)
     return {
         "grand_total": round(total_amount, 2),
+        "coupon_discount": coupon_discount,
         "total_paid": round(total_paid, 2),
         "advance_paid": round(total_paid, 2),
         "partner_held": partner_held,
@@ -1804,11 +2051,35 @@ async def _build_tour_settlement_detail(db: AsyncSession, tour) -> dict:
     else:
         commission = float(tour.platform_commission or 0)
 
+    coupon_discount, coupon_platform_share, coupon_partner_share = (
+        await _coupon_funding_split(
+            db,
+            tour.master_booking_id,
+            service_type="TOUR",
+            service_id=tour.id,
+            coupon_discount=tour.coupon_discount,
+        )
+    )
     position = _compute_tour_position(
         total_amount=total_amount,
         partner_payout=payout,
         total_paid=total_paid,
         partner_held=partner_held,
+        coupon_discount=float(coupon_discount),
+    )
+
+    cpd = (
+        (
+            await db.execute(
+                text(
+                    "SELECT id, coupon_discount_amount, platform_share, partner_share, "
+                    "status FROM pending_coupon_disbursements WHERE tour_booking_id = :bid"
+                ),
+                {"bid": tour.id},
+            )
+        )
+        .mappings()
+        .one_or_none()
     )
 
     cust_name = None
@@ -1837,6 +2108,11 @@ async def _build_tour_settlement_detail(db: AsyncSession, tour) -> dict:
         "invoice_number": tour.invoice_number,
         # Step 2: Payment details
         "total_amount": total_amount,
+        "coupon_discount": float(coupon_discount),
+        "coupon_platform_share": float(coupon_platform_share),
+        "coupon_partner_share": float(coupon_partner_share),
+        # Entitlement after coupon funding, before custody (not another debit).
+        "net_partner_entitlement": float(Decimal(str(payout)) - coupon_partner_share),
         "additional_amount": float(tour.additional_amount or 0),
         "advance_paid": position["advance_paid"],
         "balance_due": position["balance_due"],
@@ -1861,6 +2137,7 @@ async def _build_tour_settlement_detail(db: AsyncSession, tour) -> dict:
         "partner_name": partner_name,
         "partner_mobile": partner_mobile,
         "partner_wallet_balance": partner_wallet_balance,
+        "coupon_disbursement": _coupon_disbursement_detail(cpd),
         "is_settled": tour.booking_status == "SETTLED",
     }
 
@@ -2023,11 +2300,14 @@ async def list_coupon_disbursements(
             pcd.id,
             pcd.cab_booking_id,
             pcd.hotel_reservation_id,
+            pcd.tour_booking_id,
             pcd.service_type,
             pcd.master_booking_id,
             pcd.partner_id,
             pcd.customer_id,
             pcd.coupon_discount_amount,
+            pcd.platform_share,
+            pcd.partner_share,
             pcd.booking_number,
             pcd.invoice_number,
             pcd.status,
@@ -2053,13 +2333,14 @@ async def list_coupon_disbursements(
 
     items = []
     for r in rows:
+        funding = _coupon_disbursement_detail(r)
         items.append(
             {
                 "id": r["id"],
                 "cab_booking_id": r["cab_booking_id"],
                 "hotel_reservation_id": r["hotel_reservation_id"],
-                "service_type": r["service_type"]
-                or ("HOTEL" if r["hotel_reservation_id"] else "CAB"),
+                "tour_booking_id": r["tour_booking_id"],
+                "service_type": r["service_type"],
                 "booking_number": r["booking_number"],
                 "invoice_number": r["invoice_number"],
                 "partner_id": r["partner_id"],
@@ -2067,7 +2348,10 @@ async def list_coupon_disbursements(
                 "partner_mobile": (
                     str(r["partner_mobile"]) if r["partner_mobile"] else None
                 ),
-                "coupon_discount_amount": float(r["coupon_discount_amount"] or 0),
+                "coupon_discount_amount": funding["coupon_discount_amount"],
+                "platform_share": funding["platform_share"],
+                "partner_share": funding["partner_share"],
+                "disburse_amount": funding["amount"],
                 "partner_wallet_balance": float(r["partner_wallet_balance"] or 0),
                 "status": r["status"],
                 "disbursed_at": (
@@ -2127,11 +2411,48 @@ async def disburse_coupon(
         raise HTTPException(
             404, f"Disbursement record #{payload.disbursement_id} not found."
         )
-    if row["status"] == "DISBURSED":
+    if row["status"] != "PENDING":
         raise HTTPException(400, "This coupon disbursement has already been processed.")
 
     partner_id = row["partner_id"]
-    amount = float(row["coupon_discount_amount"] or 0)
+    funding = _validate_coupon_split(
+        row["coupon_discount_amount"], row["platform_share"], row["partner_share"]
+    )
+    linked = [
+        service
+        for service, (column, _) in _COUPON_SERVICES.items()
+        if row[column] is not None
+    ]
+    if len(linked) != 1 or row["service_type"] != linked[0]:
+        raise _coupon_error("disbursement requires exactly one matching service link.")
+    service_type = linked[0]
+    column, table = _COUPON_SERVICES[service_type]
+    booking = (
+        (
+            await db.execute(
+                text(
+                    f"SELECT master_booking_id, coupon_discount FROM {table} WHERE id = :sid"
+                ),
+                {"sid": row[column]},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if not booking or booking["master_booking_id"] != row["master_booking_id"]:
+        raise _coupon_error("disbursement booking/master linkage is invalid.")
+    expected = await _coupon_funding_split(
+        db,
+        row["master_booking_id"],
+        service_type=service_type,
+        service_id=row[column],
+        coupon_discount=booking["coupon_discount"],
+    )
+    if funding != expected:
+        raise _coupon_error(
+            "disbursement shares differ from the immutable service usage."
+        )
+    amount = funding[1]
     if amount <= 0:
         raise HTTPException(400, "Disbursement amount is zero. Nothing to disburse.")
 
@@ -2152,7 +2473,8 @@ async def disburse_coupon(
         narration=(
             f"Coupon discount disbursement — {row['booking_number']} | "
             f"Invoice: {row['invoice_number'] or 'N/A'} | "
-            f"Amount: ₹{amount:.2f} (partner's earnings restored for coupon discount)"
+            f"Amount: ₹{amount:.2f} (platform share of the coupon discount — "
+            "partner's earnings restored for it)"
         ),
     )
 

@@ -1,9 +1,9 @@
 # ============================================================
 # WAYTERO — COUPON SYSTEM MODELS
 # File: app/modules/admin/coupon_models.py
-# Migration: 0020_coupon_system
+# Migration: 0020_coupon_system, 0075_coupon_cost_bearer
 # Tables: coupons, coupon_service_rules, coupon_city_rules,
-#         coupon_customer_rules, coupon_usages
+#         coupon_customer_rules, coupon_partner_rules, coupon_usages
 # ============================================================
 
 from datetime import datetime, timezone
@@ -20,7 +20,10 @@ from sqlalchemy import (
     Text,
     ForeignKey,
     Index,
+    SmallInteger,
+    UniqueConstraint,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 from app.modules.master.models import City  # noqa: F401
@@ -65,6 +68,9 @@ class Coupon(Base):
     is_city_specific = Column(Boolean, nullable=False, default=False)
     is_active = Column(Boolean, nullable=False, default=True)
 
+    coupon_type = Column(String(20), nullable=False, default="PLATFORM")
+    platform_share_percent = Column(SmallInteger, nullable=True)
+
     created_by = Column(String(100), nullable=True)
     created_at = Column(
         DateTime(timezone=True),
@@ -86,6 +92,9 @@ class Coupon(Base):
     )
     customer_rules = relationship(
         "CouponCustomerRule", back_populates="coupon", cascade="all, delete-orphan"
+    )
+    partner_rules = relationship(
+        "CouponPartnerRule", back_populates="coupon", cascade="all, delete-orphan"
     )
     usages = relationship("CouponUsage", back_populates="coupon")
 
@@ -177,6 +186,41 @@ class CouponCustomerRule(Base):
     )
 
 
+class CouponPartnerRule(Base):
+    """
+    Partners joined to a partner-funded coupon (added migration 0075).
+    PARTNER_ONLY / PLATFORM_PARTNER coupons are only valid on bookings
+    fulfilled by a joined partner; the partner share is deducted from that
+    partner's settlement.
+    """
+
+    __tablename__ = "coupon_partner_rules"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    coupon_id = Column(
+        BigInteger, ForeignKey("coupons.id", ondelete="CASCADE"), nullable=False
+    )
+    partner_id = Column(
+        BigInteger, ForeignKey("partners.id", ondelete="RESTRICT"), nullable=False
+    )
+    is_active = Column(Boolean, nullable=False, default=True)
+    removed_at = Column(DateTime(timezone=True), nullable=True)
+    removed_by = Column(String(100), nullable=True)
+    joined_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    created_by = Column(String(100), nullable=True)
+
+    coupon = relationship("Coupon", back_populates="partner_rules")
+
+    __table_args__ = (
+        UniqueConstraint("coupon_id", "partner_id", name="uq_cpr_coupon_partner"),
+        Index("idx_cpr_partner", "partner_id"),
+    )
+
+
 class CouponUsage(Base):
     """Immutable redemption audit trail."""
 
@@ -193,6 +237,15 @@ class CouponUsage(Base):
         BigInteger, ForeignKey("master_bookings.id", ondelete="RESTRICT"), nullable=True
     )
     discount_applied = Column(Numeric(12, 2), nullable=False)
+    coupon_type = Column(String(20), nullable=False)
+    platform_share = Column(Numeric(12, 2), nullable=False)
+    partner_share = Column(Numeric(12, 2), nullable=False)
+    cab_booking_id = Column(BigInteger, ForeignKey("cab_bookings.id"), nullable=True)
+    hotel_reservation_id = Column(
+        BigInteger, ForeignKey("hotel_reservations.id"), nullable=True
+    )
+    tour_booking_id = Column(BigInteger, ForeignKey("tour_bookings.id"), nullable=True)
+    eligible_partner_ids = Column(JSONB, nullable=False, default=list)
     used_at = Column(
         DateTime(timezone=True),
         nullable=False,
