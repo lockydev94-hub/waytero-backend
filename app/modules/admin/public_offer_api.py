@@ -74,7 +74,8 @@ async def list_live_offers(db: AsyncSession = Depends(get_db)):
             await db.execute(
                 text(
                     f"""
-                    SELECT o.slug, o.title, o.service_type, o.image_url, o.badge_label,
+                    SELECT o.slug, o.title, o.short_description, o.service_type, o.image_url,
+                           o.badge_label,
                            o.valid_to, c.coupon_code, c.discount_type, c.discount_value,
                            c.max_discount_amount
                     FROM offers o JOIN coupons c ON c.id = o.coupon_id
@@ -95,6 +96,7 @@ async def list_live_offers(db: AsyncSession = Depends(get_db)):
         {
             "slug": r["slug"],
             "title": r["title"],
+            "short_description": r["short_description"],
             "service_type": r["service_type"],
             "image_url": _circle_thumb(r["image_url"]),
             "coupon_code": r["coupon_code"],

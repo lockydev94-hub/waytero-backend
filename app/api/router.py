@@ -57,6 +57,8 @@ from app.modules.admin.public_hotel_api import router as public_hotel_router
 from app.modules.admin.public_coupon_api import router as public_coupon_router
 from app.modules.admin.offer_api import router as admin_offer_router
 from app.modules.admin.public_offer_api import router as public_offer_router
+from app.modules.admin.cab_route_api import router as admin_cab_route_router
+from app.modules.admin.public_cab_route_api import router as public_cab_route_router
 from app.modules.admin.landing_page_api import router as admin_landing_router
 from app.modules.admin.public_landing_api import router as public_landing_router
 from app.modules.admin.public_availability import router as public_availability_router
@@ -144,6 +146,14 @@ api_router.include_router(
     admin_offer_router,
     prefix="/admin/offers",
     tags=["Offers"],
+    dependencies=[Depends(require_roles(*SUPER_OR_ADMIN))],
+)
+
+# --- Cab Routes (admin-managed intercity corridors, fare-engine priced) ---
+api_router.include_router(
+    admin_cab_route_router,
+    prefix="/admin/cab-routes",
+    tags=["Cab Routes"],
     dependencies=[Depends(require_roles(*SUPER_OR_ADMIN))],
 )
 
@@ -344,6 +354,9 @@ api_router.include_router(
     public_coupon_router, prefix="/public/coupon", tags=["Public Coupons"]
 )
 api_router.include_router(public_offer_router, prefix="/public", tags=["Public Offers"])
+api_router.include_router(
+    public_cab_route_router, prefix="/public", tags=["Public Cab Routes"]
+)
 
 # --- Tour Packages ---
 api_router.include_router(
