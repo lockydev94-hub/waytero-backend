@@ -2,9 +2,9 @@
 """
 WayTero — Odisha Tour Package Seeder (admin-equivalent bulk insert).
 
-Creates 10 ACTIVE, APPROVED tour packages for the existing active partner
-(Maa Travels, PRT-379499), exactly the way the admin "Add Package" API
-(POST /api/v1/admin/tours/packages) would have saved them:
+Creates 10 ACTIVE, APPROVED tour packages for the active partner that holds
+a TOUR grant (Maa Travels Pvt. Ltd), exactly the way the admin "Add Package"
+API (POST /api/v1/admin/tours/packages) would have saved them:
 
   tour_packages            — main row, status=ACTIVE, approved_at/by set
   tour_itineraries         — day-wise plan (activities as JSONB)
@@ -13,8 +13,9 @@ Creates 10 ACTIVE, APPROVED tour packages for the existing active partner
   tour_package_pricing     — per-group slabs keyed by persons_count
 
 Prerequisites checked before any write (fails loudly if unmet):
-  * the partner exists and is ACTIVE
-  * partner_services has an ACTIVE TOUR grant for that partner
+  * at least one partner is ACTIVE and holds an ACTIVE partner_services TOUR
+    grant (a dev database collects several partners, so the grant — not a
+    partner count of one — is the rule; the lowest eligible id is used)
   * all city_id values used by the data file exist in cities
   * no duplicate package_code / slug already present
 
@@ -41,15 +42,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import uuid
 
 from sqlalchemy import select
+
+# `text` is used as a loop variable below, so the SQL helper is aliased.
+from sqlalchemy import text as sql_text
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.core.config import settings
+
 # Register the users table in Base.metadata — tour_packages.approved_by has
 # an FK to users.id and the flush fails without this model imported
 # (same reason alembic/env.py only sees a partial metadata).
 import app.modules.auth.models.user  # noqa: F401
+
+# Also registers `partners` in Base.metadata — tour_packages.partner_id has an
+# FK to it and the flush fails without the model imported.
+import app.modules.partner.models  # noqa: F401
 from app.modules.master.models import City
-from app.modules.partner.models import Partner, PartnerService
 from app.modules.tour.models import (
     TourItinerary,
     TourPackage,
@@ -72,37 +80,54 @@ async def main() -> None:
     Session = async_sessionmaker(engine, expire_on_commit=False)
 
     async with Session() as db:
-        # ── 1. Locate the single active partner ──────────────────────────
-        partners = (
-            await db.scalars(select(Partner).where(Partner.status == "ACTIVE"))
-        ).all()
-        if len(partners) == 0:
+        # ── 1. Pick the partner that is allowed to sell tours ─────────────
+        # A dev database accumulates partners (one per onboarding test), so
+        # "exactly one ACTIVE partner" is not a usable assumption. The grant
+        # is the real rule: the admin API refuses a package for a partner
+        # without an ACTIVE TOUR service, so seed as that partner would.
+        active_partners = (
+            (
+                await db.execute(
+                    sql_text(
+                        """
+                        SELECT p.id, p.partner_code, p.business_name,
+                               EXISTS (
+                                 SELECT 1 FROM partner_services ps
+                                  WHERE ps.partner_id = p.id
+                                    AND ps.service_type = 'TOUR'
+                                    AND ps.is_active = TRUE
+                               ) AS has_tour
+                        FROM partners p
+                        WHERE p.status = 'ACTIVE' AND p.deleted_at IS NULL
+                        ORDER BY has_tour DESC, p.id
+                        """
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+        if not active_partners:
             print("FATAL: no ACTIVE partner found in the database.")
             sys.exit(1)
-        if len(partners) > 1:
-            print("Multiple active partners found:")
-            for p in partners:
-                print(f"  id={p.id} {p.partner_code} {p.business_name}")
-            print("FATAL: expected exactly one active partner; aborting.")
+        eligible = [p for p in active_partners if p["has_tour"]]
+        if not eligible:
+            print("FATAL: no ACTIVE partner has an active TOUR service grant.")
+            print("       Enable it in the admin before seeding. Partners found:")
+            for p in active_partners:
+                print(f"         id={p['id']} {p['partner_code']} {p['business_name']}")
             sys.exit(1)
 
-        partner = partners[0]
-        print(f"Partner : id={partner.id} {partner.partner_code} {partner.business_name}")
-
-        # ── 2. Verify the TOUR service grant ─────────────────────────────
-        tour_service = await db.scalar(
-            select(PartnerService.id).where(
-                PartnerService.partner_id == partner.id,
-                PartnerService.service_type == "TOUR",
-                PartnerService.is_active.is_(True),
-            )
+        partner = eligible[0]
+        print(
+            f"Partner : id={partner['id']} {partner['partner_code']} "
+            f"{partner['business_name']}"
         )
-        if tour_service is None:
+        if len(eligible) > 1:
             print(
-                "FATAL: partner does not have an active TOUR service "
-                "(enable it in the admin before seeding)."
+                f"        ({len(eligible)} partners hold a TOUR grant — "
+                "seeding under the lowest id)"
             )
-            sys.exit(1)
         print("TOUR service grant: OK")
 
         # ── 3. Verify every city_id exists ───────────────────────────────
@@ -123,14 +148,9 @@ async def main() -> None:
 
         # ── 4. Idempotency + collision checks ────────────────────────────
         existing_codes = {
-            r
-            for r in (
-                await db.scalars(select(TourPackage.package_code))
-            ).all()
+            r for r in (await db.scalars(select(TourPackage.package_code))).all()
         }
-        existing_slugs = {
-            r for r in (await db.scalars(select(TourPackage.slug))).all()
-        }
+        existing_slugs = {r for r in (await db.scalars(select(TourPackage.slug))).all()}
 
         inserts, skips, collisions = [], [], []
         for pkg in PACKAGES:
@@ -161,7 +181,7 @@ async def main() -> None:
         for pkg in inserts:
             package = TourPackage(
                 uuid=uuid.uuid4(),
-                partner_id=partner.id,
+                partner_id=partner["id"],
                 package_code=pkg["package_code"],
                 slug=pkg["slug"],
                 package_name=pkg["package_name"],

@@ -895,6 +895,11 @@ class ServiceTypeService:
 #  Doc Ref: Migration 0044_website_cms
 # ════════════════════════════════════════════════════════════════
 
+# The customer-web listing route for each platform service type. The type_code
+# is not the URL slug: /cab, /hotel and /tour do not exist, so building the
+# link from the code hands the admin a card that 404s.
+SERVICE_TYPE_ROUTES = {"CAB": "/cabs", "HOTEL": "/hotels", "TOUR": "/tours"}
+
 
 class CmsService:
     """
@@ -1680,7 +1685,9 @@ class CmsService:
                     {
                         "title": st.label,
                         "desc": st.description or "",
-                        "link": f"/{st.type_code.lower()}",
+                        "link": SERVICE_TYPE_ROUTES.get(
+                            st.type_code, f"/{st.type_code.lower()}"
+                        ),
                     }
                 )
 
