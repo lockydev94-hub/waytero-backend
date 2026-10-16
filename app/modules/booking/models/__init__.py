@@ -498,7 +498,15 @@ class BookingCancellation(Base):
 
 
 class BookingReview(Base):
-    """Customer review for a completed booking."""
+    """Review of a booking — from the account holder, or from a logged-out
+    traveller who proves the booking with reference + registered mobile.
+
+    Migration 0083 added the guest columns and the moderation status. A guest
+    submission still hangs off the booking's own customer (customer_id stays
+    NOT NULL); guest_* fields record who actually typed it. APPROVED feedback
+    is admin-only for now — nothing reads this table into the public
+    TESTIMONIALS band, which is CMS JSONB content.
+    """
 
     __tablename__ = "booking_reviews"
 
@@ -509,6 +517,22 @@ class BookingReview(Base):
     customer_id = Column(BigInteger, ForeignKey("customers.id"), nullable=False)
     rating = Column(Integer, nullable=True)
     review = Column(Text, nullable=True)
+    source = Column(
+        String(20), nullable=False, default="CUSTOMER"
+    )  # CUSTOMER | GUEST_WEB
+    status = Column(
+        String(20), nullable=False, default="PENDING"
+    )  # PENDING | APPROVED | REJECTED
+    guest_name = Column(String(150))
+    guest_mobile = Column(String(20))
+    guest_email = Column(String(255))
+    # What the visitor typed at step 1, kept for comparison with the resolved booking.
+    booking_ref_submitted = Column(String(100))
+    rejection_reason = Column(Text)
+    moderated_by = Column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    moderated_at = Column(DateTime(timezone=True))
     created_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(timezone.utc),
@@ -519,6 +543,11 @@ class BookingReview(Base):
 
     __table_args__ = (
         CheckConstraint("rating BETWEEN 1 AND 5", name="ck_review_rating"),
+        CheckConstraint(
+            "status IN ('PENDING','APPROVED','REJECTED')",
+            name="ck_booking_reviews_status",
+        ),
+        Index("idx_booking_reviews_moderation", "status", "created_at"),
     )
 
 

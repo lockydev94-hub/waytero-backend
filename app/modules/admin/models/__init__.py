@@ -612,3 +612,126 @@ class LandingPage(Base):
         Index("idx_landing_pages_city", "city_id"),
         Index("idx_landing_pages_state", "state_id"),
     )
+
+
+# ============================================================
+# WEBSITE CAPTURE — public forms → CCO queues
+# Doc Ref: Migration 0082_capture_surfaces
+#          API: public_capture_api.py (writes), capture_admin_api.py (queues)
+# ============================================================
+
+
+class Enquiry(Base):
+    """One "Enquiry Now" submission from the public homepage.
+
+    Deliberately separate from contact_messages: that table is the /contact
+    inbox with no workflow, and an enquiry is something a person has to call,
+    quote and eventually book — hence status, handled_by and handle_note.
+    """
+
+    __tablename__ = "enquiries"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    first_name = Column(String(100), nullable=False)
+    last_name = Column(String(100))
+    email = Column(String(255), nullable=False)
+    # Normalised 10-digit Indian mobile, never the raw input.
+    mobile = Column(String(10), nullable=False)
+    service_type = Column(String(10), nullable=False, default="OTHER")
+    message = Column(Text, nullable=False, default="")
+    status = Column(String(20), nullable=False, default="NEW")
+    handle_note = Column(Text)
+    handled_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    handled_at = Column(DateTime(timezone=True))
+    source = Column(String(30), nullable=False, default="WEB_RAIL")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("idx_enquiries_queue", "status", "created_at"),
+        Index("idx_enquiries_mobile", "mobile"),
+    )
+
+
+class CallbackRequest(Base):
+    """ "Request a Callback" submission — a mobile number and nothing else."""
+
+    __tablename__ = "callback_requests"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    name = Column(String(150))
+    mobile = Column(String(10), nullable=False)
+    status = Column(String(20), nullable=False, default="NEW")
+    handle_note = Column(Text)
+    handled_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    called_at = Column(DateTime(timezone=True))
+    source = Column(String(30), nullable=False, default="WEB_CARD")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("idx_callback_requests_queue", "status", "created_at"),
+        Index("idx_callback_requests_mobile", "mobile"),
+    )
+
+
+class Quotation(Base):
+    """A price the CCO offers a prospect before a booking exists.
+
+    Row + admin screen only. No PDF and no email send: the platform has no
+    document generator and EMAIL_ENABLED is off in this environment.
+
+    Every link is optional because a quotation is raised at the enquiry stage,
+    where the customer and the booking may not exist yet — ON DELETE SET NULL
+    keeps the quote readable after either goes away.
+    """
+
+    __tablename__ = "quotations"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    enquiry_id = Column(
+        BigInteger, ForeignKey("enquiries.id", ondelete="SET NULL"), index=True
+    )
+    customer_id = Column(BigInteger, ForeignKey("customers.id", ondelete="SET NULL"))
+    master_booking_id = Column(
+        BigInteger, ForeignKey("master_bookings.id", ondelete="SET NULL")
+    )
+    service_type = Column(String(10), nullable=False, default="OTHER")
+    summary = Column(Text, nullable=False)
+    amount = Column(Numeric(12, 2), nullable=False)
+    currency = Column(String(3), nullable=False, default="INR")
+    valid_till = Column(Date)
+    terms = Column(Text)
+    status = Column(String(20), nullable=False, default="DRAFT")
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (Index("idx_quotations_status", "status"),)

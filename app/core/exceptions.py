@@ -102,6 +102,24 @@ class DuplicateResourceException(WayTeroException):
         super().__init__(message=message, code="DUPLICATE_RESOURCE", status_code=409)
 
 
+class RateLimitExceededException(WayTeroException):
+    """
+    Too many requests from one client in too short a window.
+    Example: a scripted loop against the public enquiry or feedback form.
+
+    Only the public capture endpoints use this — see app/core/rate_limit.py.
+    """
+
+    def __init__(self, message: str, retry_after: Optional[int] = None):
+        details = {"retry_after_seconds": retry_after} if retry_after else None
+        super().__init__(
+            message=message,
+            code="RATE_LIMIT_EXCEEDED",
+            status_code=429,
+            details=details,
+        )
+
+
 class ServiceUnavailableException(WayTeroException):
     """
     External service unavailable.
