@@ -666,8 +666,11 @@ class SectionVariantCreate(BaseModel):
     overlay_opacity: Optional[Decimal] = Field(None, ge=0, le=1)
     content: Optional[Dict[str, Any]] = Field(
         None,
-        description="Structured content for the section (steps, offers, faqs, "
-        "destinations, hotels, stats). Keys must match the section schema.",
+        description="Structured content for the section. Only the keys the "
+        "renderer for this section actually reads are accepted — see "
+        "CmsService.SECTION_CONTENT_KEYS — and a key that names a typed "
+        "column is rejected, because content silently overwrites columns "
+        "when the public payload is built.",
     )
     service_type: Optional[str] = Field(
         None,
@@ -694,31 +697,24 @@ class SectionVariantCreate(BaseModel):
 
 
 class SectionVariantUpdate(BaseModel):
+    """Partial update — every field optional. Mirrors SectionVariantCreate
+    (the two blocks this class used to carry had drifted apart and neither
+    was complete: `is_active` was missing entirely, so the editor's
+    "activate on save" switch was dropped by Pydantic before it reached the
+    service)."""
+
     variant_name: Optional[str] = Field(None, min_length=1, max_length=150)
-    variant_tag: Optional[str] = Field(None, max_length=50)
-    display_order: Optional[int] = None
-    headline: Optional[str] = Field(None, max_length=300)
-    subheadline: Optional[str] = Field(None, max_length=500)
-    body_text: Optional[str] = None
-    cta_text: Optional[str] = Field(None, max_length=100)
-    cta_link: Optional[str] = Field(None, max_length=500)
-    background_image_url: Optional[str] = None
-    background_video_url: Optional[str] = None
-    mobile_image_url: Optional[str] = None
-    icon_url: Optional[str] = None
-    accent_color: Optional[str] = Field(None, max_length=20)
-    animation_style: Optional[str] = None
-    text_alignment: Optional[str] = None
-    overlay_opacity: Optional[Decimal] = Field(None, ge=0, le=1)
-    service_type: Optional[str] = Field(
+    variant_tag: Optional[str] = Field(
         None,
-        pattern="^(CAB|HOTEL|TOUR|ALL)$",
+        max_length=50,
+        description="The eyebrow — the small line rendered above the heading.",
     )
-    starts_at: Optional[datetime] = None
-    ends_at: Optional[datetime] = None
-    variant_name: Optional[str] = Field(None, min_length=1, max_length=150)
-    variant_tag: Optional[str] = Field(None, max_length=50)
     display_order: Optional[int] = None
+    is_active: Optional[bool] = Field(
+        None,
+        description="Set true to make this the live variant; the service "
+        "deactivates the siblings in the same request.",
+    )
     headline: Optional[str] = Field(None, max_length=300)
     subheadline: Optional[str] = Field(None, max_length=500)
     body_text: Optional[str] = None
@@ -734,8 +730,15 @@ class SectionVariantUpdate(BaseModel):
     overlay_opacity: Optional[Decimal] = Field(None, ge=0, le=1)
     content: Optional[Dict[str, Any]] = Field(
         None,
-        description="Structured content for the section (steps, offers, faqs, "
-        "destinations, hotels, stats). Keys must match the section schema.",
+        description="Structured content for the section. Only the keys the "
+        "renderer for this section actually reads are accepted — see "
+        "CmsService.SECTION_CONTENT_KEYS — and a key that names a typed "
+        "column is rejected, because content silently overwrites columns "
+        "when the public payload is built.",
+    )
+    service_type: Optional[str] = Field(
+        None,
+        pattern="^(CAB|HOTEL|TOUR|ALL)$",
     )
     starts_at: Optional[datetime] = None
     ends_at: Optional[datetime] = None

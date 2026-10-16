@@ -14,6 +14,7 @@ from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update as sa_update
 
+from app.core.exceptions import ValidationException
 from app.modules.admin.models import (
     SystemConfiguration,
     AppVersion,
@@ -909,6 +910,84 @@ class CmsService:
         Resolves only visible sections whose active variant is in-window.
     """
 
+    # ── Content contract ─────────────────────────────────────────
+
+    # `build_public_homepage` merges each variant's JSONB over the typed
+    # columns (`variant_payload.update(active.content)`), and customer-web
+    # reads the merged object back with `pick(variant, key)`. So the only
+    # content keys with any effect are the ones a renderer literally picks,
+    # and any key that names a column is a silent overwrite of the typed
+    # field an admin can see and edit elsewhere in the same form.
+    #
+    # The live-data bands (hotels, destinations, tours, routes, cities, offers,
+    # blog) fetch their cards from tables, so they accept copy keys only. Their
+    # `content.hotels` / `content.destinations` entries used to be documented
+    # and offered in the editor; nothing rendered them, so they are rejected now
+    # rather than quietly filling a form that does nothing.
+    SECTION_CONTENT_KEYS: dict[str, set[str]] = {
+        "HERO": {"marquee_items"},
+        "SERVICES": {"items", "eyebrow", "title", "subtitle"},
+        "WHY_US": {"items", "eyebrow", "title", "subtitle"},
+        "STATS": {"stats", "eyebrow", "title"},
+        "HOW_IT_WORKS": {"steps"},
+        "TESTIMONIALS": {"testimonials", "eyebrow", "title", "subtitle"},
+        "PARTNERS": {"partners", "cta", "eyebrow", "title", "subtitle"},
+        "CTA": {"title", "subtitle"},
+        "FAQ": {"faqs"},
+        "FEATURED_HOTELS": {"eyebrow", "title", "subtitle"},
+        "POPULAR_DESTINATIONS": {"eyebrow", "title", "subtitle"},
+        "TOUR_PACKAGES": {"eyebrow", "title", "subtitle"},
+        "POPULAR_ROUTES": set(),
+        "POPULAR_CITIES": set(),
+        "OFFERS": set(),
+        "BLOG": set(),
+        "NEWSLETTER": set(),
+        "APP_DOWNLOAD": set(),
+    }
+
+    # Derived from the ORM so a new column can never drift out of the guard.
+    TYPED_SLOTS: frozenset[str] = frozenset(
+        c.name for c in SectionVariant.__table__.columns if c.name != "content"
+    )
+
+    @classmethod
+    def validate_content(cls, section_key: str, content: Optional[dict]) -> None:
+        """Reject content that cannot render, before it is written.
+
+        Called from create_variant / update_variant only. The read path
+        deliberately does NOT validate, so rows already in the database keep
+        rendering while the admin is made to fix them on their next save —
+        same reject-on-write / tolerate-on-read split the landing-page CMS
+        uses. An unknown section key fails open: a band added later must not
+        be locked out of the editor by a stale whitelist here.
+        """
+        if not content:
+            return
+        allowed = cls.SECTION_CONTENT_KEYS.get(section_key.upper())
+        if allowed is None:
+            return
+        for key in content:
+            if key in cls.TYPED_SLOTS:
+                raise ValidationException(
+                    f"'{key}' is a field of this variant, not a content key — "
+                    f"set it on the variant itself. Keys placed in content "
+                    f"overwrite the matching field on the site.",
+                    details={"field": f"content.{key}"},
+                )
+            if key not in allowed:
+                if allowed:
+                    hint = "Allowed keys: " + ", ".join(sorted(allowed)) + "."
+                else:
+                    hint = (
+                        "This band builds its cards from live data, so it "
+                        "takes no content keys — edit the records themselves "
+                        "instead."
+                    )
+                raise ValidationException(
+                    f"'{key}' is not read by the '{section_key}' section. {hint}",
+                    details={"field": f"content.{key}"},
+                )
+
     # ── Page Sections ────────────────────────────────────────────
 
     @staticmethod
@@ -1075,14 +1154,24 @@ class CmsService:
         section = await CmsService.get_section_by_key(db, section_key)
         if not section:
             return None
+        CmsService.validate_content(section.section_key, payload.content)
         data = payload.model_dump()
-        variant = SectionVariant(page_section_id=section.id, **data)
+        # section_variants carries a partial unique index
+        # (uniq_variants_active_per_section) — one live variant per section — so
+        # the incumbents have to be retired before this row is written as
+        # active. It lands inactive first to earn an id, then switches on.
+        want_active = bool(data["is_active"])
+        variant = SectionVariant(
+            page_section_id=section.id, **{**data, "is_active": False}
+        )
         db.add(variant)
         await db.flush()
-        if variant.is_active:
+        if want_active:
             await CmsService._deactivate_other_variants(
                 db, section.id, variant.id, actor_id=actor_id
             )
+            variant.is_active = True
+            await db.flush()
         await CmsService._audit(
             db,
             entity_type="SECTION_VARIANT",
@@ -1109,16 +1198,20 @@ class CmsService:
         if not variant:
             return None
         section_key = await CmsService._section_key_for(db, variant.page_section_id)
+        CmsService.validate_content(section_key or "", payload.content)
         old = {k: getattr(variant, k) for k in payload.model_fields_set}
         data = payload.model_dump(exclude_unset=True)
         for field, val in data.items():
             setattr(variant, field, val)
         variant.updated_at = datetime.now(timezone.utc)
-        await db.flush()
+        # Retire the incumbents before flushing, in the same transaction —
+        # writing is_active=True first collides with the partial unique index
+        # uniq_variants_active_per_section and the save 500s.
         if data.get("is_active") is True:
             await CmsService._deactivate_other_variants(
                 db, variant.page_section_id, variant.id, actor_id=actor_id
             )
+        await db.flush()
         await CmsService._audit(
             db,
             entity_type="SECTION_VARIANT",
@@ -1172,10 +1265,13 @@ class CmsService:
             return None
         variant.is_active = True
         variant.updated_at = datetime.now(timezone.utc)
-        await db.flush()
+        # Same ordering rule as update_variant: the partial unique index
+        # permits one live variant per section, so the incumbent is retired
+        # before this row's flip is flushed.
         await CmsService._deactivate_other_variants(
             db, variant.page_section_id, variant.id, actor_id=actor_id
         )
+        await db.flush()
         section_key = await CmsService._section_key_for(db, variant.page_section_id)
         await CmsService._audit(
             db,
