@@ -13,7 +13,6 @@ import base64
 import hashlib
 import time
 from typing import List, Optional
-from urllib.parse import quote
 import httpx
 import sqlalchemy as sa
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
@@ -1023,6 +1022,38 @@ ASSET_SPECS: dict[str, dict] = {
     "general": {},
 }
 
+# Size caps per asset_type, mirroring Frontend/admin-portal/src/utils/mediaLimits.ts
+# so this endpoint never rejects a file the admin was told to send. `general`
+# stays at the historic 20 MB ceiling — the UI applies the tighter per-kind
+# budget (images 8 MB, video 20 MB) before the file is ever posted.
+# An unknown asset_type falls back to `general`.
+_MB = 1024 * 1024
+UPLOAD_LIMITS: dict[str, int] = {
+    "general": 20 * _MB,
+    "photo": 8 * _MB,
+    "og_image": 8 * _MB,
+    "logo": 2 * _MB,
+    "favicon": 1 * _MB,
+    "document": 20 * _MB,
+}
+
+
+def _format_upload_size(size_bytes: int) -> str:
+    if size_bytes >= _MB:
+        return f"{round(size_bytes / _MB)} MB"
+    return f"{max(1, round(size_bytes / 1024))} KB"
+
+
+def _media_size_problem(asset_type: str, size_bytes: int) -> str | None:
+    """Why this upload is oversize for its asset_type, or None when it fits."""
+    cap = UPLOAD_LIMITS.get(asset_type, UPLOAD_LIMITS["general"])
+    if size_bytes > cap:
+        return (
+            f"File is {_format_upload_size(size_bytes)} — "
+            f"this slot accepts up to {_format_upload_size(cap)}."
+        )
+    return None
+
 
 def _cloudinary_sign(params: dict, api_secret: str) -> str:
     """
@@ -1124,9 +1155,9 @@ async def upload_platform_media(
 
     # 3. Read file bytes
     content = await file.read()
-    max_bytes = 20 * 1024 * 1024  # 20 MB (docs can be large PDFs)
-    if len(content) > max_bytes:
-        raise HTTPException(status_code=413, detail="File too large — maximum 20 MB.")
+    too_big = _media_size_problem(asset_type, len(content))
+    if too_big:
+        raise HTTPException(status_code=413, detail=too_big)
 
     # 4. Determine resource_type (raw for PDF/documents, image for everything else)
     ct = (file.content_type or "").lower()
@@ -1281,11 +1312,14 @@ async def delete_media_library_item(
 ):
     cloud_name, api_key, api_secret = await _get_cloudinary_creds_shared(db)
 
-    encoded_id = quote(public_id, safe="")
-    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/image/upload/{encoded_id}"
+    # Cloudinary only honours the path-parameter form (…/upload/<public_id>) for
+    # GET; the same path with DELETE falls through to a 404 HTML page. The
+    # supported destroy call is the collection endpoint with public_ids[].
+    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/image/upload"
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.delete(
             url,
+            params={"public_ids[]": public_id, "invalidate": 1},
             headers={"Authorization": _cloudinary_basic_auth(api_key, api_secret)},
         )
     if resp.status_code not in (200, 201):

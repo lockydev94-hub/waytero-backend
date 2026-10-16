@@ -11,6 +11,7 @@
 # ============================================================
 
 from datetime import date
+import re
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import text
@@ -21,6 +22,33 @@ from app.core.exceptions import ResourceNotFoundException
 from app.modules.admin import offer_service
 
 router = APIRouter()
+
+# A Cloudinary transform segment is a comma list of `key_value` pairs; a
+# version segment (`v1785961951`) or a public_id never matches it.
+_CL_TRANSFORM_SEGMENT = re.compile(r"^(?:[a-z]{1,5}_[^/,]+)(?:,[a-z]{1,5}_[^/,]+)*$")
+_CL_PREFIX = "https://res.cloudinary.com/"
+_CIRCLE_TRANSFORM = "w_512,h_512,c_fill,g_auto,f_webp"
+
+
+def _circle_thumb(url: str | None) -> str | None:
+    """Force an offer image to the square crop the hero circle renders.
+
+    offers.image_url stores a full Cloudinary secure_url, so an asset chosen
+    from the gallery keeps its native aspect ratio and the circle slices it.
+    Injecting c_fill,g_auto here fixes every consumer at once. Anything that
+    is not a plain Cloudinary upload URL, or already carries a transform, is
+    returned untouched.
+    """
+    if not url or not url.startswith(_CL_PREFIX):
+        return url
+    parts = url[len(_CL_PREFIX):].split("/")
+    # cloud / resource_type / upload / <transform?> / v<version> / public_id…
+    if len(parts) < 4 or parts[2] != "upload":
+        return url
+    tail = parts[3:]
+    if tail and _CL_TRANSFORM_SEGMENT.match(tail[0]):
+        return url
+    return _CL_PREFIX + "/".join(parts[:3] + [_CIRCLE_TRANSFORM] + tail)
 
 _FUNDING_LABEL = {
     "PLATFORM": "Platform offer",
@@ -68,7 +96,7 @@ async def list_live_offers(db: AsyncSession = Depends(get_db)):
             "slug": r["slug"],
             "title": r["title"],
             "service_type": r["service_type"],
-            "image_url": r["image_url"],
+            "image_url": _circle_thumb(r["image_url"]),
             "coupon_code": r["coupon_code"],
             "badge": offer_service.derive_badge(
                 r["discount_type"],
@@ -199,7 +227,7 @@ async def get_live_offer(slug: str, db: AsyncSession = Depends(get_db)):
         "title": d["title"],
         "short_description": d["short_description"],
         "terms_and_conditions": d["terms_and_conditions"],
-        "image_url": d["image_url"],
+        "image_url": _circle_thumb(d["image_url"]),
         "service_type": d["service_type"],
         "badge": badge,
         "is_available": is_available,
