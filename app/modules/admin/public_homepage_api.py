@@ -16,7 +16,11 @@
 #    login/auth modal (left-side image slider). Reads the
 #    AUTH_MODAL_IMAGES system configuration (JSON array of URLs).
 #
-#    No auth — both are read by the public marketing site.
+#  GET /public/homepage-band-counts
+#    Row counts for the six data-driven homepage bands, so the site can
+#    tell which bands will paint before it lays out their backgrounds.
+#
+#    No auth — all are read by the public marketing site.
 # ============================================================
 
 import json
@@ -28,7 +32,11 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.modules.admin.services import CmsService, ServiceTypeService
+from app.modules.admin.services import (
+    BlogService,
+    CmsService,
+    ServiceTypeService,
+)
 from app.modules.admin.schemas import PublicHomepageOut
 
 
@@ -255,3 +263,87 @@ async def get_public_auth_modal_images(
             images = []
 
     return PublicAuthModalImagesOut(images=images)
+
+
+@router.get(
+    "/homepage-band-counts",
+    tags=["Public Homepage"],
+    summary="How many rows each data-driven homepage band can actually paint",
+    description=(
+        "Returns {section_key: count} for the six homepage bands that fetch "
+        "their content from the DB (FEATURED_HOTELS, POPULAR_DESTINATIONS, "
+        "POPULAR_ROUTES, POPULAR_CITIES, TOUR_PACKAGES, BLOG). A band with "
+        "count 0 renders nothing at all, so the website can only alternate "
+        "its light/dark background correctly if it knows which bands will "
+        "paint before it paints them. Counts mirror the filters of the "
+        "public list endpoints each band calls. No authentication required."
+    ),
+)
+async def get_public_homepage_band_counts(
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    # One row of five scalars. Each subselect is the public list endpoint's
+    # own predicate, noted inline — if a listing filter changes, this must
+    # change with it or the homepage hides/shows a band the wrong way.
+    row = (
+        (
+            await db.execute(
+                text(
+                    """
+                SELECT
+                  -- /public/hotel/search  (public_hotel_api.py `where`)
+                  (SELECT COUNT(*) FROM hotels h
+                     WHERE h.status = 'ACTIVE' AND h.deleted_at IS NULL)
+                     AS featured_hotels,
+
+                  -- /public/tours/popular-destinations (tour/api.py): cities
+                  -- grouped by their ACTIVE package count.
+                  (SELECT COUNT(DISTINCT c.id) FROM cities c
+                     JOIN states st        ON st.id = c.state_id
+                     JOIN tour_packages tp ON tp.city_id = c.id
+                          AND tp.status = 'ACTIVE'
+                    WHERE c.is_active = TRUE) AS popular_destinations,
+
+                  -- /public/routes (public_cab_route_api.py `where`)
+                  (SELECT COUNT(*) FROM cab_routes r
+                     WHERE r.is_active) AS popular_routes,
+
+                  -- /public/cab/cities (public_cab_api.py): a city counts
+                  -- when at least one active vehicle category can be priced
+                  -- for it. The band additionally drops blank names.
+                  (SELECT COUNT(*) FROM cities c
+                    WHERE c.is_active = TRUE
+                      AND BTRIM(COALESCE(c.name, '')) <> ''
+                      AND EXISTS (
+                            SELECT 1 FROM vehicle_categories vc
+                             WHERE vc.is_active = TRUE
+                               AND (EXISTS (SELECT 1 FROM vehicle_pricing_rules r
+                                             WHERE r.city_id = c.id
+                                               AND r.vehicle_category_id = vc.id)
+                                 OR EXISTS (SELECT 1 FROM default_vehicle_pricing_rules d
+                                            WHERE d.vehicle_category_id = vc.id))
+                          )) AS popular_cities,
+
+                  -- /public/tours/packages (tour/api.py statuses=['ACTIVE'])
+                  (SELECT COUNT(*) FROM tour_packages
+                     WHERE status = 'ACTIVE') AS tour_packages
+                """
+                )
+            )
+        )
+        .mappings()
+        .first()
+    )
+
+    # /public/blog (public_blog_api.py) — reused rather than re-derived so
+    # the "published only" rule lives in one place.
+    blog_total = await BlogService.count_posts(db, published_only=True)
+
+    return {
+        "FEATURED_HOTELS": int(row["featured_hotels"] or 0),
+        "POPULAR_DESTINATIONS": int(row["popular_destinations"] or 0),
+        "POPULAR_ROUTES": int(row["popular_routes"] or 0),
+        "POPULAR_CITIES": int(row["popular_cities"] or 0),
+        "TOUR_PACKAGES": int(row["tour_packages"] or 0),
+        "BLOG": int(blog_total or 0),
+    }

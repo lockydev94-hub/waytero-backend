@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.exceptions import BusinessException, ResourceNotFoundException
+from app.modules.booking.services.booking_lookup import resolve_booking_by_ref
 from app.shared.responses.base import success_response
 
 router = APIRouter()
@@ -171,12 +172,21 @@ async def submit_contact_message(
 # mobile. The mobile match is mandatory — without it anyone could probe
 # booking numbers. A mismatch returns 404 (same as "not found") so the
 # endpoint never reveals whether a booking number exists.
+#
+# The lookup itself lives in booking/services/booking_lookup.py, shared with
+# the public feedback page. Its CAB and HOTEL payloads are unchanged here;
+# the resolver also answers tour-booking and master-trip numbers, which the
+# old inline SQL did not.
 
 
 def _mask_mobile(mobile: Optional[str]) -> Optional[str]:
     if not mobile or len(mobile) < 10:
         return None
     return mobile[:2] + "****" + mobile[-3:]
+
+
+def _iso(value) -> Optional[str]:
+    return value.isoformat() if value else None
 
 
 @router.get(
@@ -194,148 +204,61 @@ async def track_booking(
     except ValueError:
         raise BusinessException("Enter a valid 10-digit mobile number")
 
-    bn = booking_number.strip().upper()
+    booking = await resolve_booking_by_ref(db, booking_number.strip().upper(), mobile)
+    if booking is None:
+        raise ResourceNotFoundException("Booking", booking_number)
 
-    # 1. Cab booking ─────────────────────────────────────────────
-    cab = (
-        (
-            await db.execute(
-                _text(
-                    """
-                SELECT
-                    cb.booking_number, cb.booking_status, cb.trip_type,
-                    cb.pickup_location, cb.drop_location, cb.pickup_datetime,
-                    cb.final_amount, cb.estimated_amount,
-                    mb.booking_number AS master_number, mb.journey_start_date,
-                    u.mobile_number AS customer_mobile,
-                    COALESCE(NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''), 'Guest') AS customer_name,
-                    d.full_name  AS driver_name,
-                    d.mobile     AS driver_mobile,
-                    v.registration_number AS vehicle_number
-                FROM cab_bookings cb
-                JOIN master_bookings mb ON mb.id = cb.master_booking_id
-                JOIN customers c        ON c.id = mb.customer_id
-                JOIN users u            ON u.id = c.user_id
-                LEFT JOIN LATERAL (
-                    SELECT cba.driver_id, cba.vehicle_id
-                    FROM cab_booking_assignments cba
-                    WHERE cba.cab_booking_id = cb.id AND cba.closed_at IS NULL
-                    ORDER BY cba.assigned_at DESC
-                    LIMIT 1
-                ) act ON true
-                LEFT JOIN drivers d     ON d.id = act.driver_id
-                LEFT JOIN vehicles v    ON v.id = act.vehicle_id
-                WHERE UPPER(cb.booking_number) = :bn
-                """
-                ),
-                {"bn": bn},
-            )
-        )
-        .mappings()
-        .first()
-    )
+    detail = booking["detail"]
+    payload: dict = {
+        "service_type": booking["service_type"],
+        "booking_number": booking["booking_number"],
+        "master_booking_number": booking["master_booking_number"],
+        "status": booking["status"],
+        "customer_name": booking["customer_name"],
+        "amount": float(booking["amount"] or 0),
+    }
 
-    if cab:
-        if cab["customer_mobile"] != mobile:
-            raise ResourceNotFoundException("Booking", booking_number)
-        return success_response(
-            "Booking found",
+    if booking["service_type"] == "CAB":
+        payload["trip"] = {
+            "trip_type": detail["trip_type"],
+            "pickup_location": detail["pickup_location"],
+            "drop_location": detail["drop_location"],
+            "pickup_datetime": _iso(detail["pickup_datetime"]),
+            "journey_start_date": _iso(detail["journey_start_date"]),
+        }
+        payload["driver"] = (
             {
-                "service_type": "CAB",
-                "booking_number": cab["booking_number"],
-                "master_booking_number": cab["master_number"],
-                "status": cab["booking_status"],
-                "customer_name": cab["customer_name"],
-                "trip": {
-                    "trip_type": cab["trip_type"],
-                    "pickup_location": cab["pickup_location"],
-                    "drop_location": cab["drop_location"],
-                    "pickup_datetime": (
-                        cab["pickup_datetime"].isoformat()
-                        if cab["pickup_datetime"]
-                        else None
-                    ),
-                    "journey_start_date": (
-                        cab["journey_start_date"].isoformat()
-                        if cab["journey_start_date"]
-                        else None
-                    ),
-                },
-                "driver": (
-                    {
-                        "name": cab["driver_name"],
-                        "mobile": _mask_mobile(cab["driver_mobile"]),
-                        "vehicle_number": cab["vehicle_number"],
-                    }
-                    if cab["driver_name"] or cab["vehicle_number"]
-                    else None
-                ),
-                "amount": float(cab["final_amount"] or cab["estimated_amount"] or 0),
-            },
+                "name": detail["driver_name"],
+                "mobile": _mask_mobile(detail["driver_mobile"]),
+                "vehicle_number": detail["vehicle_number"],
+            }
+            if detail["driver_name"] or detail["vehicle_number"]
+            else None
         )
+    elif booking["service_type"] == "HOTEL":
+        payload["stay"] = {
+            "hotel_name": detail["hotel_name"],
+            "hotel_address": detail["hotel_address"],
+            "check_in_date": _iso(detail["check_in_date"]),
+            "check_out_date": _iso(detail["check_out_date"]),
+            "num_rooms": detail["num_rooms"],
+            "num_guests": detail["num_guests"],
+        }
+    elif booking["service_type"] == "TOUR":
+        payload["tour"] = {
+            "package_name": detail["package_name"],
+            "destination": detail["destination"],
+            "travel_start_date": _iso(detail["travel_start_date"]),
+            "travel_end_date": _iso(detail["travel_end_date"]),
+            "persons_count": detail["persons_count"],
+            "duration_days": detail["duration_days"],
+            "duration_nights": detail["duration_nights"],
+        }
+    else:  # TRIP — the master booking number was used
+        payload["trip"] = {
+            "service_types": detail["service_types"],
+            "journey_start_date": _iso(detail["journey_start_date"]),
+            "journey_end_date": _iso(detail["journey_end_date"]),
+        }
 
-    # 2. Hotel booking ───────────────────────────────────────────
-    # NOTE: the legacy `hotel_bookings` table was dropped in migration
-    # 0038; live hotel reservations live in `hotel_reservations`.
-    htl = (
-        (
-            await db.execute(
-                _text(
-                    """
-                SELECT
-                    hr.reservation_number AS booking_number,
-                    hr.reservation_status AS booking_status,
-                    h.hotel_name, h.address AS hotel_address,
-                    hr.check_in_date, hr.check_out_date,
-                    hr.rooms_count AS num_rooms, hr.adults_count AS num_guests,
-                    hr.total_amount AS final_amount,
-                    mb.booking_number AS master_number,
-                    u.mobile_number AS customer_mobile,
-                    COALESCE(NULLIF(TRIM(COALESCE(c.first_name,'') || ' ' || COALESCE(c.last_name,'')), ''), 'Guest') AS customer_name
-                FROM hotel_reservations hr
-                JOIN master_bookings mb ON mb.id = hr.master_booking_id
-                JOIN hotels h          ON h.id = hr.hotel_id
-                JOIN customers c       ON c.id = hr.customer_id
-                JOIN users u           ON u.id = c.user_id
-                WHERE UPPER(hr.reservation_number) = :bn
-                """
-                ),
-                {"bn": bn},
-            )
-        )
-        .mappings()
-        .first()
-    )
-
-    if htl:
-        if htl["customer_mobile"] != mobile:
-            raise ResourceNotFoundException("Booking", booking_number)
-        return success_response(
-            "Booking found",
-            {
-                "service_type": "HOTEL",
-                "booking_number": htl["booking_number"],
-                "master_booking_number": htl["master_number"],
-                "status": htl["booking_status"],
-                "customer_name": htl["customer_name"],
-                "stay": {
-                    "hotel_name": htl["hotel_name"],
-                    "hotel_address": htl["hotel_address"],
-                    "check_in_date": (
-                        htl["check_in_date"].isoformat()
-                        if htl["check_in_date"]
-                        else None
-                    ),
-                    "check_out_date": (
-                        htl["check_out_date"].isoformat()
-                        if htl["check_out_date"]
-                        else None
-                    ),
-                    "num_rooms": htl["num_rooms"],
-                    "num_guests": htl["num_guests"],
-                },
-                "amount": float(htl["final_amount"] or 0),
-            },
-        )
-
-    raise ResourceNotFoundException("Booking", booking_number)
+    return success_response("Booking found", payload)

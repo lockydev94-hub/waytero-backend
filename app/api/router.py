@@ -70,6 +70,8 @@ from app.modules.tour.api import (
 )
 from app.modules.admin.public_leads_api import router as public_leads_router
 from app.modules.admin.leads_api import router as admin_leads_router
+from app.modules.admin.public_capture_api import router as public_capture_router
+from app.modules.admin.capture_admin_api import router as admin_capture_router
 from app.modules.chat.api import router as chat_router
 from app.modules.chat.admin_api import router as admin_chat_router
 from app.modules.admin.partner_settings_api import (
@@ -382,6 +384,19 @@ api_router.include_router(
 # Public: partner applications + contact messages + booking tracking.
 # Admin: review surfaces in the admin portal (/admin/leads/*).
 api_router.include_router(public_leads_router, prefix="/public", tags=["Public Leads"])
+
+# --- Homepage capture surfaces (enquiry rail, callback card, guest feedback)
+# Public: no login, per-IP rate limited.
+# Admin: the three review queues in the admin portal (/admin/capture/*).
+api_router.include_router(
+    public_capture_router, prefix="/public", tags=["Public Capture"]
+)
+api_router.include_router(
+    admin_capture_router,
+    prefix="/admin/capture",
+    tags=["Admin Capture"],
+    dependencies=[Depends(require_roles(*ADMIN_CCO))],
+)
 
 # --- Account Deletion (customer website form + admin review) ---
 api_router.include_router(
