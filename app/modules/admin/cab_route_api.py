@@ -132,6 +132,9 @@ async def _save_route(
         route.origin_label, route.destination_label
     ):
         raise ValidationException("Origin and destination must be different places")
+    await cab_route_service.assert_endpoints_free(
+        db, route.origin_label, route.destination_label, route_id
+    )
 
     for cid, label in (
         (route.origin_city_id, "Origin city"),

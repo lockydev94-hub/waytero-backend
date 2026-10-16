@@ -39,6 +39,31 @@ async def unique_slug(db: AsyncSession, base: str, exclude_id: int | None) -> st
         n += 1
 
 
+async def assert_endpoints_free(
+    db: AsyncSession, origin: str, destination: str, exclude_id: int | None
+) -> None:
+    """Same corridor, second time — say so instead of letting Postgres raise.
+
+    `uq_cab_routes_endpoints` (migration 0079) is unique on the lower-cased
+    pair, so an INSERT of a corridor that already exists would surface as a
+    500. Checked here to turn that into a message the admin can act on.
+    """
+    sql = """
+        SELECT 1 FROM cab_routes
+        WHERE lower(origin_label) = lower(:o)
+          AND lower(destination_label) = lower(:d)
+    """
+    params: dict = {"o": origin, "d": destination}
+    if exclude_id is not None:
+        # Only bound when there is a value — asyncpg cannot type a bare NULL.
+        sql += " AND id <> :exclude"
+        params["exclude"] = exclude_id
+    if (await db.execute(text(sql), params)).first():
+        raise ValidationException(
+            f"A route from {origin} to {destination} already exists — edit that one"
+        )
+
+
 async def assert_city_active(db: AsyncSession, city_id: int, label: str) -> None:
     if not (
         await db.execute(
