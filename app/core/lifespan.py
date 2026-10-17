@@ -146,8 +146,10 @@ def _run_migrations() -> None:
 
 def _run_legal_seeder() -> None:
     """
-    Seed the customer-website legal pages (privacy / terms / refund /
-    cookies / booking-instructions) into system_configurations.
+    Seed the customer-website page bodies (privacy / terms / refund /
+    cookies / booking-instructions) into system_configurations. The copy
+    itself lives in scripts/legal_page_content.py, which is also what the
+    website ships as its built-in fallback.
     Idempotent — ON CONFLICT DO NOTHING, never overwrites admin edits.
     """
     seeder_path = os.path.join(_BACKEND_DIR, "scripts", "seed_legal_content.py")

@@ -118,8 +118,11 @@ class PublicPlatformProfileOut(BaseModel):
     then falls back to its bundled static files. support_phone is the contact
     number saved under Settings → Platform Details (SUPPORT_PHONE key);
     support_email/office_address/tagline/social_links come from the brand
-    master keys seeded by migration 0072. customer-web falls back to its own
-    brand master when a value is empty.
+    master keys seeded by migration 0072. office_hours and whatsapp_phone are
+    the desk-hours keys (PLATFORM_OFFICE_HOURS / PLATFORM_WHATSAPP_PHONE) —
+    whatsapp_phone is empty when the admin has not set one, in which case
+    customer-web uses support_phone. customer-web falls back to its own brand
+    master when a value is empty.
     """
 
     logo_url: str = ""
@@ -128,8 +131,43 @@ class PublicPlatformProfileOut(BaseModel):
     support_phone: str = ""
     support_email: str = ""
     office_address: str = ""
+    office_hours: str = ""
+    whatsapp_phone: str = ""
     tagline: str = ""
     social_links: dict = {}
+
+
+def _single_line_address(raw: str) -> str:
+    """The OFFICE_ADDRESS key, else the primary (or first) entry of the
+    PLATFORM_OFFICE_ADDRESSES array that Settings → Platform actually writes.
+
+    The two keys were added a year apart and nothing ever reconciled them, so
+    an admin who only filled the address cards would never appear on the
+    contact page. Reading the array here is what closes that gap.
+    """
+    try:
+        entries = json.loads(raw or "[]")
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(entries, list) or not entries:
+        return ""
+    chosen = next(
+        (e for e in entries if isinstance(e, dict) and e.get("is_primary")),
+        next((e for e in entries if isinstance(e, dict)), None),
+    )
+    if not chosen:
+        return ""
+    return ", ".join(
+        str(part).strip()
+        for part in (
+            chosen.get("line1"),
+            chosen.get("line2"),
+            chosen.get("city"),
+            chosen.get("state"),
+            chosen.get("pincode"),
+        )
+        if str(part or "").strip()
+    )
 
 
 @router.get(
@@ -143,9 +181,10 @@ class PublicPlatformProfileOut(BaseModel):
         "uses favicon_url for the browser tab icon and og_image_url for "
         "social shares; empty strings mean the admin hasn't uploaded yet. "
         "Also returns contact/brand fields from system_configurations "
-        "(SUPPORT_PHONE, SUPPORT_EMAIL, OFFICE_ADDRESS, PLATFORM_TAGLINE, "
-        "SOCIAL_* keys) — customer-web falls back to its owner-approved "
-        "brand master when a value is empty. No authentication required."
+        "(SUPPORT_PHONE, SUPPORT_EMAIL, OFFICE_ADDRESS, PLATFORM_OFFICE_HOURS, "
+        "PLATFORM_WHATSAPP_PHONE, PLATFORM_TAGLINE, SOCIAL_* keys) — "
+        "customer-web falls back to its owner-approved brand master when a "
+        "value is empty. No authentication required."
     ),
 )
 async def get_public_platform_profile(
@@ -158,6 +197,8 @@ async def get_public_platform_profile(
                 "WHERE config_key IN ("
                 "'PLATFORM_LOGO_URL', 'PLATFORM_FAVICON_URL', 'PLATFORM_OG_IMAGE_URL', "
                 "'SUPPORT_PHONE', 'SUPPORT_EMAIL', 'OFFICE_ADDRESS', "
+                "'PLATFORM_OFFICE_ADDRESSES', 'PLATFORM_OFFICE_HOURS', "
+                "'PLATFORM_WHATSAPP_PHONE', "
                 "'PLATFORM_TAGLINE', 'SOCIAL_YOUTUBE', 'SOCIAL_INSTAGRAM', 'SOCIAL_FACEBOOK'"
                 ")"
             )
@@ -179,7 +220,12 @@ async def get_public_platform_profile(
         og_image_url=cfg.get("PLATFORM_OG_IMAGE_URL", ""),
         support_phone=cfg.get("SUPPORT_PHONE", "").strip(),
         support_email=cfg.get("SUPPORT_EMAIL", "").strip(),
-        office_address=cfg.get("OFFICE_ADDRESS", "").strip(),
+        office_address=(
+            cfg.get("OFFICE_ADDRESS", "").strip()
+            or _single_line_address(cfg.get("PLATFORM_OFFICE_ADDRESSES", ""))
+        ),
+        office_hours=cfg.get("PLATFORM_OFFICE_HOURS", "").strip(),
+        whatsapp_phone=cfg.get("PLATFORM_WHATSAPP_PHONE", "").strip(),
         tagline=cfg.get("PLATFORM_TAGLINE", "").strip(),
         social_links=socials,
     )

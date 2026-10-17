@@ -6,9 +6,13 @@
 # No auth — consumed by customer-web's SSR pages.
 #
 #   GET /public/legal/{slug}
-#       Serves the seeded legal page (privacy / terms / refund /
-#       cookies / booking-instructions) as the raw JSON stored in
-#       system_configurations under LEGAL_PAGE_{SLUG_UPPER}.
+#       Serves a published page body as the raw JSON stored in
+#       system_configurations under LEGAL_PAGE_{SLUG_UPPER}. The prefix
+#       says "legal" for historical reasons — it resolves ANY slug, and
+#       the admin's Website → Pages editor writes booking-instructions,
+#       safety, support, careers and press bodies into the same
+#       namespace. Nothing whitelists the slug on purpose: a new page is
+#       an admin action, not a deploy.
 #
 #   GET /public/cancellation-policy
 #       Returns the LIVE cab + tour ladders from system_configurations
@@ -29,14 +33,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.database import get_db
 
 router = APIRouter()
-
-LEGAL_SLUGS = {
-    "privacy",
-    "terms",
-    "refund",
-    "cookies",
-    "booking-instructions",
-}
 
 
 @router.get(

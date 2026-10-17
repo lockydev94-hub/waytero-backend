@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""
-WayTero — Legal Content Seeder
-================================
-Seeds the customer website's legal pages into `system_configurations`
-(keys `LEGAL_PAGE_*`) as JSON so the pages render the same text the
-platform actually enforces:
-
-  * LEGAL_PAGE_PRIVACY              — privacy policy (incl. account deletion)
-  * LEGAL_PAGE_TERMS                — terms of service (incl. booking instructions)
-  * LEGAL_PAGE_REFUND               — refund & cancellation policy framework
-  * LEGAL_PAGE_COOKIES              — cookie policy
-  * LEGAL_PAGE_BOOKING_INSTRUCTIONS — how to book cab / hotel / tour
-
-The refund page additionally renders LIVE ladder numbers from
-`system_configurations` via `GET /public/cancellation-policy`, so the
-numeric tiers always match the cancellation engine even after an admin
-edits them. This seeder only writes the prose framework.
-
-Idempotent — `ON CONFLICT (config_key) DO NOTHING`; it never overwrites
-values an admin has already set. Safe to run on every backend restart.
-
-Run via lifespan (app/core/lifespan.py) after alembic migrations, and
-manually: `python -m scripts.seed_legal_content`
-"""
+# ============================================================
+# WAYTERO — WEBSITE PAGE-BODY SEEDER
+# File: scripts/seed_legal_content.py
+#
+# Inserts the customer-website page bodies into
+# `system_configurations` under `LEGAL_PAGE_{SLUG}` as JSON, so the pages
+# render the text the platform actually enforces. The bodies themselves live
+# in `scripts/legal_page_content.PAGE_BODIES` — one place, because
+# `scripts.rewrite_legal_copy` has to be able to tell what this file would
+# have written.
+#
+#   privacy · terms · refund · cookies · booking-instructions
+#   (+ safety · support · careers · press, added in Batch B)
+#
+# The refund page additionally renders LIVE ladder numbers via
+# `GET /public/cancellation-policy`, so the numeric tiers always match the
+# cancellation engine even after an admin edits a ladder. This seeder only
+# writes prose.
+#
+# Idempotent — `ON CONFLICT (config_key) DO NOTHING`; it never overwrites a
+# value an admin has already set. Safe to run on every backend restart.
+#
+# Run via lifespan (app/core/lifespan.py) after alembic migrations, and
+# manually: `python -m scripts.seed_legal_content`
+# ============================================================
 
 import asyncio
 import json
@@ -40,8 +41,15 @@ from sqlalchemy.ext.asyncio import (
 )  # noqa: E402
 
 from app.core.config import settings  # noqa: E402
+from scripts.legal_page_content import PAGE_BODIES  # noqa: E402
 
-LEGAL_PAGES = {
+# ── Frozen first-generation copy ──────────────────────────────────────────────
+# Never edit this dict. `scripts.rewrite_legal_copy` compares the stored value
+# against it byte for byte, which is how it tells a row nobody has touched from
+# one an admin wrote. Its text claims things the platform does not do — instant
+# refunds, encryption at rest, analytics cookies, data-processing agreements —
+# and that is precisely why the anchor has to stay exactly as it was seeded.
+ORIGINAL_SEED = {
     "LEGAL_PAGE_PRIVACY": {
         "slug": "privacy",
         "title": "Privacy Policy",
@@ -324,7 +332,7 @@ async def main() -> None:
     engine = create_async_engine(settings.DATABASE_URL)
     Session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with Session() as db:
-        for key, page in LEGAL_PAGES.items():
+        for key, page in PAGE_BODIES.items():
             await db.execute(
                 text(
                     """
@@ -336,13 +344,15 @@ async def main() -> None:
                 {
                     "k": key,
                     "v": json.dumps(page, ensure_ascii=False),
-                    "d": f"Legal page: /{page['slug']} (seeded)",
+                    "d": f"Website page body: /{page['slug']} (seeded)",
                 },
             )
         await db.commit()
     await engine.dispose()
     print(
-        "legal_content_seeded: 5 pages (privacy, terms, refund, cookies, booking-instructions)"
+        "page_bodies_seeded: "
+        + ", ".join(page["slug"] for page in PAGE_BODIES.values())
+        + " (existing rows left untouched)"
     )
 
 
