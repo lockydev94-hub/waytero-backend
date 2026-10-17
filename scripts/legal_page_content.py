@@ -366,4 +366,269 @@ PAGE_BODIES = {
             },
         ],
     },
+    # ── Trust and company pages ───────────────────────────────────────────────
+    # These four carry no `effective_date`: nothing here took effect on a date,
+    # they describe how the platform works today, and `updated_at` is the only
+    # honest stamp the hero can print.
+    "LEGAL_PAGE_SAFETY": {
+        "slug": "safety",
+        "title": "Safety",
+        "eyebrow": "Trust & Safety",
+        "description": (
+            "What is checked before a driver or property goes live, what happens to "
+            "your money and your data on the way, and what to do if a trip goes wrong."
+        ),
+        "updated_at": UPDATED_AT,
+        "sections": [
+            {
+                "heading": "1. Before a partner goes live",
+                "body": (
+                    "A cab partner submits the vehicle registration, the insurance and the "
+                    "driver's licence; a hotel or tour operator submits its business and property "
+                    "documents. Someone on the WayTero team reads each set before the listing goes "
+                    "live, and a partner whose complaints keep repeating is taken off the "
+                    "platform. There is no automatic approval and no automatic suspension — both "
+                    "are decisions people make, which is also why neither happens the second a "
+                    "document lands."
+                ),
+            },
+            {
+                "heading": "2. What the site can tell you mid-trip",
+                "body": (
+                    "The Track page answers a booking number with the booking's status and, once a "
+                    "driver is assigned, the driver's name, the vehicle number and a masked mobile "
+                    "number. It is a status check, not a map: no vehicle position, no playback of "
+                    "the route, no arrival clock. Anyone you give the booking number to sees "
+                    "exactly what you see, which is the honest version of sharing a trip."
+                ),
+            },
+            {
+                "heading": "3. Money",
+                "body": (
+                    "Online payment runs on the payment gateway. WayTero keeps the amount, the "
+                    "mode, the reference and the status — never the card number. Where a driver or "
+                    "property collects an advance in cash or UPI, the booking records that it was "
+                    "collected, by whom, and how much, and the receipt entry is on the booking. If "
+                    "someone asks for money that is not on the booking, that is the moment to call."
+                ),
+            },
+            {
+                "heading": "4. If something goes wrong",
+                "body": (
+                    "Anything that puts you in danger: call 112, the national emergency number, "
+                    "first. The police do not wait for us, and we cannot send them. For the "
+                    "booking itself, the number printed on your confirmation is the fastest route "
+                    "while the desk is staffed; the hours are listed on this page. Outside them, "
+                    "WhatsApp or email reaches the team and the message is answered the next "
+                    "working day — a reassignment, a move or a cancellation is still possible "
+                    "while there is something left to change."
+                ),
+            },
+            {
+                "heading": "5. Ratings",
+                "body": (
+                    "Every completed booking can be rated and the rating stays on the listing, so "
+                    "the next traveler sees what you saw. A low score does not remove a partner by "
+                    "itself — repeat complaints and failed checks do. That is why the reviews you "
+                    "leave are read, not just stored."
+                ),
+            },
+        ],
+        "faq": [
+            {
+                "question": "How are drivers and properties verified?",
+                "answer": "Registration, insurance and licence documents for cabs; business and property documents for hotels and tour operators. A person on the team checks them before the listing goes live, and they are looked at again when a partner's record changes.",
+            },
+            {
+                "question": "Can my family watch the vehicle on a map?",
+                "answer": "No. Share the booking number and they see what you see on Track: the status and, once assigned, the driver's name, vehicle number and a masked mobile. There is no live position and no route playback on this platform.",
+            },
+            {
+                "question": "Is my card stored by WayTero?",
+                "answer": "No. Online payment runs through the gateway and we keep the transaction reference, the amount and the status. A cash or UPI advance taken by a driver or property is recorded on the booking, not stored as a payment instrument.",
+            },
+            {
+                "question": "What happens if I need help outside staffed hours?",
+                "answer": "For danger, call 112 first. For the booking, leave the message on WhatsApp or email and the desk picks it up the next working day; the hours printed above are the hours we can promise an answer inside.",
+            },
+            {
+                "question": "Does a bad review take a partner off the site?",
+                "answer": "Not on its own. One rating is one person's trip; the team acts on patterns — repeat complaints, failed document checks, bookings that did not happen.",
+            },
+        ],
+    },
+    "LEGAL_PAGE_SUPPORT": {
+        "slug": "support",
+        "title": "Support",
+        "eyebrow": "Help",
+        "description": (
+            "How to reach the desk fastest, what to have in front of you, and which "
+            "question belongs on which channel."
+        ),
+        "updated_at": UPDATED_AT,
+        "sections": [
+            {
+                "heading": "1. Have the booking number",
+                "body": (
+                    "It is the key to the whole record: the status, who is assigned, what was "
+                    "paid, what is refundable and what the property or driver was told. The same "
+                    "question without it takes three times as long, because the first thing the "
+                    "desk does is find the booking. It is on your confirmation and in My Bookings."
+                ),
+            },
+            {
+                "heading": "2. Which channel for which question",
+                "body": (
+                    "The phone number on your confirmation is fastest while the desk is staffed — "
+                    "those hours are printed on this page. WhatsApp suits trip changes and photos "
+                    "of a room or a vehicle. Email suits anything that needs a paper trail: "
+                    "invoices, name changes, complaints. The chat bubble on this site reaches an "
+                    "agent who is online, and outside staffed hours it takes a message rather than "
+                    "a conversation."
+                ),
+            },
+            {
+                "heading": "3. Cancellations and refunds",
+                "body": (
+                    "You cancel from My Bookings and the preview shows the exact refund before you "
+                    "commit; the tier that applies is the one in force at that moment. The amount "
+                    "is credited to your WayTero wallet as the cancellation is processed and can be "
+                    "spent on any future booking. The Refund Policy page lists the live ladders, "
+                    "and reads them from the same configuration the engine uses."
+                ),
+            },
+            {
+                "heading": "4. When a trip goes wrong",
+                "body": (
+                    "Tell us before it is over. A driver who never arrives, a room nothing like its "
+                    "photos, an itinerary that changed without notice — while the pickup window or "
+                    "the stay is still open there is something the desk can reassign, move or "
+                    "cancel. After the fact there is usually only a refund to argue about, which "
+                    "is worse for you."
+                ),
+            },
+            {
+                "heading": "5. What we answer when",
+                "body": (
+                    "A message that arrives while the desk is staffed is answered the same working "
+                    "day. Anything else is answered the next working day. There is no minute-count "
+                    "promise here — the platform is small, and a response-time guarantee nobody "
+                    "measures is a claim, not a service."
+                ),
+            },
+        ],
+        "faq": [
+            {
+                "question": "How do I cancel a hotel booking?",
+                "answer": "Open the booking in My Bookings and choose Cancel. The refund the property's own policy allows at that moment is shown in the preview before you confirm it.",
+            },
+            {
+                "question": "Where does my refund go?",
+                "answer": "Into your WayTero wallet, as the cancellation is processed. The wallet is the form a refund takes today — there is no bank withdrawal on the platform — and it can be spent on any future booking.",
+            },
+            {
+                "question": "How do I get a GST invoice?",
+                "answer": "Eligible bookings generate a tax invoice, downloadable from the booking in My Bookings. If it is not there, email the booking number and the billing details and the desk issues it.",
+            },
+            {
+                "question": "My driver has not arrived. What now?",
+                "answer": "Call the number on your confirmation, and the driver's number on Track if one has been assigned. A reassignment is possible while the pickup window is open, which is why it is worth calling rather than waiting.",
+            },
+            {
+                "question": "Can you change my check-in date?",
+                "answer": "Yes, subject to the property's availability and any difference in rate. Ask before the property's change window closes — after check-in date passes there is usually nothing left to change.",
+            },
+        ],
+    },
+    "LEGAL_PAGE_CAREERS": {
+        "slug": "careers",
+        "title": "Careers",
+        "eyebrow": "Work with us",
+        "description": (
+            "How the team works, what it is like to build here, and how to introduce "
+            "yourself when nothing is posted."
+        ),
+        "updated_at": UPDATED_AT,
+        "sections": [
+            {
+                "heading": "1. How we work",
+                "body": (
+                    "A small team in Bhubaneswar, owning its own work end to end. The book of "
+                    "rules is short: the traveler decides what matters, a feature ships polished or "
+                    "does not ship, and nobody hides behind a hand-off. Booking, fares, payments "
+                    "and partner onboarding all live on one stack, so an engineer sees the customer "
+                    "complaint that follows their own code — which is the fastest way to stop "
+                    "writing things that break."
+                ),
+            },
+            {
+                "heading": "2. What a role here actually is",
+                "body": (
+                    "Generalist work on a young product: you will touch a fare rule and a "
+                    "settlement screen in the same week, and you will talk to a driver, a hotel "
+                    "front desk or a customer at some point, because that is where the bugs are. "
+                    "If you want a narrow role with a team of twenty around it, this is not it."
+                ),
+            },
+            {
+                "heading": "3. When you send a profile",
+                "body": (
+                    "Say what you have built, not what you have read, and name the part of the "
+                    "platform you would want to own. Every introduction that arrives is read; we "
+                    "reply when there is something to reply to — a role, a paid trial, or a clear "
+                    "reason why neither fits yet. We do not collect CVs to look busy."
+                ),
+            },
+        ],
+        "faq": [],
+    },
+    "LEGAL_PAGE_PRESS": {
+        "slug": "press",
+        "title": "Press & Media",
+        "eyebrow": "For journalists",
+        "description": (
+            "What WayTero will give a journalist, what it will not, and how to ask."
+        ),
+        "updated_at": UPDATED_AT,
+        "sections": [
+            {
+                "heading": "1. Figures you can quote",
+                "body": (
+                    "The numbers on this page are read from the same database the site sells from: "
+                    "cities with live cab fares, routes with a set fare, properties bookable today, "
+                    "tour packages live. Quote them with the date you looked, because they move "
+                    "when the catalogue moves. Anything the platform cannot count — total "
+                    "bookings, revenue, retention — we will not put in a sentence for you."
+                ),
+            },
+            {
+                "heading": "2. Assets",
+                "body": (
+                    "The logo, product screenshots and the background of the founding team are sent "
+                    "on request, with a date on them. There is no downloadable media kit on this "
+                    "page: a zip that goes stale gets printed with the wrong wordmark, and an email "
+                    "reply takes ten minutes."
+                ),
+            },
+            {
+                "heading": "3. What we will not share",
+                "body": (
+                    "Customer names, driver names, what any single partner earns, and anything "
+                    "about money raised that has not been announced. Aggregate numbers with a date "
+                    "on them, an explanation of how the fare engine works, and a person to speak to "
+                    "are all available."
+                ),
+            },
+            {
+                "heading": "4. How to ask",
+                "body": (
+                    "Write to the address on this page with the outlet, the deadline and the "
+                    "specific question. A deadline that is real gets an answer; a general request "
+                    "for \"anything interesting\" gets the honest reply that there is nothing to "
+                    "sell you this week."
+                ),
+            },
+        ],
+        "faq": [],
+    },
 }
