@@ -282,16 +282,24 @@ class SectionVariant(Base):
     overlay_opacity = Column(Numeric(3, 2))
 
     # Structured content (JSONB) — free-form payload for sections whose
-    # copy cannot live in the fixed typed slots. Authored by admins via a
-    # JSON editor in the admin portal and spread into the public homepage
-    # variant payload so renderers read it via `pick(variant, key, …)`.
-    # Content keys are defined per section schema, e.g.:
-    #   HOW_IT_WORKS → {"steps": [{title, description, icon}]}
-    #   OFFERS       → {"offers": [{title, description, badge, cta_*}]}
-    #   FAQ          → {"faqs": [{question, answer}]}
-    #   STATS        → {"stats": [{value, suffix, label}]}
-    #   POPULAR_DESTINATIONS → {"destinations": [{name, state, price}]}
-    #   FEATURED_HOTELS      → {"hotels": [{name, city, rating, …}]}
+    # copy cannot live in the fixed typed slots. Authored by admins through
+    # the typed content editor in the CMS (never raw JSON) and spread into
+    # the public homepage variant payload, so renderers read it via
+    # `pick(variant, key, …)`.
+    # CmsService.SECTION_CONTENT_KEYS is the whitelist and validate_content
+    # rejects anything else on write. Keys the editor owns:
+    #   HERO           → {"marquee_items": [{label, icon}]}
+    #   SERVICES /
+    #   WHY_US         → {"items": [{title, desc, icon, link|tone}]}
+    #   STATS          → {"stats": [{value, suffix, label}]}
+    #   HOW_IT_WORKS   → {"steps": [{title, description, icon}]}
+    #   TESTIMONIALS   → {"testimonials": [{name, role, city, text, rating, avatar}]}
+    #   PARTNERS       → {"partners": ["…"], "cta": {label, href}}
+    #   FAQ            → {"faqs": [{question, answer}]}
+    # The live-data bands (hotels, destinations, tours, routes, cities,
+    # offers, blog) take no content array — they build their cards from the
+    # tables when the homepage renders, so their old {"hotels": […]} keys
+    # are rejected rather than stored unread.
     content = Column(JSONB)
 
     # Service type binding — when set, customer-web injects the matching

@@ -1371,13 +1371,13 @@ async def list_cms_sections(
 @router.get(
     "/cms/picker-items",
     tags=["CMS – Content Picker"],
-    summary="Candidate DB records to populate a section's content JSON",
+    summary="Live DB records that fill a section's typed content lists",
 )
 async def cms_picker_items(
     picker_type: str = Query(
         ...,
         alias="type",
-        description="HOTELS | COUPONS | DESTINATIONS | SERVICES",
+        description="SERVICES | REVIEWS | PARTNERS | HOTELS | COUPONS | DESTINATIONS",
     ),
     db: AsyncSession = Depends(get_db),
     _user: dict = Depends(require_permission("cms.section.manage")),
@@ -1499,7 +1499,8 @@ async def delete_cms_variant(
     variant = await CmsService.get_variant(db, variant_id)
     if not variant:
         raise HTTPException(status_code=404, detail="Variant not found")
-    if variant.is_active:
+    # get_variant returns the serialized dict, not the ORM row.
+    if variant.get("is_active"):
         raise HTTPException(
             status_code=409,
             detail="Cannot delete the active variant. Activate another variant first.",

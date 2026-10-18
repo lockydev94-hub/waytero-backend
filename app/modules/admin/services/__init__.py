@@ -1548,21 +1548,53 @@ class CmsService:
         }
 
     @staticmethod
+    def reviewer_display_name(
+        source: Optional[str],
+        guest_name: Optional[str],
+        first_name: Optional[str],
+        last_name: Optional[str],
+    ) -> str:
+        """
+        Public name for a homepage review.
+
+        A logged-out traveller typed `guest_name` themselves, so it can be
+        shown as written. A registered customer's name was collected to
+        identify a booking, not to headline a marketing band, so it is
+        shortened — the platform publishes no more of a customer's identity
+        than the review needs.
+        """
+        if (source or "").upper() == "GUEST_WEB":
+            return (guest_name or "").strip() or "WayTero customer"
+        first = (first_name or "").strip()
+        last = (last_name or "").strip()
+        if first and last:
+            return f"{first} {last[0]}."
+        return first or "WayTero customer"
+
+    @staticmethod
     async def picker_items(db: AsyncSession, picker_type: str) -> dict:
         """
-        Candidate records that power the admin CMS content picker.
+        Records that fill the admin CMS content editor from live data.
         Doc Ref: BRD Part 6 §155, Website CMS.
 
-        `picker_type` maps a picker to the homepage section content array
-        it should populate:
-          HOTELS       → FEATURED_HOTELS       `{hotels:[…]}`
-          COUPONS      → OFFERS                `{offers:[…]}`
-          DESTINATIONS → POPULAR_DESTINATIONS  `{destinations:[…]}`
-          SERVICES     → SERVICES              `{items:[…]}`
+        `picker_type` maps a picker to the homepage band it feeds:
+          SERVICES     → SERVICES        `{items:[…]}`
+          REVIEWS      → TESTIMONIALS    `{testimonials:[…]}`
+          PARTNERS     → PARTNERS        `{partners:[…]}`
+          HOTELS / COUPONS / DESTINATIONS are still served, but the bands
+          that used them now build their cards live, so `validate_content`
+          rejects a content array for them and the editor offers no button.
 
-        Items are starter shapes straight from live data — admins enrich
-        them (prices, images, ratings) in the JSON editor before saving.
+        Item keys are the names the public renderer reads, so a picked
+        record lands in a typed row without remapping. Keys that only the
+        picker dialog shows are dropped when the editor projects the row.
+
+        Every branch imports its own models: a branch-level import binds the
+        name across the whole function, so reading `City` without importing it
+        in that branch raises UnboundLocalError instead of using the
+        module-level one.
         """
+        from sqlalchemy import func, nullslast
         from datetime import date as _date
 
         pt = (picker_type or "").upper()
@@ -1690,6 +1722,82 @@ class CmsService:
                         ),
                     }
                 )
+
+        elif pt == "REVIEWS":
+            from app.modules.booking.models import BookingReview, MasterBooking
+            from app.modules.customer.models import Customer
+            from app.modules.master.models import City
+
+            result = await db.execute(
+                select(
+                    BookingReview.review,
+                    BookingReview.rating,
+                    BookingReview.source,
+                    BookingReview.guest_name,
+                    Customer.first_name,
+                    Customer.last_name,
+                    City.name,
+                )
+                .join(MasterBooking, MasterBooking.id == BookingReview.master_booking_id)
+                .join(Customer, Customer.id == BookingReview.customer_id)
+                .outerjoin(City, City.id == MasterBooking.city_id)
+                .where(
+                    BookingReview.status == "APPROVED",
+                    BookingReview.review.isnot(None),
+                    func.trim(BookingReview.review) != "",
+                )
+                .order_by(
+                    nullslast(BookingReview.moderated_at.desc()),
+                    BookingReview.id.desc(),
+                )
+                .limit(30)
+            )
+            # Only the columns above are read: guest_mobile, guest_email and the
+            # booking reference stay in the table.
+            for review, rating, source, guest_name, first, last, city in result.all():
+                text = " ".join(str(review).split())
+                items.append(
+                    {
+                        "name": CmsService.reviewer_display_name(
+                            source, guest_name, first, last
+                        ),
+                        "city": city or None,
+                        "text": text,
+                        "rating": int(rating) if rating is not None else None,
+                        "badge": f"{rating}/5" if rating is not None else None,
+                    }
+                )
+
+        elif pt == "PARTNERS":
+            from app.modules.partner.models import Partner
+            from app.modules.master.models import City
+
+            result = await db.execute(
+                select(Partner.business_name, Partner.owner_name, City.name)
+                .outerjoin(City, City.id == Partner.city_id)
+                .where(
+                    Partner.status.in_(["APPROVED", "ACTIVE"]),
+                    Partner.deleted_at.is_(None),
+                )
+                .order_by(
+                    nullslast(Partner.approved_at.desc()),
+                    Partner.id,
+                )
+                .limit(40)
+            )
+            for business_name, owner_name, city in result.all():
+                brand = (business_name or owner_name or "").strip()
+                if not brand:
+                    continue
+                # `partners` stores plain strings, so the editor maps this
+                # row's `name` into the list and ignores the rest.
+                items.append({"name": brand, "city": city or ""})
+
+        else:
+            raise ValidationException(
+                f"Unknown content picker type '{picker_type}'.",
+                details={"picker_type": pt},
+            )
 
         return {"type": pt, "items": items}
 
