@@ -102,11 +102,11 @@ async def update_my_mobile(
         )
     ).first()
     if dup:
-        from app.core.exceptions import DuplicateResourceException
+        from app.core.exceptions import BusinessException
 
-        raise DuplicateResourceException(
-            message="This mobile number is already linked to another account.",
-            resource="User.mobile_number",
+        raise BusinessException(
+            "This mobile number is already linked to another account.",
+            code="MOBILE_TAKEN",
         )
     await db.execute(
         _text(
@@ -145,7 +145,7 @@ async def verify_and_attach_mobile(
 ):
     from sqlalchemy import text as _text
 
-    from app.core.exceptions import DuplicateResourceException, ValidationException
+    from app.core.exceptions import BusinessException, ValidationException
     from app.infrastructure.cache.redis_client import RedisCache, get_redis
     from app.modules.auth.services import OTPService
 
@@ -164,9 +164,9 @@ async def verify_and_attach_mobile(
         )
     ).first()
     if dup:
-        raise DuplicateResourceException(
-            message="This mobile number is already linked to another account.",
-            resource="User.mobile_number",
+        raise BusinessException(
+            "This mobile number is already linked to another account.",
+            code="MOBILE_TAKEN",
         )
     # Verify the attach OTP — purpose-scoped so it can't collide with a login OTP.
     redis = await get_redis()
@@ -208,7 +208,7 @@ async def update_my_email(
 ):
     from sqlalchemy import text as _text
 
-    from app.core.exceptions import DuplicateResourceException
+    from app.core.exceptions import BusinessException
 
     user_uuid = UUID(current_user["sub"])
     email = payload.email.strip().lower()
@@ -235,9 +235,9 @@ async def update_my_email(
         )
     ).first()
     if dup:
-        raise DuplicateResourceException(
-            message="This email is already linked to another account.",
-            resource="User.email",
+        raise BusinessException(
+            "This email is already linked to another account.",
+            code="EMAIL_TAKEN",
         )
     await db.execute(
         _text(
