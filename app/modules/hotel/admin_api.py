@@ -705,6 +705,117 @@ async def create_hotel(
 
 
 # ============================================================
+# COMMISSION AUDIT — platform-wide view of every hotel's
+# resolved commission. Lets finance spot hotels that have
+# drifted away from the city / global rule.
+# ============================================================
+
+
+@router.get(
+    "/commission-audit",
+    summary="Every hotel with its resolved commission source",
+)
+async def commission_audit(
+    source_filter: Optional[str] = Query(
+        None, description="HOTEL_OVERRIDE | CITY_RULE | GLOBAL_RULE | SYSTEM_DEFAULT"
+    ),
+    city_id: Optional[int] = Query(None),
+    search: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    current_user: dict = Depends(require_roles(*ADMIN_ROLES)),
+    db: AsyncSession = Depends(get_db),
+) -> dict[str, Any]:
+    """One row per hotel with the active commission override (if any),
+    the city/global/system-default fallback, and the source the resolver
+    would actually use at booking time. Source filter is the finance
+    auditor's primary lever: 'show me every hotel that's not on the
+    platform default'.
+    """
+    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
+    where = ["h.deleted_at IS NULL"]
+    if city_id is not None:
+        where.append("h.city_id = :city_id")
+        params["city_id"] = city_id
+    if search and search.strip():
+        where.append(
+            "(h.hotel_name ILIKE :q OR h.hotel_code ILIKE :q "
+            "OR p.business_name ILIKE :q OR p.partner_code ILIKE :q)"
+        )
+        params["q"] = f"%{search.strip()}%"
+    where_clause = " AND ".join(where)
+
+    # Get the page first, then resolve commission per hotel (the resolver
+    # is per-hotel logic; calling it N times in a loop is the only way to
+    # give a faithful "source" column without re-implementing it in SQL).
+    list_sql = text(
+        f"""
+        SELECT h.id, h.uuid, h.hotel_code, h.hotel_name, h.status,
+               h.city_id, h.partner_id,
+               p.partner_code, COALESCE(NULLIF(p.business_name,''), p.owner_name) AS partner_name,
+               c.name AS city_name
+        FROM hotels h
+        LEFT JOIN partners p ON p.id = h.partner_id
+        LEFT JOIN cities   c ON c.id = h.city_id
+        WHERE {where_clause}
+        ORDER BY h.hotel_name ASC
+        LIMIT :limit OFFSET :offset
+        """
+    )
+    hotel_rows = (await db.execute(list_sql, params)).mappings().all()
+
+    total_sql = text(
+        f"SELECT COUNT(*) FROM hotels h LEFT JOIN partners p ON p.id = h.partner_id WHERE {where_clause}"
+    )
+    total = (await db.execute(total_sql, params)).scalar() or 0
+
+    items: list[dict[str, Any]] = []
+    hotel_service = HotelService(db)
+    for r in hotel_rows:
+        hid = int(r["id"])
+        try:
+            resolved = await hotel_service.get_commission(hid)
+            source = (resolved.get("resolved") or {}).get("source")
+        except Exception:
+            source = None
+        if source_filter and source != source_filter:
+            continue
+        override = resolved.get("override") if "resolved" in resolved else None
+        items.append(
+            {
+                "hotel_id": hid,
+                "hotel_code": r["hotel_code"],
+                "hotel_name": r["hotel_name"],
+                "status": r["status"],
+                "city_id": int(r["city_id"]) if r["city_id"] is not None else None,
+                "city_name": r["city_name"],
+                "partner_id": (
+                    int(r["partner_id"]) if r["partner_id"] is not None else None
+                ),
+                "partner_name": r["partner_name"],
+                "partner_code": r["partner_code"],
+                "has_override": override is not None,
+                "override_commission_type": (
+                    override.commission_type if override is not None else None
+                ),
+                "override_commission_percent": (
+                    float(override.commission_percent)
+                    if override is not None and override.commission_percent is not None
+                    else None
+                ),
+                "override_commission_flat": (
+                    float(override.commission_flat)
+                    if override is not None and override.commission_flat is not None
+                    else None
+                ),
+                "resolved_source": source,
+            }
+        )
+
+    return {"items": items, "total": int(total), "page": page, "page_size": page_size}
+
+
+# ============================================================
 # DETAIL
 # ============================================================
 
@@ -1708,117 +1819,6 @@ async def list_hotel_logs(
     service: HotelVerificationService = Depends(get_verification_service),
 ) -> list[dict[str, Any]]:
     return await service.list_logs(hotel_id, limit)
-
-
-# ============================================================
-# COMMISSION AUDIT — platform-wide view of every hotel's
-# resolved commission. Lets finance spot hotels that have
-# drifted away from the city / global rule.
-# ============================================================
-
-
-@router.get(
-    "/commission-audit",
-    summary="Every hotel with its resolved commission source",
-)
-async def commission_audit(
-    source_filter: Optional[str] = Query(
-        None, description="HOTEL_OVERRIDE | CITY_RULE | GLOBAL_RULE | SYSTEM_DEFAULT"
-    ),
-    city_id: Optional[int] = Query(None),
-    search: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=200),
-    current_user: dict = Depends(require_roles(*ADMIN_ROLES)),
-    db: AsyncSession = Depends(get_db),
-) -> dict[str, Any]:
-    """One row per hotel with the active commission override (if any),
-    the city/global/system-default fallback, and the source the resolver
-    would actually use at booking time. Source filter is the finance
-    auditor's primary lever: 'show me every hotel that's not on the
-    platform default'.
-    """
-    params: dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
-    where = ["h.deleted_at IS NULL"]
-    if city_id is not None:
-        where.append("h.city_id = :city_id")
-        params["city_id"] = city_id
-    if search and search.strip():
-        where.append(
-            "(h.hotel_name ILIKE :q OR h.hotel_code ILIKE :q "
-            "OR p.business_name ILIKE :q OR p.partner_code ILIKE :q)"
-        )
-        params["q"] = f"%{search.strip()}%"
-    where_clause = " AND ".join(where)
-
-    # Get the page first, then resolve commission per hotel (the resolver
-    # is per-hotel logic; calling it N times in a loop is the only way to
-    # give a faithful "source" column without re-implementing it in SQL).
-    list_sql = text(
-        f"""
-        SELECT h.id, h.uuid, h.hotel_code, h.hotel_name, h.status,
-               h.city_id, h.partner_id,
-               p.partner_code, COALESCE(NULLIF(p.business_name,''), p.owner_name) AS partner_name,
-               c.name AS city_name
-        FROM hotels h
-        LEFT JOIN partners p ON p.id = h.partner_id
-        LEFT JOIN cities   c ON c.id = h.city_id
-        WHERE {where_clause}
-        ORDER BY h.hotel_name ASC
-        LIMIT :limit OFFSET :offset
-        """
-    )
-    hotel_rows = (await db.execute(list_sql, params)).mappings().all()
-
-    total_sql = text(
-        f"SELECT COUNT(*) FROM hotels h LEFT JOIN partners p ON p.id = h.partner_id WHERE {where_clause}"
-    )
-    total = (await db.execute(total_sql, params)).scalar() or 0
-
-    items: list[dict[str, Any]] = []
-    hotel_service = HotelService(db)
-    for r in hotel_rows:
-        hid = int(r["id"])
-        try:
-            resolved = await hotel_service.get_commission(hid)
-            source = (resolved.get("resolved") or {}).get("source")
-        except Exception:
-            source = None
-        if source_filter and source != source_filter:
-            continue
-        override = resolved.get("override") if "resolved" in resolved else None
-        items.append(
-            {
-                "hotel_id": hid,
-                "hotel_code": r["hotel_code"],
-                "hotel_name": r["hotel_name"],
-                "status": r["status"],
-                "city_id": int(r["city_id"]) if r["city_id"] is not None else None,
-                "city_name": r["city_name"],
-                "partner_id": (
-                    int(r["partner_id"]) if r["partner_id"] is not None else None
-                ),
-                "partner_name": r["partner_name"],
-                "partner_code": r["partner_code"],
-                "has_override": override is not None,
-                "override_commission_type": (
-                    override.commission_type if override is not None else None
-                ),
-                "override_commission_percent": (
-                    float(override.commission_percent)
-                    if override is not None and override.commission_percent is not None
-                    else None
-                ),
-                "override_commission_flat": (
-                    float(override.commission_flat)
-                    if override is not None and override.commission_flat is not None
-                    else None
-                ),
-                "resolved_source": source,
-            }
-        )
-
-    return {"items": items, "total": int(total), "page": page, "page_size": page_size}
 
 
 __all__ = ["router"]
