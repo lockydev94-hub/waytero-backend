@@ -619,6 +619,118 @@ async def _write_log(
     return int(row[0])
 
 
+# ── Customer inbox mirror ─────────────────────────────────────────
+# The website's notification inbox (GET /notifications/me/notifications) was
+# empty for customers because these lifecycle events were only ever told by
+# email — the outbox rows existed solely for BOOKING_CANCELLED and
+# CAB_BREAKDOWN_REPORTED. `booking_cancelled` is deliberately NOT listed: the
+# cancellation APIs already dispatch BOOKING_CANCELLED, so mirroring it would
+# write the customer the same news twice.
+INBOX_MIRROR_EVENTS: Dict[str, str] = {
+    "booking_requested": "BOOKING_REQUESTED",
+    "booking_confirmed": "BOOKING_CONFIRMED",
+    "booking_completed": "BOOKING_COMPLETED",
+    "refund_processed": "REFUND_PROCESSED",
+    "payment_received": "PAYMENT_RECEIVED",
+    "invoice_issued": "INVOICE_ISSUED",
+    "wallet_recharged": "WALLET_RECHARGED",
+}
+
+# email_logs.related_type → the child table that carries master_booking_id.
+# The outbox's booking_id column is the MASTER id (that is what the customer
+# cancellation path writes), and callers pass the child id here, so it has to
+# be resolved before it can deep-link.
+_MASTER_BOOKING_TABLES: Dict[str, str] = {
+    "CAB_BOOKING": "cab_bookings",
+    "HOTEL_RESERVATION": "hotel_reservations",
+    "TOUR_BOOKING": "tour_bookings",
+}
+
+_INBOX_DATA_KEYS = ("service", "booking_number", "amount", "wallet_type")
+
+
+async def _customer_user_id_by_email(db: AsyncSession, email: str):
+    """The user id behind an email address, but only for an active CUSTOMER.
+    Partner and driver addresses must never resolve here — they have their own
+    portals and would start receiving customer inbox rows."""
+    row = (
+        await db.execute(
+            text(
+                "SELECT u.id FROM users u "
+                "WHERE lower(u.email) = lower(:email) "
+                "  AND u.user_type = 'CUSTOMER' AND u.is_active = TRUE "
+                "LIMIT 1"
+            ),
+            {"email": email},
+        )
+    ).first()
+    return row[0] if row is not None else None
+
+
+async def _master_booking_id_for(
+    db: AsyncSession, related_type: Optional[str], related_id: Any
+) -> Optional[int]:
+    table = _MASTER_BOOKING_TABLES.get(related_type or "")
+    if not table or related_id is None:
+        return None
+    # `table` comes from the fixed dict above, never from the caller.
+    row = (
+        await db.execute(
+            text(f"SELECT master_booking_id FROM {table} WHERE id = :rid"),
+            {"rid": int(related_id)},
+        )
+    ).first()
+    return int(row[0]) if row is not None and row[0] is not None else None
+
+
+async def _mirror_to_customer_inbox(
+    db: AsyncSession,
+    *,
+    event_type: str,
+    to_email: str,
+    title: str,
+    context: Dict[str, Any],
+    related_type: Optional[str],
+    related_id: Any,
+) -> None:
+    """Copy a customer lifecycle email into notification_outbox.
+
+    Best-effort by design: the email is the deliverable, so nothing here may
+    raise into the send path. A row is written when the email was *attempted*,
+    not only when SMTP accepted it — the event really happened either way, and
+    a machine without SMTP still needs to show the customer their own history.
+    """
+    inbox_event = INBOX_MIRROR_EVENTS.get(event_type)
+    if inbox_event is None:
+        return
+    uid = await _customer_user_id_by_email(db, to_email)
+    if uid is None:
+        return
+    mbid = await _master_booking_id_for(db, related_type, related_id)
+    data: Dict[str, Any] = {
+        key: context[key] for key in _INBOX_DATA_KEYS if context.get(key) is not None
+    }
+    data["email_event"] = event_type
+    if related_type:
+        data["related_type"] = related_type
+    if related_id is not None:
+        data["related_id"] = str(related_id)
+    # body stays None on purpose — the subject line already carries every fact
+    # (service, booking number, amount) and a second sentence would be invented
+    # filler.
+    from app.modules.notification.services import dispatch
+
+    await dispatch(
+        db,
+        user_id=uid,
+        event_type=inbox_event,
+        title=title[:255],
+        body=None,
+        data=data,
+        booking_id=mbid,
+    )
+
+
 async def send_event_email(
     db: AsyncSession,
     *,
@@ -641,19 +753,36 @@ async def send_event_email(
         cfg = await load_config(db)
         if not cfg["enabled"]:
             return None  # disabled → no attempt, no log noise
+        subject = _fill(
+            EVENT_TEMPLATES.get(
+                event_type, EVENT_TEMPLATES["test_email"]
+            ).subject,
+            ctx,
+            cfg,
+        )
+        try:
+            await _mirror_to_customer_inbox(
+                db,
+                event_type=event_type,
+                to_email=to_email,
+                title=subject,
+                context=ctx,
+                related_type=related_type,
+                related_id=related_id,
+            )
+        except Exception as mirror_exc:  # never lets a mirror break the email
+            logger.warning(
+                "email.inbox_mirror_failed event=%s err=%s",
+                event_type,
+                mirror_exc,
+            )
         if not (cfg["host"] and cfg["user"] and cfg["password"]):
             return await _write_log(
                 db,
                 event_type=event_type,
                 to_email=to_email,
                 to_name=to_name,
-                subject=_fill(
-                    EVENT_TEMPLATES.get(
-                        event_type, EVENT_TEMPLATES["test_email"]
-                    ).subject,
-                    ctx,
-                    cfg,
-                ),
+                subject=subject,
                 status="FAILED",
                 error="SMTP not configured — save credentials in Settings → Email",
                 attempt=1,
@@ -661,7 +790,9 @@ async def send_event_email(
                 related_type=related_type,
                 related_id=related_id,
             )
-        subject, html_body = await asyncio.to_thread(render_email, event_type, ctx, cfg)
+        # Same subject the caller's context produced above; render_email returns
+        # it alongside the HTML body.
+        _, html_body = await asyncio.to_thread(render_email, event_type, ctx, cfg)
         await asyncio.to_thread(_smtp_send, cfg, to_email, subject, html_body)
         return await _write_log(
             db,
