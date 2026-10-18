@@ -214,7 +214,7 @@ async def _validate_booking_coupon(
     from app.modules.admin.coupon_api import ValidateRequest, validate_coupon
 
     mobile = await db.scalar(
-        select(User.mobile)
+        select(User.mobile_number)
         .join(Customer, Customer.user_id == User.id)
         .where(Customer.id == customer_id)
     )
@@ -2696,6 +2696,10 @@ async def create_public_booking(
     db: AsyncSession = Depends(get_db),
     user: dict = Depends(get_current_user),
 ):
+    from app.shared.utilities.mobile import require_real_mobile
+
+    await require_real_mobile(db, user["sub"])
+
     customer_id = await _customer_id(db, user)
     if customer_id is None:
         raise HTTPException(403, "Customer profile not found")

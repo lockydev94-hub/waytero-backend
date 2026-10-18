@@ -649,6 +649,10 @@ async def create_cab_booking(
     import uuid as _uuid
     from datetime import datetime
 
+    from app.shared.utilities.mobile import require_real_mobile
+
+    await require_real_mobile(db, current_user["sub"])
+
     # Resolve customer_id from user UUID, auto-creating the profile on first
     # booking. Mobile-OTP login creates the customer row inline; Firebase/email
     # login does not — so the first booking through this path will lazily

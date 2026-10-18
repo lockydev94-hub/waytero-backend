@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ResourceNotFoundException
 from app.core.logging import get_logger
+from app.shared.utilities.mobile import has_real_mobile
 from app.modules.customer.models import Customer, CustomerAddress
 from app.modules.customer.repositories import CustomerRepository
 from app.modules.customer.schemas import (
@@ -103,6 +104,7 @@ class CustomerService:
         if user_row:
             out.mobile_number = user_row.get("mobile_number")
             out.email = user_row.get("email")
+            out.has_real_mobile = has_real_mobile(user_row.get("mobile_number"))
         return out
 
     async def get_by_uuid(self, customer_uuid: UUID) -> CustomerResponse:

@@ -128,6 +128,11 @@ class CustomerResponse(BaseModel):
     mobile_number: Optional[str] = None
     email: Optional[str] = None
 
+    # Server-computed: mobile_number is a usable number rather than the `fb_`
+    # placeholder a Google-only account gets. The client reads this instead of
+    # re-implementing the rule.
+    has_real_mobile: bool = False
+
     model_config = {"from_attributes": True}
 
 

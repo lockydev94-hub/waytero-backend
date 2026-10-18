@@ -420,8 +420,9 @@ class AuthService:
         The customer row requires a unique mobile_number; Google doesn't give
         us a phone, so for a brand-new account we seed it with a unique
         placeholder keyed on the Firebase uid (`fb_<uid>` truncated to fit
-        the column). The customer can attach a real number later via the
-        /auth/me/attach-mobile endpoint (or the booking flow can prompt for it).
+        the column). The customer can attach a real number later via
+        PATCH /customers/me/mobile (or the unverified no-SMS variant), and the
+        booking flows prompt for one when it is still a placeholder.
 
         Existing accounts are matched by email (case-insensitive). If the email
         is claimed by a different user_type, we raise — prevents cross-portal

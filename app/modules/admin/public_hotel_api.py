@@ -1096,6 +1096,10 @@ async def create_hotel_booking(
     current_user: dict = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
+    from app.shared.utilities.mobile import require_real_mobile
+
+    await require_real_mobile(db, current_user["sub"])
+
     if body.check_out_date <= body.check_in_date:
         raise HTTPException(status_code=400, detail="Check-out must be after check-in")
 

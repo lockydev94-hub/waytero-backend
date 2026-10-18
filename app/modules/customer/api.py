@@ -24,6 +24,7 @@ from app.modules.customer.schemas import (
     AddressResponse,
 )
 from app.modules.customer.services import CustomerService
+from app.shared.utilities.mobile import has_real_mobile
 
 router = APIRouter()
 
@@ -86,11 +87,11 @@ async def update_my_mobile(
 
     user_uuid = UUID(current_user["sub"])
     mobile = (payload.mobile_number or "").strip()
-    if not mobile or not (10 <= len(mobile) <= 15) or not mobile.isdigit():
+    if not has_real_mobile(mobile):
         from app.core.exceptions import ValidationException
 
         raise ValidationException(
-            message="Enter a valid 10–15 digit mobile number.",
+            message="Enter a valid 10-digit Indian mobile number.",
             code="INVALID_MOBILE",
         )
     # Reject if another user already owns this mobile.
@@ -150,9 +151,9 @@ async def verify_and_attach_mobile(
 
     user_uuid = UUID(current_user["sub"])
     mobile = payload.mobile_number.strip()
-    if not (10 <= len(mobile) <= 15) or not mobile.isdigit():
+    if not has_real_mobile(mobile):
         raise ValidationException(
-            message="Enter a valid 10–15 digit mobile number.",
+            message="Enter a valid 10-digit Indian mobile number.",
             code="INVALID_MOBILE",
         )
     # Reject if another user already owns this mobile.
