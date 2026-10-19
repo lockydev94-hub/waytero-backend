@@ -340,6 +340,39 @@ class CabBooking(Base):
     coupon_discount = Column(Numeric(12, 2), nullable=True, default=Decimal("0.00"))
     # Offer attribution (migration 0077) — server-resolved, never client input.
     offer_id = Column(BigInteger, ForeignKey("offers.id"), nullable=True)
+    # ── Priced-by-the-server fare lines (added migration 0086) ───────────────
+    # The fare engine computes these already (booking/services/fare.py
+    # calculate_fare_breakdown); they used to be discarded and only the total
+    # kept, so the invoice, the settlement line and the phone-desk screen each
+    # re-derived the price and could disagree. Persisting them makes this row the
+    # answer. NULL on pre-0086 bookings — meaning "not itemised at close", never
+    # "each line was zero".
+    pricing_city_id = Column(BigInteger, ForeignKey("cities.id"), nullable=True)
+    # GOOGLE | CONFIGURED_ROUTE | MANUAL — who said how far it was.
+    distance_source = Column(String(20), nullable=True)
+    # The km the per-km charge was actually applied to. Deliberately separate
+    # from estimated_distance/actual_distance: for ONE_WAY / ROUND_TRIP /
+    # OUTSTATION this is MAX(travelled, minimum_km), so a 23 km trip billed at a
+    # 30 km minimum records both.
+    billing_distance_km = Column(Numeric(10, 2), nullable=True)
+    base_fare_amount = Column(Numeric(12, 2), nullable=True)
+    distance_charge_amount = Column(Numeric(12, 2), nullable=True)
+    driver_allowance_amount = Column(Numeric(12, 2), nullable=True)
+    night_charge_amount = Column(Numeric(12, 2), nullable=True)
+    toll_amount = Column(Numeric(12, 2), nullable=True)
+    waiting_charge_amount = Column(Numeric(12, 2), nullable=True)
+    # The rule sheet and the commission rule in force at close, snapshotted the
+    # way hotel_reservations does, so editing a rule cannot reprice history.
+    rate_snapshot = Column(JSONB, nullable=True)
+    commission_config_snapshot = Column(JSONB, nullable=True)
+    # A cancelled booking keeps its invoice number and amount but the document
+    # must never be reissued; the migration's CHECK requires a reason whenever
+    # voided_at is set.
+    invoice_voided_at = Column(DateTime(timezone=True), nullable=True)
+    invoice_void_reason = Column(String(255), nullable=True)
+    # Set by the auto-assign chain when it runs out of rounds
+    # (AUTO_ASSIGN_EXHAUSTED); cleared when a human picks a partner.
+    needs_attention = Column(String(40), nullable=True)
     # ── Vehicle breakdown / swap audit (added migration 0041) ────────────────
     # is_breakdown_swap is True once at least one swap has happened. swap_count
     # tracks how many. original_partner_id is set on the FIRST handover so the
