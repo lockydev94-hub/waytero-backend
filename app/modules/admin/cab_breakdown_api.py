@@ -370,9 +370,11 @@ async def list_available_vehicles_for_swap(
         """
     )
     same_rows = (
-        await db.execute(
-            same_sql,
-            {"pid": partner_id, "cat_id": cat_id},
+        (
+            await db.execute(
+                same_sql,
+                {"pid": partner_id, "cat_id": cat_id},
+            )
         )
         .mappings()
         .all()
@@ -406,9 +408,11 @@ async def list_available_vehicles_for_swap(
         """
     )
     other_rows = (
-        await db.execute(
-            other_sql,
-            {"pid": partner_id, "city_id": city_id, "cat_id": cat_id},
+        (
+            await db.execute(
+                other_sql,
+                {"pid": partner_id, "city_id": city_id, "cat_id": cat_id},
+            )
         )
         .mappings()
         .all()
@@ -499,9 +503,11 @@ async def list_available_partners_for_handover(
         """
     )
     rows = (
-        await db.execute(
-            sql,
-            {"pid": current_pid, "city_id": city_id, "cat_id": cat_id},
+        (
+            await db.execute(
+                sql,
+                {"pid": current_pid, "city_id": city_id, "cat_id": cat_id},
+            )
         )
         .mappings()
         .all()
