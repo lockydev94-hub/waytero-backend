@@ -14,6 +14,7 @@ from app.modules.driver.api import router as driver_router
 from app.modules.vehicle.api import router as vehicle_router
 from app.modules.admin.api import router as admin_settings_router
 from app.modules.admin.api_dashboard import router as admin_dashboard_router
+from app.modules.admin.branch_api import router as admin_branch_router
 from app.modules.admin.coupon_api import router as coupon_router
 from app.modules.admin.booking_api import router as admin_booking_router
 from app.modules.admin.customer_care_api import router as customer_care_router
@@ -126,6 +127,13 @@ api_router.include_router(
     prefix="/admin/reports",
     tags=["Admin Reports"],
     dependencies=[Depends(require_roles(*FINANCE_STAFF))],
+)
+
+api_router.include_router(
+    admin_branch_router,
+    prefix="/admin/branches",
+    tags=["Admin Branches"],
+    dependencies=[Depends(require_roles(*ALL_STAFF))],
 )
 
 api_router.include_router(
