@@ -14,6 +14,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
+from app.core.branch_scope import STAFF_BRANCH_TYPES
 from app.core.dependencies import get_current_user
 from app.core.database import engine as app_engine
 from app.core.security import create_access_token
@@ -217,12 +218,55 @@ def _reset_engine_pool():
     asyncio.run(app_engine.dispose(close=False))
 
 
-def _make_client(roles: list[str]) -> Iterator[TestClient]:
+def _branch_payload(
+    *,
+    branch_id: int,
+    city_id: int,
+    name: str,
+    code: str,
+    is_headquarters: bool,
+    is_active: bool = True,
+) -> dict:
+    """The branch dict get_current_user attaches to a staff payload (0085).
+
+    The scope layer reads this shape rather than querying, so a test controls
+    the caller's branch by building a payload — which is also what makes the
+    fail-closed path testable (omit the key entirely).
+    """
+    return {
+        "id": branch_id,
+        "city_id": city_id,
+        "name": name,
+        "code": code,
+        "is_headquarters": is_headquarters,
+        "is_active": is_active,
+    }
+
+
+HQ_BRANCH = _branch_payload(
+    branch_id=1, city_id=1, name="Bhubaneswar", code="BBS", is_headquarters=True
+)
+CUTTACK_BRANCH = _branch_payload(
+    branch_id=2, city_id=2, name="Cuttack", code="CTK", is_headquarters=False
+)
+
+
+def _make_client(
+    roles: list[str],
+    *,
+    branch: dict | None | object = ...,
+) -> Iterator[TestClient]:
     """TestClient whose caller carries `roles` and the stub auth service.
 
     The role list belongs to the caller, not the stub: /auth/* routes only need
     any signed-in identity, while every /admin/* gate reads the JWT roles — so
     an admin-path test has to present as an admin.
+
+    `branch` is the caller's branch facts, which get_current_user normally reads
+    off the user row. Defaults to the head office for a branch-scoped staff role
+    (a staff account with no branch cannot exist under ck_users_branch_membership)
+    and to nothing for everyone else; pass `None` explicitly to test the
+    fail-closed path.
 
     The Authorization header is a real signed token because
     AuthenticationGuardMiddleware default-denies every /api/v1 path outside the
@@ -241,6 +285,9 @@ def _make_client(roles: list[str]) -> Iterator[TestClient]:
         expires_delta=timedelta(hours=1),
     )
 
+    if branch is ...:
+        branch = HQ_BRANCH if roles[0] in STAFF_BRANCH_TYPES else None
+
     async def override_auth_service() -> StubAuthService:
         return auth_service
 
@@ -248,9 +295,10 @@ def _make_client(roles: list[str]) -> Iterator[TestClient]:
         return StubOTPService()
 
     async def override_current_user() -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
             "sub": str(auth_service.user_id),
             "role": roles[0],
+            "user_type": roles[0],
             "roles": roles,
             "permissions": [
                 "auth.self.read",
@@ -258,6 +306,9 @@ def _make_client(roles: list[str]) -> Iterator[TestClient]:
                 "auth.sessions.revoke",
             ],
         }
+        if branch is not None:
+            payload["branch"] = branch
+        return payload
 
     app.dependency_overrides[get_auth_service] = override_auth_service
     app.dependency_overrides[get_otp_service] = override_otp_service
@@ -286,3 +337,23 @@ def client_staff() -> Iterator[TestClient]:
 def client_super_admin() -> Iterator[TestClient]:
     """Signed in as SUPER_ADMIN — the working-hours report is gated on this."""
     yield from _make_client(["SUPER_ADMIN"])
+
+
+@pytest.fixture
+def client_hq_admin() -> Iterator[TestClient]:
+    """ADMIN of the head office — its own city plus everything unassigned."""
+    yield from _make_client(["ADMIN"], branch=HQ_BRANCH)
+
+
+@pytest.fixture
+def client_cuttack_cco() -> Iterator[TestClient]:
+    """CCO of the Cuttack sub-branch — Cuttack rows only."""
+    yield from _make_client(["CCO"], branch=CUTTACK_BRANCH)
+
+
+@pytest.fixture
+def client_cuttack_verification_officer() -> Iterator[TestClient]:
+    """VERIFICATION_OFFICER of the Cuttack sub-branch."""
+    yield from _make_client(
+        ["VERIFICATION_OFFICER"], branch=CUTTACK_BRANCH
+    )

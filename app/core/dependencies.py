@@ -82,6 +82,18 @@ async def get_current_user(
         )
 
     payload["status"] = user.status.value
+
+    # Branch facts (migration 0085). Taken from the row and not from the JWT:
+    # the token was signed when the account was created, and a super admin can
+    # move a person between branches, so the row is the only current version.
+    # A staff account always has a branch_id (ck_users_branch_membership) and
+    # nobody else does, so this costs customers, partners, drivers and the
+    # master admin no extra query at all.
+    if user.branch_id is not None:
+        from app.core.branch_scope import attach_branch
+
+        await attach_branch(db, payload, user.branch_id)
+
     return payload
 
 
