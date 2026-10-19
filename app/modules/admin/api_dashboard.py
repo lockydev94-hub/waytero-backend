@@ -1966,6 +1966,7 @@ async def list_staff(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin()),
 ):
     result = await AdminDashboardService.list_staff_users(
         db, role=role, status=status, search=search, page=page, page_size=page_size
@@ -2031,7 +2032,11 @@ async def create_staff(
     tags=["Admin – Staff"],
     summary="Get a single staff member by UUID",
 )
-async def get_staff(user_id: UUID, db: AsyncSession = Depends(get_db)):
+async def get_staff(
+    user_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin()),
+):
     user = await AdminDashboardService.get_staff_user(db, user_id)
     if not user:
         raise HTTPException(status_code=404, detail="Staff user not found")
@@ -2045,7 +2050,10 @@ async def get_staff(user_id: UUID, db: AsyncSession = Depends(get_db)):
     summary="Update a staff member's profile",
 )
 async def update_staff(
-    user_id: UUID, payload: StaffUserUpdate, db: AsyncSession = Depends(get_db)
+    user_id: UUID,
+    payload: StaffUserUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin()),
 ):
     user = await AdminDashboardService.update_staff_user(db, user_id, payload)
     if not user:
@@ -2170,6 +2178,7 @@ async def generate_staff_id_card(
     user_id: UUID,
     payload: StaffIdCardGenerateRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin()),
 ):
     user = await AdminDashboardService.generate_staff_id_card(
         db, user_id, notes=payload.notes
@@ -2197,6 +2206,7 @@ async def upsert_staff_profile(
     user_id: UUID,
     payload: StaffProfileCreate,
     db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin()),
 ):
     user = await AdminDashboardService.get_staff_user(db, user_id)
     if not user:
@@ -2309,6 +2319,7 @@ async def upload_staff_photo(
     user_id: UUID,
     file: UploadFile = File(..., description="Profile photo (JPG/PNG/WebP, max 5 MB)"),
     db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin()),
 ):
     user = await AdminDashboardService.get_staff_user(db, user_id)
     if not user:
@@ -2380,6 +2391,7 @@ async def upload_staff_document(
     document_name: str | None = Form(None, description="Human-readable label"),
     notes: str | None = Form(None, description="Optional notes"),
     db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin()),
 ):
     import uuid as _uuid
 
@@ -2488,7 +2500,11 @@ async def upload_staff_document(
     tags=["Admin – Staff"],
     summary="List all uploaded documents for a staff member",
 )
-async def list_staff_documents(user_id: UUID, db: AsyncSession = Depends(get_db)):
+async def list_staff_documents(
+    user_id: UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_admin()),
+):
     res = await db.execute(
         _text(f"SELECT id FROM staff_profiles WHERE user_id = '{user_id}'")
     )

@@ -340,6 +340,24 @@ def client_super_admin() -> Iterator[TestClient]:
 
 
 @pytest.fixture
+def client_cco() -> Iterator[TestClient]:
+    """CCO — support work, and nothing that manages staff or platform config."""
+    yield from _make_client(["CCO"])
+
+
+@pytest.fixture
+def client_finance_manager() -> Iterator[TestClient]:
+    """FINANCE_MANAGER — settlements and reports."""
+    yield from _make_client(["FINANCE_MANAGER"])
+
+
+@pytest.fixture
+def client_verification_officer() -> Iterator[TestClient]:
+    """VERIFICATION_OFFICER — partner and vehicle verification."""
+    yield from _make_client(["VERIFICATION_OFFICER"])
+
+
+@pytest.fixture
 def client_hq_admin() -> Iterator[TestClient]:
     """ADMIN of the head office — its own city plus everything unassigned."""
     yield from _make_client(["ADMIN"], branch=HQ_BRANCH)
