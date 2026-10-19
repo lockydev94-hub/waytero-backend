@@ -9,12 +9,16 @@
 # ALL methods are async — uses AsyncSession (project standard)
 # ============================================================
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update as sa_update
+from sqlalchemy import select, or_, update as sa_update
 
-from app.core.exceptions import PermissionDeniedException, ValidationException
+from app.core.exceptions import (
+    BusinessException,
+    PermissionDeniedException,
+    ValidationException,
+)
 from app.modules.admin.models import (
     SystemConfiguration,
     AppVersion,
@@ -713,6 +717,7 @@ class DefaultPricingService:
         city_id: int,
         vehicle_category_id: int,
         trip_type: str,
+        for_date: Optional[date] = None,
     ) -> Optional[dict]:
         """
         Core fallback logic used by the booking engine:
@@ -720,24 +725,61 @@ class DefaultPricingService:
         2. If not found, fall back to default_vehicle_pricing_rules.
         3. Return None only if neither exists (should not happen after migration).
 
-        Returns a dict with all pricing fields + a 'source' key.
+        Returns a dict with all pricing fields + a 'source' key, plus the
+        identity of the rule row that answered (`rule_id`, `rule_table`,
+        `effective_from`, `effective_to`) so a booking can snapshot the rule it
+        was actually priced under. Settlement and dispute both read that snapshot
+        back, which is what makes "the rate changed since" a question with an
+        answer instead of an argument.
+
+        `for_date` is the day the trip happens, and defaults to today. A rule
+        sheet carries `effective_from` / `effective_to` precisely so a fare can be
+        announced now for a trip next month and a superseded rate stops applying
+        on the day it was superseded — neither of which works if the columns are
+        ignored, which is how they were read until 0086. A future-dated booking
+        must pass its own pickup date or it will be quoted at the current rate.
         """
         from app.modules.vehicle.models import (
             VehiclePricingRule,
             DefaultVehiclePricingRule,
         )
 
-        # Step 1: city-specific rule
+        on_day = for_date or datetime.now(timezone.utc).date()
+
+        # Step 1: city-specific rule, in force on the trip's date.
         city_q = select(VehiclePricingRule).where(
             VehiclePricingRule.city_id == city_id,
             VehiclePricingRule.vehicle_category_id == vehicle_category_id,
             VehiclePricingRule.trip_type == trip_type,
+            or_(
+                VehiclePricingRule.effective_from.is_(None),
+                VehiclePricingRule.effective_from <= on_day,
+            ),
+            or_(
+                VehiclePricingRule.effective_to.is_(None),
+                VehiclePricingRule.effective_to >= on_day,
+            ),
         )
-        city_result = await db.execute(city_q)
-        city_rule = city_result.scalar_one_or_none()
+        city_rows = (await db.execute(city_q)).scalars().all()
+        if len(city_rows) > 1:
+            # Two sheets in force at once is a data conflict, not a booking
+            # problem, and guessing between them by row order is how a customer
+            # is quoted one price and invoiced another. Say which pair is
+            # duplicated and let the owner fix the sheet.
+            raise BusinessException(
+                f"More than one fare sheet is in force for this city, cab "
+                f"category and trip type on {on_day}. Remove or re-date one of "
+                f"them before booking."
+            )
+        city_rule = city_rows[0] if city_rows else None
 
         if city_rule:
             return {
+                "rule_id": city_rule.id,
+                "rule_table": "vehicle_pricing_rules",
+                "city_id": city_rule.city_id,
+                "effective_from": city_rule.effective_from,
+                "effective_to": city_rule.effective_to,
                 "vehicle_category_id": city_rule.vehicle_category_id,
                 "trip_type": city_rule.trip_type,
                 "base_fare": city_rule.base_fare or 0,
@@ -761,11 +803,24 @@ class DefaultPricingService:
             DefaultVehiclePricingRule.vehicle_category_id == vehicle_category_id,
             DefaultVehiclePricingRule.trip_type == trip_type,
         )
-        def_result = await db.execute(def_q)
-        def_rule = def_result.scalar_one_or_none()
+        def_rows = (await db.execute(def_q)).scalars().all()
+        if len(def_rows) > 1:
+            raise BusinessException(
+                "More than one platform fare sheet exists for this cab category "
+                "and trip type. Remove one before booking."
+            )
+        def_rule = def_rows[0] if def_rows else None
 
         if def_rule:
             return {
+                # The platform fallback sheet carries no effective window
+                # (0011/0022 created it without one), so there is nothing to
+                # date-filter here and nothing to claim about a start date.
+                "rule_id": def_rule.id,
+                "rule_table": "default_vehicle_pricing_rules",
+                "city_id": None,
+                "effective_from": None,
+                "effective_to": None,
                 "vehicle_category_id": def_rule.vehicle_category_id,
                 "trip_type": def_rule.trip_type,
                 "base_fare": def_rule.base_fare,

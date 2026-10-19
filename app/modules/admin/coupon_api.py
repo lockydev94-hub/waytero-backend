@@ -1,13 +1,14 @@
 """Coupon management and redemption. Doc Ref: BRD Part 6 §129, §147."""
 
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal, ROUND_HALF_UP
-from typing import Literal
+from typing import Literal, Optional
 import math
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from sqlalchemy import select, func, delete, text
+from sqlalchemy import select, func, delete, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -590,6 +591,109 @@ async def validate_coupon(
         partner_share=partner,
         eligible_partner_ids=cohort,
     )
+
+
+@dataclass(frozen=True)
+class CouponOption:
+    """One coupon the desk can offer this customer, with the money it saves.
+
+    A recommendation the agent has to trust: the figures come from
+    :func:`validate_coupon` running against the same amount the booking will be
+    created with, so "this code saves ₹150" cannot turn into a rejection once the
+    agent applies it.
+    """
+
+    coupon_id: int
+    coupon_code: str
+    title: str
+    discount_amount: Decimal
+    final_amount: Decimal
+    coupon_type: str
+    partner_funded: bool
+
+
+async def recommend_coupons(
+    db: AsyncSession,
+    *,
+    service_type: ServiceType,
+    city_id: Optional[int],
+    vehicle_category_id: Optional[int],
+    booking_amount: Decimal,
+    customer_id: int,
+    customer_mobile: Optional[str] = None,
+    pickup_datetime: Optional[datetime] = None,
+    return_datetime: Optional[datetime] = None,
+) -> list[CouponOption]:
+    """Every coupon that would actually apply to this booking, best saving first.
+
+    Deliberately not a second rule set. A cheap SQL prefilter removes only the
+    cases :func:`validate_coupon` also rejects — inactive, outside its date
+    window, wrong service, below its minimum, total usage exhausted — and then
+    every survivor is put through that same function, which is where the city
+    rules, service/category rules, offer scope, per-customer history, discount
+    caps and partner-capacity checks live. Filtering on those here would mean a
+    second implementation of coupon validity that could disagree with the one
+    that decides whether the code is accepted.
+
+    No limit on the survivor set: a percentage coupon worth 20% of a large booking
+    beats a flat ₹300 on a small one, so the ranking is only known after the
+    arithmetic. Coupons are a short list; running the real check on each is what
+    makes "the best one is at the top" true rather than plausible.
+    """
+    candidates = (
+        (
+            await db.execute(
+                select(Coupon)
+                .where(
+                    Coupon.is_active.is_(True),
+                    Coupon.valid_from <= date.today(),
+                    Coupon.valid_to >= date.today(),
+                    Coupon.apply_to.in_(("ALL", service_type)),
+                    Coupon.min_booking_amount <= booking_amount,
+                    or_(
+                        Coupon.max_usage_total.is_(None),
+                        Coupon.current_usage_count < Coupon.max_usage_total,
+                    ),
+                )
+                .order_by(Coupon.discount_value.desc(), Coupon.id.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    options: list[CouponOption] = []
+    for coupon in candidates:
+        result = await validate_coupon(
+            ValidateRequest(
+                coupon_code=coupon.coupon_code,
+                service_type=service_type,
+                city_id=city_id,
+                vehicle_category_id=vehicle_category_id,
+                booking_amount=booking_amount,
+                customer_id=customer_id,
+                customer_mobile=customer_mobile,
+                pickup_datetime=pickup_datetime,
+                return_datetime=return_datetime,
+            ),
+            db,
+        )
+        if not result.valid or result.coupon_id is None:
+            continue
+        options.append(
+            CouponOption(
+                coupon_id=result.coupon_id,
+                coupon_code=coupon.coupon_code,
+                title=coupon.title,
+                discount_amount=result.discount_amount,
+                final_amount=result.final_amount,
+                coupon_type=result.coupon_type,
+                partner_funded=result.coupon_type in PARTNER_FUNDED_TYPES,
+            )
+        )
+
+    options.sort(key=lambda o: o.discount_amount, reverse=True)
+    return options
 
 
 @router.post("/validate", response_model=ValidateResponse, tags=["Coupons"])

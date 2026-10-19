@@ -17,6 +17,7 @@
 # ============================================================
 
 from decimal import Decimal
+import json
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -26,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
+from app.core.timezone import get_platform_tz_sync, to_platform_tz
 from app.modules.admin.schemas.landing_pages import LandingFareRow
 from app.modules.admin.services import DefaultPricingService
 from app.modules.booking.services.fare import calculate_fare_breakdown
@@ -526,6 +528,17 @@ async def get_fare_estimate(
             end_dt = None
     days = trip_days_from(start_dt, end_dt)
 
+    # The search page quotes for a trip on a calendar day, so it must read the
+    # fare sheet that is in force on that day. `start_dt` is the customer's chosen
+    # pickup; with no pickup time the request's own day is all there is to go on.
+    # Booking creation passes the same day, so a quoted figure and the price the
+    # booking computes cannot come from two different sheets.
+    estimate_day = (
+        to_platform_tz(start_dt).date()
+        if start_dt
+        else datetime.now(get_platform_tz_sync()).date()
+    )
+
     # Get active vehicle categories
     result = await db.execute(
         text(
@@ -542,7 +555,7 @@ async def get_fare_estimate(
     items: List[FareBreakdownItem] = []
     for cat in categories:
         rule = await DefaultPricingService.get_effective_rule(
-            db, city_id, cat.id, trip_type
+            db, city_id, cat.id, trip_type, for_date=estimate_day
         )
         if not rule:
             continue
@@ -752,18 +765,6 @@ async def create_cab_booking(
     except Exception:
         pickup_dt = datetime.utcnow()
 
-    # ── Server-side recompute of estimated_amount ─────────────────────────
-    # The FE sends a hint (estimated_amount) computed via the same fare
-    # formula, but the canonical value comes from this server. If the FE
-    # is in sync, the warning is null. If the FE is stale or tampered, the
-    # server value wins and the response carries a warning so the FE can
-    # surface the discrepancy. Mirrors the admin "create on behalf" path
-    # at customer_care_api.py:767-802.
-    server_estimated_amount = Decimal("0.00")
-    server_warning: Optional[str] = None
-    pricing_rule = await DefaultPricingService.get_effective_rule(
-        db, body.city_id, body.vehicle_category_id, body.trip_type
-    )
     # Parse return_datetime (used to compute trip_days for PER_DAY
     # driver-allowance rules on ROUND_TRIP). Migration 0049.
     return_dt: Optional[datetime] = None
@@ -774,40 +775,58 @@ async def create_cab_booking(
             )
         except ValueError:
             return_dt = None
-    if pricing_rule:
-        from app.modules.booking.services.fare import trip_days_from
 
-        distance_km = float(body.estimated_distance_km or 0)
-        days = trip_days_from(pickup_dt, return_dt)
-        server_estimated_amount = calculate_fare_breakdown(
-            rule=pricing_rule,
-            actual_distance_km=distance_km,
-            start_dt=pickup_dt,
-            end_dt=return_dt,
-            trip_type=body.trip_type,
-            trip_days=days,
-        )["total"]
-        fe_amount = (
-            Decimal(str(body.estimated_amount)) if body.estimated_amount else None
-        )
-        if fe_amount is not None and abs(fe_amount - server_estimated_amount) > Decimal(
-            "0.50"
-        ):
-            # >₹0.50 deviation — surface as a warning. We don't reject because
-            # legitimate re-renders of the search page can show slightly
-            # different numbers (e.g. night-charge flip on second-pass).
-            server_warning = (
-                f"Server fare ₹{server_estimated_amount:.2f} differs from "
-                f"client-quoted ₹{fe_amount:.2f}. Using server value."
-            )
-    else:
-        # No pricing rule for this combination — fall back to the FE amount.
-        # The booking will still be filed; admin can correct via EditCabDetails.
-        server_estimated_amount = Decimal(str(body.estimated_amount or 0))
+    # ── Server-side price of the trip ──────────────────────────────────────
+    # This used to recompute the fare from `body.estimated_distance_km`, i.e.
+    # from the browser's own number. Recomputing a tampered input is arithmetic,
+    # not authority: halve the kilometres and the server faithfully halved the
+    # fare, with nothing on the row to show who said it. The trip is now measured
+    # backend-side — a published corridor's distance first, then Google — and the
+    # client's figure survives only as the labelled fallback for a hire with no
+    # destination to measure against.
+    # Doc Ref: BRD Part 3 §35 — fare formula; Round 15 plan C2.
+    from app.modules.booking.services.trip_pricing import (
+        fare_columns,
+        quote_cab_trip,
+    )
+
+    server_warning: Optional[str] = None
+    quote = await quote_cab_trip(
+        db,
+        pickup_location=body.pickup_location,
+        drop_location=body.drop_location or "",
+        origin_city_id=body.city_id,
+        vehicle_category_id=body.vehicle_category_id,
+        trip_type=body.trip_type,
+        pickup_datetime=pickup_dt,
+        return_datetime=return_dt,
+        fallback_distance_km=(
+            Decimal(str(body.estimated_distance_km))
+            if body.estimated_distance_km
+            else None
+        ),
+    )
+    server_estimated_amount = quote.total
+    fe_amount = (
+        Decimal(str(body.estimated_amount)) if body.estimated_amount else None
+    )
+    if fe_amount is not None and abs(fe_amount - server_estimated_amount) > Decimal(
+        "0.50"
+    ):
+        # >₹0.50 deviation — surface as a warning. We don't reject because
+        # legitimate re-renders of the search page can show slightly
+        # different numbers (e.g. night-charge flip on second-pass).
         server_warning = (
-            "No pricing rule configured for this city/category/trip — "
-            "using client-supplied estimate."
+            f"Server fare ₹{server_estimated_amount:.2f} differs from "
+            f"client-quoted ₹{fe_amount:.2f}. Using server value."
         )
+    if quote.distance.source == "CLIENT_STATED":
+        # The customer is being charged on a number nobody measured. Say so in
+        # the same field the page already reads, rather than letting the total
+        # look as final as a corridor fare.
+        server_warning = (
+            server_warning + " " if server_warning else ""
+        ) + "Distance taken from the booking form — no destination was given to measure."
 
     # ── Coupon validation + persistence ──────────────────────────────────
     # Re-validate the coupon against the SERVER-recomputed amount so a tampered
@@ -909,7 +928,11 @@ async def create_cab_booking(
     )
     master_id = mbr.scalar()
 
-    # 2. Insert cab booking — includes the persisted coupon snapshot.
+    # 2. Insert cab booking — includes the persisted coupon snapshot and the
+    #    server's own fare lines. The lines are stored rather than re-derived at
+    #    invoice time so the page the customer agreed to, the invoice and the
+    #    settlement line are provably the same arithmetic.
+    fare_cols = fare_columns(quote)
     await db.execute(
         text(
             """
@@ -920,6 +943,9 @@ async def create_cab_booking(
             drop_location, drop_latitude, drop_longitude,
             pickup_datetime, return_datetime, estimated_distance, estimated_amount,
             coupon_code, coupon_id, coupon_discount, offer_id,
+            pricing_city_id, distance_source, billing_distance_km,
+            base_fare_amount, distance_charge_amount, driver_allowance_amount,
+            night_charge_amount, toll_amount, waiting_charge_amount, rate_snapshot,
             booking_status, created_at
         ) VALUES (
             :uuid, :master_id, :booking_number,
@@ -928,6 +954,10 @@ async def create_cab_booking(
             :drop_location, :drop_lat, :drop_lng,
             :pickup_datetime, :return_datetime, :distance, :estimated,
             :coupon_code, :coupon_id, :coupon_discount, :offer_id,
+            :pricing_city_id, :distance_source, :billing_distance_km,
+            :base_fare_amount, :distance_charge_amount, :driver_allowance_amount,
+            :night_charge_amount, :toll_amount, :waiting_charge_amount,
+            CAST(:rate_snapshot AS jsonb),
             'PENDING_ASSIGNMENT', NOW()
         )
     """
@@ -946,12 +976,16 @@ async def create_cab_booking(
             "drop_lng": body.drop_longitude,
             "pickup_datetime": pickup_dt,
             "return_datetime": return_dt,
-            "distance": body.estimated_distance_km or 0,
+            "distance": quote.distance.km,
             "estimated": server_estimated_amount,
             "coupon_code": coupon_code_used,
             "coupon_id": coupon_id_used,
             "coupon_discount": coupon_discount_applied,
             "offer_id": offer_id_used,
+            **{
+                k: (json.dumps(v) if k == "rate_snapshot" else v)
+                for k, v in fare_cols.items()
+            },
         },
     )
 
@@ -1092,6 +1126,10 @@ async def create_cab_booking(
             "cab_booking_number": cab_num,
             "status": "DRAFT",
             "estimated_amount": float(server_estimated_amount),
+            # So the page can say where the kilometres came from instead of
+            # presenting an estimated fare as though it were measured.
+            "distance_km": float(quote.distance.km),
+            "distance_source": quote.distance.source,
             "coupon_code": coupon_code_used,
             "coupon_discount": float(coupon_discount_applied),
             "warning": server_warning,

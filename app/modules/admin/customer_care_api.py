@@ -31,6 +31,7 @@ from app.core.branch_scope import (
 )
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
+from app.core.exceptions import ResourceNotFoundException, ValidationException
 from app.modules.admin.cab_route_service import assert_city_active
 from app.modules.auth.models.user import User
 from app.modules.booking.models import (
@@ -114,13 +115,47 @@ class CustomerRegisterByAdmin(BaseModel):
     city_id: Optional[int] = None
 
 
-class CabBookingCreateByAdmin(BaseModel):
-    customer_id: int
-    city_id: int
+class CabBookingQuoteRequest(BaseModel):
+    """What the desk needs to quote a trip before it commits to booking one.
+
+    No amount and no distance here — those are the server's answers, which is the
+    whole point. The agent gives places, a cab type, a trip type and a time.
+    """
+
+    city_id: Optional[int] = None
+    destination_city_id: Optional[int] = None
+    vehicle_category_id: int = Field(..., gt=0)
     trip_type: str = Field(
         ..., description="LOCAL | AIRPORT | OUTSTATION | ONE_WAY | ROUND_TRIP"
     )
-    vehicle_category_id: int
+    pickup_location: str = Field(..., max_length=500)
+    drop_location: str = Field(..., max_length=500)
+    pickup_datetime: datetime
+    return_datetime: Optional[datetime] = None
+    # Minutes the customer asked the cab to wait on this trip. A property of the
+    # trip, not of the city's fare sheet — which is why the desk can say it here
+    # and nowhere else.
+    waiting_minutes: Optional[int] = Field(None, ge=0, le=1440)
+    # Only used to say which coupons this customer could actually redeem.
+    customer_id: Optional[int] = None
+
+
+class CabBookingCreateByAdmin(BaseModel):
+    """Create-on-behalf payload.
+
+    `estimated_distance` and any hand-typed amount are gone: the booking is
+    priced by the same server call the quote screen made, from the places the
+    agent named. `customer_id` is required because the fare a customer is told
+    and the coupon they may use both depend on who they are.
+    """
+
+    customer_id: int
+    city_id: Optional[int] = None
+    destination_city_id: Optional[int] = None
+    trip_type: str = Field(
+        ..., description="LOCAL | AIRPORT | OUTSTATION | ONE_WAY | ROUND_TRIP"
+    )
+    vehicle_category_id: int = Field(..., gt=0)
     pickup_location: str = Field(..., max_length=500)
     pickup_latitude: Optional[float] = None
     pickup_longitude: Optional[float] = None
@@ -132,8 +167,74 @@ class CabBookingCreateByAdmin(BaseModel):
     # ``trip_days`` when the matched pricing rule has
     # ``driver_allowance_type = PER_DAY``. Added migration 0049.
     return_datetime: Optional[datetime] = None
-    estimated_distance: Optional[float] = None
+    waiting_minutes: Optional[int] = Field(None, ge=0, le=1440)
+    coupon_code: Optional[str] = Field(None, max_length=50)
     remarks: Optional[str] = None
+
+
+class CabCouponOptionOut(BaseModel):
+    """One coupon the desk can honestly offer this booking.
+
+    Produced by the same validator that decides whether a redemption is accepted,
+    so a code recommended here cannot fail at create for a reason the screen
+    could have said out loud.
+    """
+
+    coupon_id: int
+    coupon_code: str
+    title: str
+    discount_amount: Decimal
+    final_amount: Decimal
+    coupon_type: str
+    partner_funded: bool
+
+
+class CabQuoteOut(BaseModel):
+    """The desk's price panel. Money leaves as Decimal so the JSON cannot round
+    a figure the customer is about to be told."""
+
+    city_id: int
+    pricing_city_id: Optional[int] = None
+    vehicle_category_id: int
+    trip_type: str
+    distance_km: Decimal
+    # GOOGLE | CONFIGURED_ROUTE | HAVERSINE — the agent says which one it was.
+    distance_source: str
+    billable_km: Decimal
+    route_id: Optional[int] = None
+    toll_configured: bool
+    base_fare: Decimal
+    distance_charge: Decimal
+    driver_allowance: Decimal
+    night_charge: Decimal
+    toll: Decimal
+    waiting: Decimal
+    total: Decimal
+    notes: List[str] = Field(default_factory=list)
+    coupons: List[CabCouponOptionOut] = Field(default_factory=list)
+
+
+class CabBookingCreateOut(BaseModel):
+    """What the desk gets back, in the same Decimal form it was quoted in.
+
+    `estimated_amount` is the fare, `payable_amount` is what the customer pays
+    after the coupon. Returning both stops a screen from subtracting the
+    discount a second time.
+    """
+
+    success: bool
+    master_booking_id: int
+    booking_number: str
+    cab_booking_id: int
+    cab_booking_number: str
+    distance_km: Decimal
+    distance_source: str
+    billable_km: Decimal
+    estimated_amount: Decimal
+    coupon_discount: Decimal
+    payable_amount: Decimal
+    notes: List[str] = Field(default_factory=list)
+    message: str
 
 
 # ── Hotel booking (by admin) ─────────────────────────────────
@@ -928,6 +1029,9 @@ async def update_care_log(
 @router.get("/cab-booking/meta", tags=["Customer Care"])
 async def cab_booking_meta(
     city_id: Optional[int] = Query(None),
+    for_date: Optional[date] = Query(
+        None, description="Day the trip happens; fare sheets are read as of it"
+    ),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
     scope: BranchScope = Depends(get_branch_scope),
@@ -947,19 +1051,28 @@ async def cab_booking_meta(
     )
     cats = [dict(r) for r in cats_r.mappings().all()]
 
-    # Pricing per category per trip_type
+    # Pricing per category per trip_type, as of the day of the trip.
+    # The window matters: a superseded sheet still sits in the table, and a
+    # next-month trip has to be explained from the sheet that will be in force
+    # when it runs. `/cab-booking/quote` applies the same filter through
+    # DefaultPricingService, so a number shown here is a number the quote can
+    # actually honour.
+    on_day = for_date or datetime.now(timezone.utc).date()
     if effective_city_id:
         pricing_r = await db.execute(
             text(
                 """
             SELECT vehicle_category_id, trip_type, base_fare, per_km_rate,
                    minimum_km, driver_allowance, night_charge,
-                   driver_allowance_type, night_charge_type, toll
+                   driver_allowance_type, night_charge_type, toll,
+                   effective_from, effective_to
             FROM vehicle_pricing_rules
             WHERE city_id = :city_id
+              AND (effective_from IS NULL OR effective_from <= :on_day)
+              AND (effective_to   IS NULL OR effective_to   >= :on_day)
         """
             ),
-            {"city_id": effective_city_id},
+            {"city_id": effective_city_id, "on_day": on_day},
         )
     else:
         pricing_r = await db.execute(
@@ -967,18 +1080,27 @@ async def cab_booking_meta(
                 """
             SELECT vehicle_category_id, trip_type, base_fare, per_km_rate,
                    minimum_km, driver_allowance, night_charge,
-                   driver_allowance_type, night_charge_type, toll
+                   driver_allowance_type, night_charge_type, toll,
+                   NULL::date AS effective_from, NULL::date AS effective_to
             FROM default_vehicle_pricing_rules
         """
             )
         )
 
-    pricing = {}
+    # One sheet per (category, trip type) or none. A pair with two rows covering
+    # the same day is a configuration conflict the quote will refuse outright, so
+    # the form is not allowed to display a price for it — showing one of the two
+    # at random would have the desk quote a fare the booking then rejects.
+    rows_by_key: dict = {}
     for row in pricing_r.mappings().all():
-        key = str(row["vehicle_category_id"])
-        if key not in pricing:
-            pricing[key] = {}
-        pricing[key][row["trip_type"]] = {
+        rows_by_key.setdefault((str(row["vehicle_category_id"]), row["trip_type"]), []).append(row)
+
+    pricing = {}
+    for (cat_key, trip_type), group in rows_by_key.items():
+        if len(group) != 1:
+            continue
+        row = group[0]
+        pricing.setdefault(cat_key, {})[trip_type] = {
             "base_fare": float(row["base_fare"] or 0),
             "per_km_rate": float(row["per_km_rate"] or 0),
             "minimum_km": int(row["minimum_km"] or 0),
@@ -987,6 +1109,14 @@ async def cab_booking_meta(
             "driver_allowance_type": row["driver_allowance_type"] or "PER_TRIP",
             "night_charge_type": row["night_charge_type"] or "FIXED",
             "toll": float(row["toll"] or 0),
+            # The agent is quoting a price the customer hears over the phone;
+            # whether the sheet they read is temporary is part of that answer.
+            "effective_from": (
+                row["effective_from"].isoformat() if row["effective_from"] else None
+            ),
+            "effective_to": (
+                row["effective_to"].isoformat() if row["effective_to"] else None
+            ),
         }
 
     # The city picker shows a branch only its own city — offering another city
@@ -1005,90 +1135,239 @@ async def cab_booking_meta(
     return {"vehicle_categories": cats, "pricing": pricing, "cities": cities}
 
 
+# ── 7b. Quote a trip, then book it ───────────────────────────
+
+
+async def _desk_customer(db: AsyncSession, customer_id: int, scope: BranchScope) -> dict:
+    """The customer the desk is acting for, only if this branch may act for them.
+
+    `/lookup` already answers "is this customer ours" by home city, booking
+    history and care history, and the booking has to agree with that answer.
+    Without the same test here, a Cuttack agent who had the customer id could
+    file a booking that `/lookup` would refuse to show them — and the booking
+    would then be invisible to the branch that has to service it.
+    """
+    branch_clause, branch_params = _customer_in_branch_sql(scope)
+    row = (
+        await db.execute(
+            text(
+                f"""
+            SELECT
+                c.id AS customer_id, c.customer_code,
+                u.first_name, u.last_name,
+                u.first_name || ' ' || COALESCE(u.last_name, '') AS full_name,
+                u.mobile_number, u.email
+            FROM customers c
+            JOIN users u ON u.id = c.user_id
+            WHERE c.id = :cid AND u.user_type = 'CUSTOMER'
+              AND ({branch_clause})
+        """
+            ),
+            {"cid": customer_id, **branch_params},
+        )
+    ).mappings().one_or_none()
+    if row is None:
+        # 404, not 403: an out-of-scope customer must not be confirmable by id.
+        raise ResourceNotFoundException(
+            "That customer is not in this branch's book, so a booking cannot be "
+            "filed for them from here."
+        )
+    return dict(row)
+
+
+async def _desk_pricing_city(payload, db: AsyncSession, scope: BranchScope) -> int:
+    """Where the trip starts, which is whose fare sheet prices it.
+
+    A branch never gets to choose: it books in its own city. A super admin does,
+    and the city has to exist and be active.
+    """
+    if scope.restricted:
+        return scope.city_id
+    if not payload.city_id:
+        raise ValidationException(
+            "Choose the city the trip starts in — the cab fare depends on it."
+        )
+    await assert_city_active(db, payload.city_id, "Booking city")
+    return payload.city_id
+
+
+@router.post("/cab-booking/quote", response_model=CabQuoteOut, tags=["Customer Care"])
+async def quote_cab_booking_by_admin(
+    payload: CabBookingQuoteRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
+):
+    """What this trip costs, what it is made of, and what the customer could pay less with.
+
+    The phone desk's price panel. Nothing in the answer is typed by anyone: the
+    kilometres come from a published corridor or from Google, the rate comes from
+    the fare sheet in force on the trip's day, and the lines are the fare engine's
+    own breakdown. `POST /cab-booking` recomputes this same quote from the same
+    inputs rather than trusting a number returned here, which is why there is no
+    quote id to pass back and why a quote nobody re-used cannot go stale.
+
+    Coupons are only listed when `customer_id` is supplied, because whether a code
+    applies depends on who is asking as much as on what they are booking.
+    """
+    from app.modules.booking.services.trip_pricing import quote_cab_trip
+
+    effective_city_id = await _desk_pricing_city(payload, db, scope)
+
+    quote = await quote_cab_trip(
+        db,
+        pickup_location=payload.pickup_location,
+        drop_location=payload.drop_location,
+        origin_city_id=effective_city_id,
+        vehicle_category_id=payload.vehicle_category_id,
+        trip_type=payload.trip_type,
+        pickup_datetime=payload.pickup_datetime,
+        return_datetime=payload.return_datetime,
+        destination_city_id=payload.destination_city_id,
+        waiting_minutes=payload.waiting_minutes,
+    )
+    b = quote.breakdown
+
+    coupons = []
+    if payload.customer_id:
+        customer = await _desk_customer(db, payload.customer_id, scope)
+        from app.modules.admin.coupon_api import recommend_coupons
+
+        coupons = [
+            CabCouponOptionOut(
+                coupon_id=c.coupon_id,
+                coupon_code=c.coupon_code,
+                title=c.title,
+                discount_amount=c.discount_amount,
+                final_amount=c.final_amount,
+                coupon_type=c.coupon_type,
+                partner_funded=c.partner_funded,
+            )
+            for c in await recommend_coupons(
+                db,
+                service_type="CAB",
+                city_id=effective_city_id,
+                vehicle_category_id=payload.vehicle_category_id,
+                booking_amount=quote.total,
+                customer_id=payload.customer_id,
+                customer_mobile=customer.get("mobile_number"),
+                pickup_datetime=payload.pickup_datetime,
+                return_datetime=payload.return_datetime,
+            )
+        ]
+
+    return CabQuoteOut(
+        city_id=effective_city_id,
+        pricing_city_id=quote.pricing_city_id,
+        vehicle_category_id=payload.vehicle_category_id,
+        trip_type=payload.trip_type,
+        distance_km=quote.distance.km,
+        distance_source=quote.distance.source,
+        billable_km=Decimal(str(b["billable_km"])),
+        route_id=quote.distance.route_id,
+        toll_configured=quote.distance.toll_configured,
+        base_fare=Decimal(str(b["base_fare"])),
+        distance_charge=Decimal(str(b["distance_charge"])),
+        driver_allowance=Decimal(str(b["driver_allowance"])),
+        night_charge=Decimal(str(b["night_charge_applied"])),
+        toll=Decimal(str(b["toll"])),
+        waiting=Decimal(str(b["waiting"])),
+        total=quote.total,
+        notes=quote.notes,
+        coupons=coupons,
+    )
+
+
 # ── 8. Create cab booking by admin (on behalf of customer) ────
-@router.post("/cab-booking", tags=["Customer Care"])
+@router.post("/cab-booking", response_model=CabBookingCreateOut, tags=["Customer Care"])
 async def create_cab_booking_by_admin(
     payload: CabBookingCreateByAdmin,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
     scope: BranchScope = Depends(get_branch_scope),
 ):
-    """Admin creates a cab booking on behalf of a customer."""
+    """Admin creates a cab booking on behalf of a customer.
 
-    # The booking's city is not trusted from the form: a branch files it in its
-    # own city, always, and the pricing lookup and the stored row use that same
-    # city so a booking cannot be priced in one city and recorded in another. A
-    # super admin supplies one, and it has to be an active city.
-    if scope.restricted:
-        effective_city_id = scope.city_id
-    else:
-        await assert_city_active(db, payload.city_id, "Booking city")
-        effective_city_id = payload.city_id
+    Priced here, never accepted from the screen. The booking re-runs the same
+    server-side quote the agent looked at, from the places they named, and stores
+    the measured distance, the fare lines and the rule sheet behind them on the
+    row. That is why there is no distance or amount on this payload: an agent who
+    re-posts the form with a friendlier number changes nothing they can control.
+    """
+    from app.modules.booking.services.trip_pricing import fare_columns, quote_cab_trip
 
-    # Verify customer exists
-    cust_r = await db.execute(
-        text("SELECT id FROM customers WHERE id = :cid"), {"cid": payload.customer_id}
+    effective_city_id = await _desk_pricing_city(payload, db, scope)
+    customer = await _desk_customer(db, payload.customer_id, scope)
+
+    quote = await quote_cab_trip(
+        db,
+        pickup_location=payload.pickup_location,
+        drop_location=payload.drop_location,
+        origin_city_id=effective_city_id,
+        vehicle_category_id=payload.vehicle_category_id,
+        trip_type=payload.trip_type,
+        pickup_datetime=payload.pickup_datetime,
+        return_datetime=payload.return_datetime,
+        destination_city_id=payload.destination_city_id,
+        waiting_minutes=payload.waiting_minutes,
     )
-    if not cust_r.scalar_one_or_none():
-        raise HTTPException(status_code=404, detail="Customer not found")
+    # Pre-coupon, matching the website: master_bookings.total_amount stays the
+    # fare view and the discount lives on cab_bookings + coupon_usages, so the
+    # invoice, the settlement line and the partner close-trip math all read the
+    # discount from one place and subtract it once.
+    estimated_amount = quote.total
+    fare_cols = fare_columns(quote)
 
-    # Calculate estimated amount from pricing.
-    # Doc Ref: BRD Part 3 §35 — fare formula. Centralised in
-    # app.modules.booking.services.fare so admin/partner/customer previews
-    # all agree on the same number.
-    estimated_amount = Decimal("0.00")
-    if payload.estimated_distance and payload.estimated_distance > 0:
-        pr_r = await db.execute(
-            text(
-                """
-            SELECT base_fare, per_km_rate, minimum_km, driver_allowance, night_charge,
-                   driver_allowance_type, night_charge_type, toll
-            FROM vehicle_pricing_rules
-            WHERE city_id = :cid AND vehicle_category_id = :vcid AND trip_type = :ttype
-            LIMIT 1
-        """
+    # ── Coupon, through the website's validator ────────────────────────
+    # Deliberately not a second rule set: `validate_coupon(reserve=True)` is the
+    # function that decides whether a redemption is accepted at all, including
+    # the per-customer history and the usage cap under a row lock. The quote
+    # screen recommended from that same function, so a code listed there either
+    # still works here or is refused with the reason the validator gave.
+    coupon_discount = Decimal("0.00")
+    coupon_id_used: Optional[int] = None
+    coupon_code_used: Optional[str] = None
+    offer_id_used: Optional[int] = None
+    coupon_validation = None
+    if payload.coupon_code:
+        from app.modules.admin.coupon_api import ValidateRequest, validate_coupon
+        from app.modules.admin.offer_service import resolve_offer_for_booking
+
+        coupon_validation = await validate_coupon(
+            ValidateRequest(
+                coupon_code=payload.coupon_code,
+                service_type="CAB",
+                vehicle_category_id=payload.vehicle_category_id,
+                city_id=effective_city_id,
+                booking_amount=estimated_amount,
+                customer_id=payload.customer_id,
+                customer_mobile=customer.get("mobile_number"),
+                pickup_datetime=payload.pickup_datetime,
+                return_datetime=payload.return_datetime,
             ),
-            {
-                "cid": effective_city_id,
-                "vcid": payload.vehicle_category_id,
-                "ttype": payload.trip_type,
-            },
+            db,
+            reserve=True,
         )
-        pr = pr_r.mappings().one_or_none()
-
-        if not pr:
-            # fallback to default
-            pr_r2 = await db.execute(
-                text(
-                    """
-                SELECT base_fare, per_km_rate, minimum_km, driver_allowance, night_charge,
-                       driver_allowance_type, night_charge_type, toll
-                FROM default_vehicle_pricing_rules
-                WHERE vehicle_category_id = :vcid AND trip_type = :ttype
-                LIMIT 1
-            """
-                ),
-                {"vcid": payload.vehicle_category_id, "ttype": payload.trip_type},
+        if not coupon_validation.valid:
+            # Same code the website path returns for the same event: the coupon
+            # was real a moment ago and is not now (used up, expired, or this
+            # customer has had it).
+            raise HTTPException(
+                status_code=409,
+                detail=f"Coupon not applied: {coupon_validation.message}",
             )
-            pr = pr_r2.mappings().one_or_none()
-
-        if pr:
-            from app.modules.booking.services.fare import calculate_fare, trip_days_from
-
-            # Estimate uses the pickup start (night-window for an
-            # admin-future-dated booking) and the return datetime when the
-            # matched rule uses PER_DAY driver allowance. Fall back to a
-            # single-day trip when return_datetime is absent.
-            estimated_amount = calculate_fare(
-                dict(pr),
-                payload.estimated_distance,
-                start_dt=payload.pickup_datetime,
-                end_dt=payload.return_datetime or payload.pickup_datetime,
-                trip_type=payload.trip_type,
-                trip_days=trip_days_from(
-                    payload.pickup_datetime, payload.return_datetime
-                ),
-            )
+        coupon_discount = Decimal(str(coupon_validation.discount_amount))
+        coupon_id_used = coupon_validation.coupon_id
+        coupon_code_used = payload.coupon_code.strip().upper()
+        offer_id_used = await resolve_offer_for_booking(
+            db,
+            coupon_id=coupon_id_used,
+            service_type="CAB",
+            vehicle_category_id=payload.vehicle_category_id,
+            hotel_id=None,
+            room_category_id=None,
+            tour_package_id=None,
+        )
 
     # Create master booking via ORM so the booking_number, uuid and FK
     # defaults are populated through the same path the model declares.
@@ -1136,12 +1415,34 @@ async def create_cab_booking_by_admin(
         drop_longitude=payload.drop_longitude,
         pickup_datetime=payload.pickup_datetime,
         return_datetime=payload.return_datetime,
-        estimated_distance=payload.estimated_distance,
+        # What the trip measured, as opposed to what will be billed: the billable
+        # figure is the measured one or the trip type's minimum, whichever is
+        # larger, and the difference is exactly what a customer argues about.
+        estimated_distance=quote.distance.km,
         estimated_amount=estimated_amount,
+        coupon_code=coupon_code_used,
+        coupon_id=coupon_id_used,
+        coupon_discount=coupon_discount,
+        offer_id=offer_id_used,
+        **fare_cols,
         booking_status="PENDING_ASSIGNMENT",
     )
     db.add(cb)
     await db.flush()  # populate cb.id for booking_services.service_reference_id
+
+    # The redemption row is the source of truth for the usage counter, the
+    # invoice discount and the funding split, so it is written here exactly as
+    # the website writes it.
+    if coupon_id_used is not None:
+        from app.modules.admin.coupon_api import record_coupon_usage
+
+        await record_coupon_usage(
+            db,
+            validation=coupon_validation,
+            customer_id=payload.customer_id,
+            master_booking_id=mb.id,
+            cab_booking_id=cb.id,
+        )
 
     # Link the CAB service to the master booking
     bs = BookingService(
@@ -1153,26 +1454,44 @@ async def create_cab_booking_by_admin(
     )
     db.add(bs)
 
-    # Audit trail
+    # Audit trail. The fare and how it was measured go in the description, not
+    # only on the booking row, because the question asked months later is "what
+    # did we tell this customer and why" — and the answer is a timestamped
+    # sentence, not a re-derivation from rules that may since have changed.
     tl = BookingTimeline(
         master_booking_id=mb.id,
         event_type="BOOKING_CREATED",
-        event_description="Booking created by admin via Customer Care",
+        event_description=(
+            "Booking created by admin via Customer Care — "
+            f"₹{estimated_amount.quantize(Decimal('0.01'))} for "
+            f"{quote.distance.km} km ({quote.distance.source})"
+            + (
+                f", coupon {coupon_code_used} −₹{coupon_discount.quantize(Decimal('0.01'))}"
+                if coupon_code_used
+                else ""
+            )
+        ),
         created_by=created_by_uuid,
     )
     db.add(tl)
 
     # get_db auto-commits on success.
 
-    return {
-        "success": True,
-        "master_booking_id": mb.id,
-        "booking_number": mbk_number,
-        "cab_booking_id": cb.id,
-        "cab_booking_number": cb_number,
-        "estimated_amount": float(estimated_amount),
-        "message": "Cab booking created successfully",
-    }
+    return CabBookingCreateOut(
+        success=True,
+        master_booking_id=mb.id,
+        booking_number=mbk_number,
+        cab_booking_id=cb.id,
+        cab_booking_number=cb_number,
+        distance_km=quote.distance.km,
+        distance_source=quote.distance.source,
+        billable_km=Decimal(str(quote.breakdown["billable_km"])),
+        estimated_amount=estimated_amount,
+        coupon_discount=coupon_discount,
+        payable_amount=estimated_amount - coupon_discount,
+        notes=quote.notes,
+        message="Cab booking created successfully",
+    )
 
 
 # ── Hotel booking helpers + endpoints ────────────────────────

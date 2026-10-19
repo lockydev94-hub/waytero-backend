@@ -50,7 +50,13 @@ from typing import Any, Dict, Mapping, Optional
 # rows if those exist.
 DEFAULT_NIGHT_START = time(22, 0)
 DEFAULT_NIGHT_END = time(6, 0)
-DEFAULT_NIGHT_TZ = timezone(timedelta(hours=5, minutes=30))  # Asia/Kolkata
+
+# Indian Standard Time, the zone a cab trip is actually priced and driven in.
+# Named once here because "which day is it" has to mean the same thing to the
+# night window, to a rule's effective dates and to a quote's trip date — two
+# definitions of that offset is how a booking gets priced on yesterday's sheet.
+INDIA_TZ = timezone(timedelta(hours=5, minutes=30))
+DEFAULT_NIGHT_TZ = INDIA_TZ
 
 TWO_PLACES = Decimal("0.01")
 
@@ -72,6 +78,18 @@ def _rule_decimal(rule: Mapping[str, Any], key: str) -> Decimal:
     if val is None or val == "":
         return Decimal("0")
     return Decimal(str(val))
+
+
+def _decimal_or_rule(value: Any, rule: Mapping[str, Any], key: str) -> Decimal:
+    """A trip's own figure if it brought one, otherwise the rule's.
+
+    ``None`` means "not supplied" and falls back; an explicit 0 means "this trip
+    has no toll / did not wait" and is honoured. Those are different claims and
+    conflating them is how a zero becomes an assertion.
+    """
+    if value is None:
+        return _rule_decimal(rule, key)
+    return Decimal(str(value))
 
 
 def _billable_km(
@@ -262,6 +280,8 @@ def calculate_fare(
     *,
     trip_type: Optional[str] = None,
     trip_days: Optional[int] = None,
+    toll: Optional[Any] = None,
+    actual_waiting_minutes: Optional[Any] = None,
 ) -> Decimal:
     """
     Compute the cab fare using the full rule.
@@ -286,6 +306,14 @@ def calculate_fare(
 
     Toll and waiting charges are read from the rule if present; they are
     added after the base components (before night charge).
+
+    ``toll`` and ``actual_waiting_minutes`` override the rule when given. They
+    exist because a pricing rule is a *city's* configuration while both of those
+    are facts about *this trip*: a corridor's toll plaza is a property of the
+    route the customer is on, and an hour of waiting is what happened, not what
+    the city's default row says. Leaving them rule-sourced priced every trip with
+    whatever the rule row happened to carry. ``None`` keeps the rule's value, so
+    existing callers are unaffected.
     """
     base_fare = _rule_decimal(rule, "base_fare")
     minimum_km = _rule_decimal(rule, "minimum_km")
@@ -304,12 +332,12 @@ def calculate_fare(
     distance_charge = billable * per_km_rate
     allowance = _driver_allowance(da_amount, da_type, billable, int(trip_days or 1))
 
-    # Toll charge (flat amount from rule)
-    toll = _rule_decimal(rule, "toll")
+    # Toll charge — the trip's own when given, otherwise the rule's flat amount.
+    toll = _decimal_or_rule(toll, rule, "toll")
 
     # Waiting charge: free_waiting_minutes, actual_waiting_minutes, rate_per_hour, granularity
     free_waiting = _rule_decimal(rule, "free_waiting_minutes")
-    actual_waiting = _rule_decimal(rule, "actual_waiting_minutes")
+    actual_waiting = _decimal_or_rule(actual_waiting_minutes, rule, "actual_waiting_minutes")
     waiting_rate = _rule_decimal(rule, "waiting_rate_per_hour")
     waiting_granularity = rule.get("waiting_granularity") or "PER_15_MINUTES"
     waiting = _waiting_charge(
@@ -339,12 +367,22 @@ def calculate_fare_breakdown(
     *,
     trip_type: Optional[str] = None,
     trip_days: Optional[int] = None,
+    toll: Optional[Any] = None,
+    actual_waiting_minutes: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """
     Same calculation as :func:`calculate_fare`, but returns the line items so
     the UI / invoice can show the components. All money values are Decimal
-    rounded to 2 places; ``total`` is the same value :func:`calculate_fare`
-    returns.
+    rounded to 2 places.
+
+    Every line here is quantised before it is summed, so ``total`` adds up to the
+    stored lines by construction — which makes this the form a booking should
+    persist. :func:`calculate_fare` quantises once at the end instead and can
+    therefore differ by a paisa; that is acceptable for a sanity check and not
+    acceptable on a document that has to reconcile.
+
+    ``toll`` and ``actual_waiting_minutes`` override the rule when given — see
+    :func:`calculate_fare` for why those two are trip facts, not city settings.
 
     Keys:
         base_fare               — Decimal (₹2 places)
@@ -365,9 +403,9 @@ def calculate_fare_breakdown(
         night_charge_applied    — Decimal (₹2 places, 0 if not a night trip)
         night_charge_type       — str (FIXED / PERCENTAGE / PER_KM)
         is_night                — bool
-        toll                    — Decimal (₹2 places, flat amount on the rule)
+        toll                    — Decimal (₹2 places, the trip's own when given)
         waiting                 — Decimal (₹2 places, evaluated waiting charge)
-        total                   — Decimal (₹2 places)
+        total                   — Decimal (₹2 places, sum of the lines above)
     """
     base_fare = _rule_decimal(rule, "base_fare").quantize(
         TWO_PLACES, rounding=ROUND_HALF_UP
@@ -398,12 +436,14 @@ def calculate_fare_breakdown(
     ).quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
     is_night = is_night_trip(start_dt, end_dt)
 
-    # Toll charge (from rule)
-    toll = _rule_decimal(rule, "toll").quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    # Toll charge — the trip's own when given, otherwise the rule's flat amount.
+    toll = _decimal_or_rule(toll, rule, "toll").quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
 
-    # Waiting charge (from rule)
+    # Waiting charge — the trip's own minutes when given, otherwise the rule's.
     free_waiting = _rule_decimal(rule, "free_waiting_minutes")
-    actual_waiting = _rule_decimal(rule, "actual_waiting_minutes")
+    actual_waiting = _decimal_or_rule(
+        actual_waiting_minutes, rule, "actual_waiting_minutes"
+    )
     waiting_rate = _rule_decimal(rule, "waiting_rate_per_hour")
     waiting_granularity = rule.get("waiting_granularity") or "PER_15_MINUTES"
     waiting = _waiting_charge(
