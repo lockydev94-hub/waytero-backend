@@ -5,16 +5,27 @@
 #   DB Schema Part 1, Section 9  → countries
 #   DB Schema Part 1, Section 10 → states
 #   DB Schema Part 1, Section 11 → cities
+#   Migration 0085              → branches
 #
-# These three tables are created by migration 0003_phase2_master_data.
-# The ORM models here exist purely so SQLAlchemy can resolve
+# The reference tables are created by migration 0003_phase2_master_data (and
+# branches by 0085). The ORM models here exist partly so SQLAlchemy can resolve
 # ForeignKey("cities.id"), ForeignKey("states.id"), etc. across all
 # other modules — without them the ORM throws NoReferencedTableError
 # on any write that touches city_id.
 # ============================================================
 
+from datetime import datetime, timezone
+
 import sqlalchemy as sa
-from sqlalchemy import Column, BigInteger, String, Boolean, ForeignKey, Index
+from sqlalchemy import (
+    Column,
+    BigInteger,
+    String,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+)
 from sqlalchemy.orm import relationship
 from app.core.database import Base
 
@@ -80,6 +91,54 @@ class City(Base):
     state = relationship("State", back_populates="cities")
 
     __table_args__ = (Index("idx_cities_state", "state_id"),)
+
+
+class Branch(Base):
+    """
+    One office, and (owner decision) exactly one office per city.
+    Migration 0085 — branches. Doc Ref: DB Architecture Part 3 §5 (users).
+
+    A branch is not a location in itself: `city_id` is the same key that
+    master_bookings, hotels, vehicles and partners already carry, which is what
+    lets a row reach its branch without a `branch_id` on every table. The UNIQUE
+    constraint on city_id is that 1:1 mapping.
+
+    `is_headquarters` marks the office that owns rows nobody has assigned a city
+    to yet (a website enquiry with no destination, for instance). Exactly one
+    is enforced in the service, not the DB: no super admin or head office is
+    seeded, so a unique index would abort `alembic upgrade` on a database that
+    already has rows to reconcile.
+
+    Only staff belong here. Customers, partners and drivers are scoped by their
+    own account, never by an office — `users.branch_id` is NULL for them and for
+    SUPER_ADMIN, who sees every branch.
+    """
+
+    __tablename__ = "branches"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    name = Column(String(120), nullable=False)
+    code = Column(String(50), nullable=False, unique=True)
+    city_id = Column(BigInteger, ForeignKey("cities.id"), nullable=False)
+    address = Column(String(255), nullable=True)
+    is_headquarters = Column(Boolean, nullable=False, default=False, server_default="false")
+    is_active = Column(Boolean, nullable=False, default=True, server_default="true")
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    __table_args__ = (
+        Index("uq_branches_city", "city_id", unique=True),
+        Index("idx_branches_active", "is_active"),
+    )
 
 
 class Place(Base):

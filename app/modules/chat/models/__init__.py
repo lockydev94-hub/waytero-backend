@@ -47,6 +47,9 @@ class ChatConversation(Base):
     status = Column(
         String(20), nullable=False, default="WAITING"
     )  # WAITING | OPEN | CLOSED
+    # Migration 0085 — the branch that answers this conversation. Set from the
+    # page the visitor opened it on; NULL (no city hint) means head office.
+    city_id = Column(BigInteger, ForeignKey("cities.id", ondelete="SET NULL"), nullable=True)
     assigned_admin_id = Column(
         UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True
     )
@@ -63,6 +66,7 @@ class ChatConversation(Base):
         Index("idx_chat_conv_status", "status", "updated_at"),
         Index("idx_chat_conv_customer", "customer_user_id"),
         Index("idx_chat_conv_guest", "guest_key"),
+        Index("idx_chat_conversations_city_queue", "city_id", "status", "updated_at"),
     )
 
 

@@ -652,6 +652,9 @@ class Enquiry(Base):
     handled_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
     handled_at = Column(DateTime(timezone=True))
     source = Column(String(30), nullable=False, default="WEB_RAIL")
+    # Migration 0085 — which branch works this enquiry. NULL until someone reads
+    # it, and NULL rows belong to the head office, not to every branch.
+    city_id = Column(BigInteger, ForeignKey("cities.id", ondelete="SET NULL"))
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -667,6 +670,7 @@ class Enquiry(Base):
     __table_args__ = (
         Index("idx_enquiries_queue", "status", "created_at"),
         Index("idx_enquiries_mobile", "mobile"),
+        Index("idx_enquiries_city_queue", "city_id", "status", "created_at"),
     )
 
 
@@ -683,6 +687,8 @@ class CallbackRequest(Base):
     handled_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
     called_at = Column(DateTime(timezone=True))
     source = Column(String(30), nullable=False, default="WEB_CARD")
+    # Migration 0085 — branch that owns the callback (see Enquiry.city_id).
+    city_id = Column(BigInteger, ForeignKey("cities.id", ondelete="SET NULL"))
     created_at = Column(
         DateTime(timezone=True),
         nullable=False,
@@ -698,6 +704,7 @@ class CallbackRequest(Base):
     __table_args__ = (
         Index("idx_callback_requests_queue", "status", "created_at"),
         Index("idx_callback_requests_mobile", "mobile"),
+        Index("idx_callback_requests_city_queue", "city_id", "status", "created_at"),
     )
 
 
@@ -729,6 +736,10 @@ class Quotation(Base):
     valid_till = Column(Date)
     terms = Column(Text)
     status = Column(String(20), nullable=False, default="DRAFT")
+    # Migration 0085 — copied from the enquiry when the quote is raised, so the
+    # branch list does not have to join back through an enquiry that ON DELETE
+    # SET NULL may already have detached.
+    city_id = Column(BigInteger, ForeignKey("cities.id", ondelete="SET NULL"))
     created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"))
     created_at = Column(
         DateTime(timezone=True),
@@ -742,4 +753,7 @@ class Quotation(Base):
         onupdate=lambda: datetime.now(timezone.utc),
     )
 
-    __table_args__ = (Index("idx_quotations_status", "status"),)
+    __table_args__ = (
+        Index("idx_quotations_status", "status"),
+        Index("idx_quotations_city_queue", "city_id", "status", "created_at"),
+    )

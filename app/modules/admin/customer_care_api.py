@@ -268,6 +268,11 @@ async def _ensure_care_log_table(db: AsyncSession):
       the pg_type unique-violation that asyncpg's prepared-statement cache
       causes when CREATE TABLE IF NOT EXISTS is called while the table
       already exists in a concurrent session.
+
+    Migration 0085 owns this table's shape and creates it with the rest of the
+    schema; this runtime DDL only keeps a database that has not been upgraded
+    readable. city_id is declared without an inline FK so 0085's
+    fk_customer_care_logs_city is the only constraint on the column.
     """
     global _care_table_ensured
     if _care_table_ensured:
@@ -300,6 +305,7 @@ async def _ensure_care_log_table(db: AsyncSession):
                 id              BIGSERIAL PRIMARY KEY,
                 log_number      VARCHAR(60)  UNIQUE NOT NULL,
                 customer_id     BIGINT       REFERENCES customers(id) ON DELETE SET NULL,
+                city_id         BIGINT,
                 issue_type      VARCHAR(60)  NOT NULL DEFAULT 'INQUIRY',
                 subject         VARCHAR(255) NOT NULL,
                 description     TEXT         NOT NULL,

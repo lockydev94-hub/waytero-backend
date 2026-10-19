@@ -9,7 +9,9 @@
 import uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
+    BigInteger,
     Column,
+    ForeignKey,
     String,
     Boolean,
     DateTime,
@@ -63,6 +65,17 @@ class User(Base):
         default=UserStatus.ACTIVE,
         server_default="ACTIVE",
     )
+
+    # --- Branch (migration 0085)
+    # NULL means "no branch": SUPER_ADMIN (who sees every branch) and the
+    # customer / partner / driver accounts, which are scoped by their own
+    # account rather than by an office. The DB CHECK
+    # ck_users_branch_membership keeps a staff account off that NULL, so the
+    # scope layer never has to guess whether a NULL branch is a bug or a super
+    # admin. No relationship here on purpose: get_current_user already has the
+    # row and joins to branches itself, and a lazy-loaded relationship would
+    # raise MissingGreenlet in the async path.
+    branch_id = Column(BigInteger, ForeignKey("branches.id"), nullable=True)
 
     # --- Security Flags
     is_mobile_verified = Column(Boolean, default=False, nullable=False)
@@ -121,6 +134,7 @@ class User(Base):
         Index("idx_users_status", "status"),
         Index("idx_users_created_at", "created_at"),
         Index("idx_users_user_type", "user_type"),
+        Index("idx_users_branch", "branch_id"),
     )
 
     def __repr__(self):
