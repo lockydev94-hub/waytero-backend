@@ -27,6 +27,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from app.core.timezone import get_platform_tz
+from app.core.branch_scope import BranchScope
+from app.core.exceptions import (
+    BusinessException,
+    PermissionDeniedException,
+    ResourceNotFoundException,
+    ValidationException,
+)
 from app.infrastructure.cache.redis_client import RedisCache, get_redis
 from app.modules.auth.repositories import StaffWorkDailyRepository
 from app.modules.admin.schemas.dashboard import (
@@ -39,6 +46,23 @@ from app.modules.admin.schemas.dashboard import (
 # never served from a cache that is staler than the refresh the client does.
 ACTION_COUNTS_CACHE_KEY = "admin:action_counts"
 ACTION_COUNTS_TTL_SECONDS = 45
+
+# The staff register. SUPER_ADMIN is a row only a super admin may enumerate:
+# it is not a hireable role (StaffUserCreate refuses it) and a manager has no
+# reason to learn how many master accounts exist or which one to probe.
+STAFF_LIST_ROLES = (
+    "ADMIN",
+    "CCO",
+    "VERIFICATION_OFFICER",
+    "FINANCE_MANAGER",
+    "SUPER_ADMIN",
+)
+MANAGER_VISIBLE_ROLES = (
+    "ADMIN",
+    "CCO",
+    "VERIFICATION_OFFICER",
+    "FINANCE_MANAGER",
+)
 
 # (nav key, count query). The keys are the sidebar's, so the client can index
 # the response without a mapping table of its own.
@@ -1163,42 +1187,54 @@ class AdminDashboardService:
         search: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
+        scope: Optional[BranchScope] = None,
     ) -> Dict[str, Any]:
-        """List internal staff members only (excludes CUSTOMER, PARTNER, DRIVER)."""
-        STAFF_ROLES = (
-            "ADMIN",
-            "CCO",
-            "VERIFICATION_OFFICER",
-            "FINANCE_MANAGER",
-            "SUPER_ADMIN",
+        """List internal staff members only (excludes CUSTOMER, PARTNER, DRIVER).
+
+        Two filters the register cannot do without (migration 0085):
+
+          * a branch manager sees their own branch's people, never another
+            office's — `scope` carries that, resolved from the caller's row;
+          * SUPER_ADMIN is not a hireable role and not a row a manager may
+            enumerate, so it leaves the visible set for everyone but a super
+            admin.
+
+        Without a `scope` the caller is unscoped (a super admin browsing all
+        branches) — that is the pre-0085 behaviour, kept for callers that have
+        no branch concept.
+        """
+        visible_roles = (
+            STAFF_LIST_ROLES if scope is None or scope.is_super else MANAGER_VISIBLE_ROLES
         )
-        where_clauses = [
-            f"user_type IN {STAFF_ROLES!r}".replace("(", "(").replace(",)", ")")
-        ]
+        placeholders = ",".join(f"'{r}'" for r in visible_roles)
+        conditions = [f"u.user_type IN ({placeholders})"]
         params: Dict[str, Any] = {"limit": page_size, "offset": (page - 1) * page_size}
 
-        # Build IN clause properly
-        role_placeholders = ",".join(f"'{r}'" for r in STAFF_ROLES)
-        where_clauses = [f"user_type IN ({role_placeholders})"]
-
+        if scope is not None and scope.restricted:
+            conditions.append("u.branch_id = :scope_branch_id")
+            params["scope_branch_id"] = scope.branch_id
         if role:
-            where_clauses.append("user_type = :role")
+            conditions.append("u.user_type = :role")
             params["role"] = role
         if status:
-            where_clauses.append("status = :status")
+            conditions.append("u.status = :status")
             params["status"] = status
         if search:
-            where_clauses.append(
-                "(mobile_number ILIKE :search OR email ILIKE :search OR first_name ILIKE :search OR last_name ILIKE :search)"
+            conditions.append(
+                "(u.mobile_number ILIKE :search OR u.email ILIKE :search"
+                " OR u.first_name ILIKE :search OR u.last_name ILIKE :search)"
             )
             params["search"] = f"%{search}%"
 
-        where_sql = "WHERE " + " AND ".join(where_clauses)
+        where_sql = "WHERE " + " AND ".join(conditions)
+        from_sql = (
+            "FROM users u "
+            "LEFT JOIN branches b ON b.id = u.branch_id "
+            "LEFT JOIN staff_profiles sp ON sp.user_id = u.id"
+        )
 
         count_r = await db.execute(
-            text(
-                f"SELECT COUNT(*) FROM users u LEFT JOIN staff_profiles sp ON sp.user_id = u.id {where_sql.replace('WHERE ', 'WHERE u.').replace(' AND ', ' AND u.')}"
-            ),
+            text(f"SELECT COUNT(*) {from_sql} {where_sql}"),
             params,
         )
         total = count_r.scalar() or 0
@@ -1210,13 +1246,13 @@ class AdminDashboardService:
                     u.id, u.user_code, u.first_name, u.last_name, u.mobile_number,
                     u.email, u.user_type, u.status, u.is_active, u.profile_image_url,
                     u.created_at, u.last_login_at,
+                    u.branch_id, b.name AS branch_name,
                     sp.id AS profile_id,
                     sp.designation, sp.department, sp.joining_date, sp.employee_id,
                     sp.city, sp.state,
                     sp.id_card_status, sp.id_card_generated_at
-                FROM users u
-                LEFT JOIN staff_profiles sp ON sp.user_id = u.id
-                {where_sql.replace('WHERE', 'WHERE u.')}
+                {from_sql}
+                {where_sql}
                 ORDER BY u.created_at DESC
                 LIMIT :limit OFFSET :offset
             """
@@ -1247,18 +1283,29 @@ class AdminDashboardService:
 
     @staticmethod
     async def get_staff_user(
-        db: AsyncSession, user_id: UUID
+        db: AsyncSession, user_id: UUID, scope: Optional[BranchScope] = None
     ) -> Optional[Dict[str, Any]]:
         """Fetch staff user with extended profile joined from staff_profiles.
         Doc Ref: DB 0014_staff_profiles
+
+        A `scope` narrows the read to the caller's branch, and a row outside it
+        comes back None so the route answers 404 — the same shape as "no such
+        staff member", which is the point (see branch_scope rule 3).
         """
+        branch_clause = ""
+        params: Dict[str, Any] = {"user_id": str(user_id)}
+        if scope is not None and scope.restricted:
+            branch_clause = " AND u.branch_id = :scope_branch_id"
+            params["scope_branch_id"] = scope.branch_id
+
         r = await db.execute(
             text(
-                """
+                f"""
                 SELECT
                     u.id, u.user_code, u.first_name, u.last_name, u.mobile_number,
                     u.email, u.user_type, u.status, u.is_active, u.profile_image_url,
                     u.created_at, u.last_login_at,
+                    u.branch_id, b.name AS branch_name,
                     sp.id AS profile_id,
                     sp.date_of_birth, sp.gender, sp.blood_group, sp.personal_email,
                     sp.emergency_contact_name, sp.emergency_contact_phone,
@@ -1271,12 +1318,14 @@ class AdminDashboardService:
                     sp.nominee_name, sp.nominee_relation, sp.nominee_phone, sp.nominee_address,
                     sp.id_card_status, sp.id_card_generated_at, sp.id_card_notes
                 FROM users u
+                LEFT JOIN branches b ON b.id = u.branch_id
                 LEFT JOIN staff_profiles sp ON sp.user_id = u.id
                 WHERE u.id = :user_id
                   AND u.user_type IN ('ADMIN','CCO','VERIFICATION_OFFICER','FINANCE_MANAGER','SUPER_ADMIN')
+                  {branch_clause}
             """
             ),
-            {"user_id": str(user_id)},
+            params,
         )
         row = r.mappings().one_or_none()
         if not row:
@@ -1426,12 +1475,61 @@ class AdminDashboardService:
         db: AsyncSession,
         payload: "StaffUserCreate",
         created_by: Optional[UUID] = None,
+        scope: Optional[BranchScope] = None,
     ) -> Dict[str, Any]:
         """Create an internal staff member account.
         Doc Ref: BRD Part 2 §12 — Password Login for Admin/CCO/Officer
+
+        `scope` decides which office the new account belongs to, and it is not
+        optional any more: `ck_users_branch_membership` (migration 0085) rejects
+        a staff row with no branch, so an insert that skips this decision fails
+        at the database.
+
+        Two owner rulings live here:
+
+          * a branch manager hires for their own branch only — the role list is
+            CCO / Verification Officer / Finance Manager, and the branch is
+            forced, not taken from the body;
+          * creating a branch manager (ADMIN), or filing anyone under a
+            different office, is a super admin act.
+
+        SUPER_ADMIN is unreachable from this function at all: the schema
+        validator refuses it and the branch CHECK would too, since a master
+        account has no office.
         """
         from app.core.security import hash_password
+        from app.core.branch_scope import load_active_branch
         import uuid as _uuid
+
+        if payload.user_type == "SUPER_ADMIN":
+            raise PermissionDeniedException(
+                "A master admin account cannot be created here.",
+                code="SUPER_ADMIN_NOT_CREATABLE",
+            )
+
+        if scope is None:
+            raise ValidationException(
+                "Staff accounts belong to a branch; this caller has no branch "
+                "scope, so there is no office to file them under."
+            )
+        if scope.is_super:
+            if payload.branch_id is None:
+                raise ValidationException(
+                    "Choose the branch this person will work from."
+                )
+            branch_id = (await load_active_branch(db, payload.branch_id)).id
+        else:
+            if payload.user_type == "ADMIN":
+                raise PermissionDeniedException(
+                    "Only a super admin can create a branch manager.",
+                    code="STAFF_ADMIN_CREATION_SUPER_ONLY",
+                )
+            if payload.branch_id not in (None, scope.branch_id):
+                raise PermissionDeniedException(
+                    "You can only hire into your own branch.",
+                    code="STAFF_BRANCH_OUT_OF_SCOPE",
+                )
+            branch_id = scope.branch_id
 
         # Check duplicate email / mobile
         dup = await db.execute(
@@ -1467,12 +1565,12 @@ class AdminDashboardService:
                 """
                 INSERT INTO users (
                     id, user_code, first_name, last_name, mobile_number, email,
-                    password_hash, user_type, status, is_active,
+                    password_hash, user_type, status, is_active, branch_id,
                     is_mobile_verified, is_email_verified,
                     profile_image_url, created_by, created_at, updated_at
                 ) VALUES (
                     :id, :user_code, :first_name, :last_name, :mobile_number, :email,
-                    :password_hash, :user_type, 'ACTIVE', TRUE,
+                    :password_hash, :user_type, 'ACTIVE', TRUE, :branch_id,
                     FALSE, FALSE,
                     :profile_image_url, :created_by, NOW(), NOW()
                 )
@@ -1487,6 +1585,7 @@ class AdminDashboardService:
                 "email": payload.email,
                 "password_hash": password_hash,
                 "user_type": payload.user_type,
+                "branch_id": branch_id,
                 "profile_image_url": payload.profile_image_url,
                 "created_by": str(created_by) if created_by else None,
             },
@@ -1504,11 +1603,98 @@ class AdminDashboardService:
         return await AdminDashboardService.get_staff_user(db, user_id)
 
     @staticmethod
+    async def assert_staff_row(
+        db: AsyncSession,
+        scope: Optional[BranchScope],
+        user_id: UUID,
+        *,
+        for_write: bool = False,
+    ) -> Dict[str, Any]:
+        """The staff row this caller is about to read or write, or the refusal.
+
+        Answers, deliberately different:
+
+          * not a staff row, or another branch's → 404. A 403 would confirm to a
+            Cuttack manager that this id exists and is Bhubaneswar's. (A
+            SUPER_ADMIN row lands here too: its branch is NULL, so it matches no
+            branch — which is also why no manager can demote one.)
+          * writing the ADMIN who heads a branch, by anyone but a super admin →
+            403. Reading one is fine: the branch manager's own account is an
+            ADMIN row, and their list already shows the office's managers.
+          * a super admin, or the caller's own branch → the row.
+
+        Returns the row so a caller that then needs `user_type` (the last-master
+        guard below) does not read it a second time after the UPDATE.
+        """
+        row = (
+            await db.execute(
+                text(
+                    "SELECT u.user_type, u.branch_id "
+                    "FROM users u "
+                    "WHERE u.id = :user_id "
+                    "AND u.user_type IN ('ADMIN','CCO','VERIFICATION_OFFICER',"
+                    "                    'FINANCE_MANAGER','SUPER_ADMIN')"
+                ),
+                {"user_id": str(user_id)},
+            )
+        ).mappings().one_or_none()
+
+        if row is None:
+            raise ResourceNotFoundException("Staff user", user_id)
+        if scope is None:
+            return dict(row)
+
+        if scope.restricted:
+            if row["branch_id"] != scope.branch_id:
+                raise ResourceNotFoundException("Staff user", user_id)
+            is_self = str(user_id) == scope.actor_id
+            if for_write and row["user_type"] == "ADMIN" and not is_self:
+                raise PermissionDeniedException(
+                    "Only a super admin can change a branch manager.",
+                    code="STAFF_ADMIN_ROW_SUPER_ONLY",
+                )
+        return dict(row)
+
+    @staticmethod
+    async def refuse_losing_last_super_admin(
+        db: AsyncSession, row: Dict[str, Any], *, would_end_mastership: bool
+    ) -> None:
+        """Keep at least one account that can assign branches.
+
+        Nothing else can reach this: a branch manager is refused by
+        assert_staff_row_writable, and no route can create a SUPER_ADMIN at all.
+        So the way this platform loses its master admin is an edit that demotes
+        or suspends the only one there is.
+        """
+        if row["user_type"] != "SUPER_ADMIN" or not would_end_mastership:
+            return
+        count = (
+            await db.execute(
+                text(
+                    "SELECT COUNT(*) FROM users "
+                    "WHERE user_type = 'SUPER_ADMIN' AND is_active = TRUE"
+                )
+            )
+        ).scalar() or 0
+        if count <= 1:
+            raise BusinessException(
+                "This is the only master admin account. Another has to exist "
+                "before this one can be demoted or suspended.",
+                code="LAST_SUPER_ADMIN",
+            )
+
+    @staticmethod
     async def update_staff_user(
         db: AsyncSession,
         user_id: UUID,
         payload: "StaffUserUpdate",
+        scope: Optional[BranchScope] = None,
     ) -> Optional[Dict[str, Any]]:
+        # Before anything else: whose row is this, and may this caller touch it?
+        row = await AdminDashboardService.assert_staff_row(
+            db, scope, user_id, for_write=True
+        )
+
         updates = []
         params: Dict[str, Any] = {"user_id": str(user_id)}
 
@@ -1525,8 +1711,27 @@ class AdminDashboardService:
             updates.append("mobile_number = :mobile_number")
             params["mobile_number"] = payload.mobile_number
         if payload.user_type is not None:
+            await AdminDashboardService.refuse_losing_last_super_admin(
+                db, row, would_end_mastership=True
+            )
             updates.append("user_type = :user_type")
             params["user_type"] = payload.user_type
+        if payload.branch_id is not None:
+            # Moving a person between offices is the super admin's act (owner
+            # decision). A manager sending it is refused rather than ignored:
+            # silently dropping a field the caller meant to change is how a UI
+            # ends up believing the save worked.
+            if payload.branch_id != row["branch_id"]:
+                if scope is not None and not scope.is_super:
+                    raise PermissionDeniedException(
+                        "Only a super admin can move someone to another branch.",
+                        code="STAFF_BRANCH_MOVE_SUPER_ONLY",
+                    )
+                from app.core.branch_scope import load_active_branch
+
+                await load_active_branch(db, payload.branch_id)
+                updates.append("branch_id = :branch_id")
+                params["branch_id"] = payload.branch_id
         if payload.profile_image_url is not None:
             updates.append("profile_image_url = :profile_image_url")
             params["profile_image_url"] = payload.profile_image_url
@@ -1541,6 +1746,16 @@ class AdminDashboardService:
             ),
             params,
         )
+
+        branch_moved = "branch_id" in params and params["branch_id"] != row["branch_id"]
+        if branch_moved:
+            # Enforcement never read the branch from the token, so this is not
+            # what makes the move take effect — it is here so a screen full of
+            # the old branch's queues is not still open when they come back.
+            from app.modules.auth.repositories import SessionRepository
+
+            await SessionRepository(db).deactivate_all_user_sessions(user_id)
+
         await db.commit()
 
         # Always upsert profile — even if no profile fields changed, this ensures

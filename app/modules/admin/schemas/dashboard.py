@@ -440,6 +440,11 @@ class AdminActionResponse(BaseModel):
 
 STAFF_ROLES = {"ADMIN", "CCO", "VERIFICATION_OFFICER", "FINANCE_MANAGER"}
 
+# Who a branch manager (ADMIN) may hire. An ADMIN account is the head of a
+# branch, so creating one — or moving anyone between branches — stays with the
+# super admin (owner decision: "manager will be able manage own branch").
+BRANCH_MANAGER_HIRABLE_ROLES = {"CCO", "VERIFICATION_OFFICER", "FINANCE_MANAGER"}
+
 
 # ── Staff Profile (extended fields) ──────────────────────────────────────────
 # Doc Ref: DB 0014_staff_profiles | Employee Lifecycle §13
@@ -550,6 +555,10 @@ class StaffUserCreate(BaseModel):
     user_type: str = Field(
         ..., description="ADMIN | CCO | VERIFICATION_OFFICER | FINANCE_MANAGER"
     )
+    # The office this person answers to. A super admin must state it; a branch
+    # manager gets it forced to their own branch in the service, which is why
+    # this is optional on the wire rather than required by validation.
+    branch_id: Optional[int] = None
     profile_image_url: Optional[str] = None
     # Extended profile — passed inline during creation
     profile: Optional[StaffProfileCreate] = None
@@ -570,6 +579,8 @@ class StaffUserUpdate(BaseModel):
     email: Optional[str] = None
     mobile_number: Optional[str] = Field(None, min_length=10, max_length=20)
     user_type: Optional[str] = None
+    # Setting this to a different branch is a super-admin act (service-enforced).
+    branch_id: Optional[int] = None
     profile_image_url: Optional[str] = None
     profile: Optional[StaffProfileCreate] = None
 
@@ -593,6 +604,10 @@ class StaffUserOut(BaseModel):
     user_type: str
     status: str
     is_active: bool
+    # Which office this account works from. The Users list shows it as a column
+    # because a super admin browsing "All branches" sees everyone at once.
+    branch_id: Optional[int] = None
+    branch_name: Optional[str] = None
     profile_image_url: Optional[str]
     created_at: datetime
     last_login_at: Optional[datetime]

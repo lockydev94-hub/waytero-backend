@@ -65,3 +65,53 @@ def test_the_staff_register_still_answers_for_a_manager(client_staff) -> None:
     response = client_staff.get("/api/v1/admin/staff")
     assert response.status_code == 200
     assert {"items", "total", "page", "page_size"} <= set(response.json())
+
+
+# ── And by which office ───────────────────────────────────────────────────────
+# The gate above says a manager may open the register. Migration 0085 says the
+# register is no longer one list. These run against the developer database, so
+# they assert the relationship between two callers' lists rather than a row count
+# that whoever next seeds the database would break.
+
+REGISTER = "/api/v1/admin/staff"
+
+
+def _ids(client) -> set[str]:
+    return {item["id"] for item in client.get(REGISTER).json()["items"]}
+
+
+def _branches(client) -> set:
+    return {item["branch_id"] for item in client.get(REGISTER).json()["items"]}
+
+
+def test_two_branch_managers_do_not_share_a_register(
+    client_hq_admin, client_cuttack_admin
+) -> None:
+    """The head office has staff, the sub-branch may not have any yet — but neither
+    may appear in the other's list, and that holds whatever rows exist."""
+    assert _branches(client_hq_admin) == {1} or _branches(client_hq_admin) == set()
+    assert _branches(client_cuttack_admin) <= {2}
+    assert _ids(client_hq_admin) & _ids(client_cuttack_admin) == set()
+
+
+def test_a_manager_cannot_read_another_branches_staff_row(
+    client_hq_admin, client_cuttack_admin
+) -> None:
+    """404, not 403: the answer a Cuttack manager gets for a Bhubaneswar id has to
+    be the answer they get for an id that was never issued."""
+    hq_only = _ids(client_hq_admin) - _ids(client_cuttack_admin)
+    if not hq_only:
+        pytest.skip("the head office has no staff row to reach across to")
+
+    assert client_cuttack_admin.get(f"{REGISTER}/{hq_only.pop()}").status_code == 404
+
+
+def test_the_master_admin_is_not_a_row_a_manager_enumerates(
+    client_hq_admin, client_super_admin
+) -> None:
+    """SUPER_ADMIN has no branch, so it drops out of every branch list — and the
+    service hides it from non-supers even when a branch could match it. This is
+    the one test that needs the developer database to hold a master account, which
+    it does: nothing works without one."""
+    invisible = _ids(client_super_admin) - _ids(client_hq_admin)
+    assert invisible, "a super admin's own register should show at least the master account"

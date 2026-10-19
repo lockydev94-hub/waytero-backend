@@ -194,7 +194,14 @@ def scope_header_branch_id(request: Request) -> Optional[int]:
         )
 
 
-async def _load_branch(db: AsyncSession, branch_id: int) -> Branch:
+async def load_active_branch(db: AsyncSession, branch_id: int) -> Branch:
+    """The branch row, or the failure that goes with not having one.
+
+    Public because assigning a person to an office needs the same two answers
+    as the super admin's switcher: no such branch (404) and a closed one (403).
+    A staff route that skipped this would happily file a new hire under an
+    office that no longer exists.
+    """
     branch = await db.get(Branch, branch_id)
     if branch is None:
         raise ResourceNotFoundException("Branch", branch_id)
@@ -256,7 +263,7 @@ async def _scope_for_super(
             cities=frozenset(),
             include_unassigned=True,
         )
-    branch = await _load_branch(db, filter_branch_id)
+    branch = await load_active_branch(db, filter_branch_id)
     return BranchScope(
         actor_id=str(current_user.get("sub")),
         user_type=user_type,

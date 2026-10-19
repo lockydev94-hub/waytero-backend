@@ -35,6 +35,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
+from app.core.branch_scope import BranchScope, get_branch_scope
 from app.core.dependencies import require_admin, require_roles
 from app.core.exceptions import ValidationException
 from app.modules.admin.services.dashboard import AdminDashboardService
@@ -1871,6 +1872,33 @@ def _uuid_to_int(value: Any) -> Optional[int]:
         return None
 
 
+async def _guard_staff_row(
+    db: AsyncSession,
+    scope: BranchScope,
+    user_id: UUID,
+    *,
+    for_write: bool = True,
+    ends_mastership: bool = False,
+):
+    """Refuse a staff-route action that is not this caller's to take.
+
+    Every `/staff/{user_id}` route takes an id from the path, so every one of
+    them needs this before it touches anything — the list pages filter
+    themselves, but a route that trusts the id has to check the row.
+
+    `ends_mastership` is the suspend/role-change case: losing the last master
+    admin would leave nobody who can assign branches, so it is refused outright.
+    """
+    row = await AdminDashboardService.assert_staff_row(
+        db, scope, user_id, for_write=for_write
+    )
+    if ends_mastership:
+        await AdminDashboardService.refuse_losing_last_super_admin(
+            db, row, would_end_mastership=True
+        )
+    return row
+
+
 @router.get(
     "/audit-logs",
     response_model=AuditLogListResponse,
@@ -1967,9 +1995,16 @@ async def list_staff(
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     result = await AdminDashboardService.list_staff_users(
-        db, role=role, status=status, search=search, page=page, page_size=page_size
+        db,
+        role=role,
+        status=status,
+        search=search,
+        page=page,
+        page_size=page_size,
+        scope=scope,
     )
     items = [StaffUserOut.model_validate(i) for i in result["items"]]
     return StaffUserListResponse(
@@ -1997,9 +2032,15 @@ async def create_staff(
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     try:
-        user = await AdminDashboardService.create_staff_user(db, payload)
+        user = await AdminDashboardService.create_staff_user(
+            db,
+            payload,
+            created_by=UUID(current_user["sub"]),
+            scope=scope,
+        )
     except ValueError as e:
         raise HTTPException(status_code=409, detail=str(e))
     if not user:
@@ -2036,8 +2077,9 @@ async def get_staff(
     user_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
-    user = await AdminDashboardService.get_staff_user(db, user_id)
+    user = await AdminDashboardService.get_staff_user(db, user_id, scope)
     if not user:
         raise HTTPException(status_code=404, detail="Staff user not found")
     return StaffUserOut.model_validate(user)
@@ -2054,8 +2096,9 @@ async def update_staff(
     payload: StaffUserUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
-    user = await AdminDashboardService.update_staff_user(db, user_id, payload)
+    user = await AdminDashboardService.update_staff_user(db, user_id, payload, scope)
     if not user:
         raise HTTPException(status_code=404, detail="Staff user not found")
     return StaffUserOut.model_validate(user)
@@ -2072,7 +2115,9 @@ async def activate_staff(
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    await _guard_staff_row(db, scope, user_id)
     ok = await AdminDashboardService.set_user_status(
         db, user_id, is_active=True, status="ACTIVE"
     )
@@ -2105,7 +2150,11 @@ async def suspend_staff(
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    # Suspending the only master admin would leave nobody who can assign a
+    # branch, so the guard runs before the write, not after.
+    await _guard_staff_row(db, scope, user_id, ends_mastership=True)
     ok = await AdminDashboardService.set_user_status(
         db, user_id, is_active=False, status="SUSPENDED"
     )
@@ -2140,7 +2189,9 @@ async def reset_staff_password(
     request: Request,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    await _guard_staff_row(db, scope, user_id)
     ok = await AdminDashboardService.reset_staff_password(
         db, user_id, payload.new_password
     )
@@ -2179,7 +2230,9 @@ async def generate_staff_id_card(
     payload: StaffIdCardGenerateRequest,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    await _guard_staff_row(db, scope, user_id)
     user = await AdminDashboardService.generate_staff_id_card(
         db, user_id, notes=payload.notes
     )
@@ -2207,14 +2260,16 @@ async def upsert_staff_profile(
     payload: StaffProfileCreate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
-    user = await AdminDashboardService.get_staff_user(db, user_id)
+    await _guard_staff_row(db, scope, user_id)
+    user = await AdminDashboardService.get_staff_user(db, user_id, scope)
     if not user:
         raise HTTPException(status_code=404, detail="Staff user not found")
     await AdminDashboardService._upsert_staff_profile(db, user_id, payload)
     await db.commit()
     return StaffUserOut.model_validate(
-        await AdminDashboardService.get_staff_user(db, user_id)
+        await AdminDashboardService.get_staff_user(db, user_id, scope)
     )
 
 
@@ -2320,14 +2375,16 @@ async def upload_staff_photo(
     file: UploadFile = File(..., description="Profile photo (JPG/PNG/WebP, max 5 MB)"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
-    user = await AdminDashboardService.get_staff_user(db, user_id)
+    user = await AdminDashboardService.get_staff_user(db, user_id, scope)
     if not user:
         raise HTTPException(status_code=404, detail="Staff user not found")
 
     content = await file.read()
     if len(content) > 5 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="Photo too large — maximum 5 MB.")
+
 
     cloud_name, api_key, api_secret = await _get_cloudinary_creds(db)
 
@@ -2354,7 +2411,7 @@ async def upload_staff_photo(
     )
     await db.commit()
 
-    updated = await AdminDashboardService.get_staff_user(db, user_id)
+    updated = await AdminDashboardService.get_staff_user(db, user_id, scope)
     return StaffUserOut.model_validate(updated)
 
 
@@ -2392,10 +2449,11 @@ async def upload_staff_document(
     notes: str | None = Form(None, description="Optional notes"),
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     import uuid as _uuid
 
-    user = await AdminDashboardService.get_staff_user(db, user_id)
+    user = await AdminDashboardService.get_staff_user(db, user_id, scope)
     if not user:
         raise HTTPException(status_code=404, detail="Staff user not found")
 
@@ -2504,7 +2562,11 @@ async def list_staff_documents(
     user_id: UUID,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_admin()),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    # This route reaches staff_documents by raw SQL, so nothing else would have
+    # asked whose staff member this is.
+    await _guard_staff_row(db, scope, user_id, for_write=False)
     res = await db.execute(
         _text(f"SELECT id FROM staff_profiles WHERE user_id = '{user_id}'")
     )

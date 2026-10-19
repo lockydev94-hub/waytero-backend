@@ -265,11 +265,15 @@ def _branch_payload(
     }
 
 
+# These ids are migration 0085's bootstrap rows, not invented ones: branch 1 is
+# the Bhubaneswar head office (cities.id 5) and branch 2 is Cuttack (cities.id 3).
+# A test that filters on a branch and then reads the dev database has to name the
+# same offices the database does, or the assertion proves nothing.
 HQ_BRANCH = _branch_payload(
-    branch_id=1, city_id=1, name="Bhubaneswar", code="BBS", is_headquarters=True
+    branch_id=1, city_id=5, name="Bhubaneswar", code="BBS", is_headquarters=True
 )
 CUTTACK_BRANCH = _branch_payload(
-    branch_id=2, city_id=2, name="Cuttack", code="CTK", is_headquarters=False
+    branch_id=2, city_id=3, name="Cuttack", code="CTK", is_headquarters=False
 )
 
 
@@ -386,6 +390,12 @@ def client_verification_officer() -> Iterator[TestClient]:
 def client_hq_admin() -> Iterator[TestClient]:
     """ADMIN of the head office — its own city plus everything unassigned."""
     yield from _make_client(["ADMIN"], branch=HQ_BRANCH)
+
+
+@pytest.fixture
+def client_cuttack_admin() -> Iterator[TestClient]:
+    """ADMIN of the Cuttack sub-branch — the manager role, off the head office."""
+    yield from _make_client(["ADMIN"], branch=CUTTACK_BRANCH)
 
 
 @pytest.fixture
