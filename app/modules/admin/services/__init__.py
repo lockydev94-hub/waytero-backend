@@ -14,7 +14,7 @@ from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update as sa_update
 
-from app.core.exceptions import ValidationException
+from app.core.exceptions import PermissionDeniedException, ValidationException
 from app.modules.admin.models import (
     SystemConfiguration,
     AppVersion,
@@ -72,6 +72,24 @@ from app.shared.utilities.seo import ensure_slug_unique, unique_slug
 
 class SystemConfigService:
 
+    # Keys the admin session policy reads: idle-lock default, forced-logout
+    # hour, MPIN strength and lockout. /admin/settings is gated ALL_STAFF, so
+    # without this a CCO could move the hour everyone gets logged out at or
+    # weaken the MPIN rule — those belong to the super admin alone.
+    SUPER_ADMIN_ONLY_PREFIX = "ADMIN_"
+
+    @staticmethod
+    def _reject_admin_policy_write(key: str, current_user: Optional[dict]) -> None:
+        if not key.startswith(SystemConfigService.SUPER_ADMIN_ONLY_PREFIX):
+            return
+        user = current_user or {}
+        roles = user.get("roles") or [user.get("role", "")]
+        if "SUPER_ADMIN" not in roles:
+            raise PermissionDeniedException(
+                f"'{key}' is an admin session-policy key and can only be "
+                "changed by a super admin"
+            )
+
     @staticmethod
     async def list_all(db: AsyncSession) -> List[SystemConfiguration]:
         result = await db.execute(
@@ -88,8 +106,12 @@ class SystemConfigService:
 
     @staticmethod
     async def upsert(
-        db: AsyncSession, key: str, payload: SystemConfigUpdate
+        db: AsyncSession,
+        key: str,
+        payload: SystemConfigUpdate,
+        current_user: Optional[dict] = None,
     ) -> SystemConfiguration:
+        SystemConfigService._reject_admin_policy_write(key, current_user)
         result = await db.execute(
             select(SystemConfiguration).where(SystemConfiguration.config_key == key)
         )
@@ -112,7 +134,12 @@ class SystemConfigService:
         return cfg
 
     @staticmethod
-    async def delete(db: AsyncSession, key: str) -> bool:
+    async def delete(
+        db: AsyncSession,
+        key: str,
+        current_user: Optional[dict] = None,
+    ) -> bool:
+        SystemConfigService._reject_admin_policy_write(key, current_user)
         result = await db.execute(
             select(SystemConfiguration).where(SystemConfiguration.config_key == key)
         )

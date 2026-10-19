@@ -21,7 +21,7 @@ from sqlalchemy import select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.core.dependencies import require_roles
+from app.core.dependencies import get_current_user, require_roles
 from app.modules.admin.models import ApiIntegration
 from app.modules.admin.schemas import (
     SystemConfigOut,
@@ -126,10 +126,17 @@ async def get_configuration(key: str, db: AsyncSession = Depends(get_db)):
     tags=["Settings – System Config"],
 )
 async def upsert_configuration(
-    key: str, payload: SystemConfigUpdate, db: AsyncSession = Depends(get_db)
+    key: str,
+    payload: SystemConfigUpdate,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
 ):
-    """Create or update a configuration key."""
-    return await SystemConfigService.upsert(db, key, payload)
+    """Create or update a configuration key.
+
+    ADMIN_* keys are session policy and rejected for non-super-admins inside
+    the service — this router is gated ALL_STAFF, which is not enough for them.
+    """
+    return await SystemConfigService.upsert(db, key, payload, current_user)
 
 
 @router.delete(
@@ -137,8 +144,12 @@ async def upsert_configuration(
     response_model=SettingsResponse,
     tags=["Settings – System Config"],
 )
-async def delete_configuration(key: str, db: AsyncSession = Depends(get_db)):
-    deleted = await SystemConfigService.delete(db, key)
+async def delete_configuration(
+    key: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    deleted = await SystemConfigService.delete(db, key, current_user)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Config key '{key}' not found")
     return SettingsResponse(message=f"Config key '{key}' deleted")

@@ -6,6 +6,7 @@ from app.modules.auth.models.role_permission import RolePermission
 from app.modules.auth.models.user import User
 from app.modules.auth.models.user_role import UserRole
 from app.modules.auth.models.user_session import UserSession
+from app.modules.auth.models.staff_work_daily import StaffWorkDaily
 
 __all__ = [
     "Permission",
@@ -14,4 +15,5 @@ __all__ = [
     "User",
     "UserRole",
     "UserSession",
+    "StaffWorkDaily",
 ]

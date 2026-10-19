@@ -71,6 +71,18 @@ class User(Base):
     failed_login_attempts = Column(Integer, default=0, nullable=False)
     locked_until = Column(DateTime(timezone=True), nullable=True)
 
+    # --- Screen-lock MPIN (Admin Portal §39, migration 0084)
+    # Separate counter/deadline from the pair above on purpose: User.is_locked
+    # reads locked_until, so sharing it would let MPIN typos lock the password
+    # login and leave the admin with no way back in.
+    mpin_hash = Column(Text, nullable=True)
+    mpin_failed_attempts = Column(
+        Integer, default=0, nullable=False, server_default="0"
+    )
+    mpin_locked_until = Column(DateTime(timezone=True), nullable=True)
+    # NULL = inherit ADMIN_IDLE_DEFAULT_MINUTES; a staff choice is always shorter.
+    idle_lock_minutes = Column(Integer, nullable=True)
+
     # --- Force password change on next login (partner default password flow)
     # Doc Ref: Partner Portal — first-login must-change-password requirement
     force_password_change = Column(
@@ -119,6 +131,16 @@ class User(Base):
         if self.locked_until is None:
             return False
         return datetime.now(timezone.utc) < self.locked_until
+
+    @property
+    def has_mpin(self) -> bool:
+        return self.mpin_hash is not None
+
+    @property
+    def is_mpin_locked(self) -> bool:
+        if self.mpin_locked_until is None:
+            return False
+        return datetime.now(timezone.utc) < self.mpin_locked_until
 
     @property
     def full_name(self) -> str:
