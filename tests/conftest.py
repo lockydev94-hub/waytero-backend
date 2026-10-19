@@ -22,6 +22,7 @@ from app.modules.auth.schemas import (
     LoginResponse,
     OTPSentResponse,
     RefreshResponse,
+    SessionConfigResponse,
 )
 
 
@@ -33,6 +34,10 @@ class StubOTPService:
 class StubAuthService:
     def __init__(self) -> None:
         self.user_id = uuid4()
+        # Session-policy state the /auth/admin/* routes mutate, so the API tests
+        # can assert a flow instead of a canned reply.
+        self.mpin_set = False
+        self.idle_lock_minutes: int | None = None
 
     def _login_response(
         self, user_type: str, session_id: UUID | None = None
@@ -117,6 +122,42 @@ class StubAuthService:
 
     async def get_profile(self, user_id: UUID) -> AuthUserResponse:
         return self._login_response("PARTNER", session_id=uuid4()).user
+
+    # ── Admin session policy (Admin Portal §39, migration 0084) ──
+    # Kept in step with AuthService so the /auth/admin/* routes stay testable.
+
+    async def get_session_config(self, user_id: UUID) -> SessionConfigResponse:
+        return SessionConfigResponse(
+            has_mpin=self.mpin_set,
+            idle_minutes=self.idle_lock_minutes or 5,
+            idle_lock_minutes=self.idle_lock_minutes,
+            idle_default_minutes=5,
+            daily_logout_hour=23,
+            timezone="Asia/Kolkata",
+            server_now=datetime.now(timezone.utc),
+            mpin_locked_until=None,
+            mpin_attempts_remaining=5,
+            mpin_min_length=6,
+            access_token_expires_in=900,
+        )
+
+    async def set_mpin(self, **_: object) -> None:
+        self.mpin_set = True
+
+    async def change_mpin(self, **_: object) -> None:
+        self.mpin_set = True
+
+    async def verify_mpin(self, *, user_id: UUID, mpin: str) -> None:
+        return None
+
+    async def remove_mpin(self, **_: object) -> None:
+        self.mpin_set = False
+
+    async def set_idle_lock_minutes(
+        self, user_id: UUID, idle_lock_minutes: int | None
+    ) -> int:
+        self.idle_lock_minutes = idle_lock_minutes
+        return idle_lock_minutes or 5
 
 
 @pytest.fixture(autouse=True)

@@ -72,3 +72,49 @@ DEFAULT_ROLE_CODE_BY_USER_TYPE = {
     "ADMIN": "ADMIN",
     "SUPER_ADMIN": "SUPER_ADMIN",
 }
+
+# ── Admin dashboard session policy ────────────────────────────────────────────
+# Doc: Admin Portal §39 Security — idle lock, daily forced logout, MPIN unlock.
+# Migration: 0084.
+
+# Who signs in to the admin portal. The MPIN and idle columns live on the
+# shared `users` row, so the endpoints must reject CUSTOMER / PARTNER / DRIVER
+# explicitly rather than assume the route name is a gate.
+STAFF_USER_TYPES = (
+    "SUPER_ADMIN",
+    "ADMIN",
+    "CCO",
+    "FINANCE_MANAGER",
+    "VERIFICATION_OFFICER",
+)
+
+CONFIG_ADMIN_IDLE_DEFAULT_MINUTES = "ADMIN_IDLE_DEFAULT_MINUTES"
+CONFIG_ADMIN_DAILY_LOGOUT_HOUR = "ADMIN_DAILY_LOGOUT_HOUR"
+CONFIG_ADMIN_MPIN_MIN_LENGTH = "ADMIN_MPIN_MIN_LENGTH"
+CONFIG_ADMIN_MPIN_MAX_ATTEMPTS = "ADMIN_MPIN_MAX_ATTEMPTS"
+CONFIG_ADMIN_MPIN_LOCKOUT_MINUTES = "ADMIN_MPIN_LOCKOUT_MINUTES"
+
+# Code-side fallbacks for when a configuration row is missing (fresh database,
+# or a seed deleted from /settings). They match what 0084 seeds.
+MPIN_MIN_LENGTH_DEFAULT = 6
+MPIN_MAX_LENGTH = 12
+MPIN_MAX_ATTEMPTS_DEFAULT = 5
+MPIN_LOCKOUT_MINUTES_DEFAULT = 15
+IDLE_LOCK_MINUTES_DEFAULT = 5
+DAILY_LOGOUT_HOUR_DEFAULT = 23
+
+# The same range the users.idle_lock_minutes CHECK enforces — an admin may make
+# the screen lock sooner, never later.
+IDLE_LOCK_MINUTES_MIN = 1
+IDLE_LOCK_MINUTES_MAX = 240
+# A day is 24 hours; the heartbeat clamp keeps one report from exceeding it.
+HEARTBEAT_MAX_SECONDS = 60
+DAILY_LOGOUT_HOUR_MIN = 0
+DAILY_LOGOUT_HOUR_MAX = 23
+
+AUTH_EVENT_MPIN_SET = "MPIN_SET"
+AUTH_EVENT_MPIN_CHANGED = "MPIN_CHANGED"
+AUTH_EVENT_MPIN_VERIFIED = "MPIN_VERIFIED"
+AUTH_EVENT_MPIN_FAILED = "MPIN_FAILED"
+AUTH_EVENT_MPIN_LOCKED = "MPIN_LOCKED"
+AUTH_EVENT_MPIN_REMOVED = "MPIN_REMOVED"

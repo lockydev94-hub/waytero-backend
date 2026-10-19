@@ -10,13 +10,16 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import settings
 from app.core.exceptions import (
     AuthenticationException,
     BusinessException,
+    PermissionDeniedException,
     ResourceNotFoundException,
+    ValidationException,
 )
 from app.core.logging import get_logger
 from app.core.security import (
@@ -29,6 +32,7 @@ from app.core.security import (
     needs_rehash,
     verify_password,
 )
+from app.core.timezone import get_platform_tz_name
 from app.infrastructure.cache.redis_client import RedisCache
 from app.infrastructure.push import (
     FirebaseAuthUnavailableError,
@@ -38,6 +42,12 @@ from app.infrastructure.push import (
 from app.modules.auth.constants import (
     AUTH_EVENT_ACCOUNT_LOCKED,
     AUTH_EVENT_LOGIN_SUCCESS,
+    AUTH_EVENT_MPIN_CHANGED,
+    AUTH_EVENT_MPIN_FAILED,
+    AUTH_EVENT_MPIN_LOCKED,
+    AUTH_EVENT_MPIN_REMOVED,
+    AUTH_EVENT_MPIN_SET,
+    AUTH_EVENT_MPIN_VERIFIED,
     AUTH_EVENT_PASSWORD_CHANGED,
     AUTH_EVENT_TOKEN_REFRESHED,
     LOGIN_LOCK_MINUTES,
@@ -64,6 +74,22 @@ from app.modules.auth.constants import (
     REDIS_REFRESH_RATE_KEY,
     REFRESH_RATE_LIMIT_COUNT,
     REFRESH_RATE_LIMIT_WINDOW_SECONDS,
+    # Admin session policy (migration 0084)
+    CONFIG_ADMIN_DAILY_LOGOUT_HOUR,
+    CONFIG_ADMIN_IDLE_DEFAULT_MINUTES,
+    CONFIG_ADMIN_MPIN_LOCKOUT_MINUTES,
+    CONFIG_ADMIN_MPIN_MAX_ATTEMPTS,
+    CONFIG_ADMIN_MPIN_MIN_LENGTH,
+    DAILY_LOGOUT_HOUR_DEFAULT,
+    DAILY_LOGOUT_HOUR_MAX,
+    DAILY_LOGOUT_HOUR_MIN,
+    IDLE_LOCK_MINUTES_DEFAULT,
+    IDLE_LOCK_MINUTES_MAX,
+    IDLE_LOCK_MINUTES_MIN,
+    MPIN_LOCKOUT_MINUTES_DEFAULT,
+    MPIN_MAX_ATTEMPTS_DEFAULT,
+    MPIN_MIN_LENGTH_DEFAULT,
+    STAFF_USER_TYPES,
 )
 from app.modules.auth.models.user import User
 from app.modules.auth.repositories import (
@@ -76,6 +102,7 @@ from app.modules.auth.schemas import (
     LoginResponse,
     OTPSentResponse,
     RefreshResponse,
+    SessionConfigResponse,
     TokenResponse,
 )
 from app.shared.enums.user_types import UserType, UserStatus
@@ -1228,6 +1255,11 @@ class AuthService:
             is_mobile_verified=user.is_mobile_verified,
             is_email_verified=user.is_email_verified,
             must_change_password=getattr(user, "force_password_change", False),
+            # No PIN means the shell can only log the admin out on idle, so the
+            # profile asks for one. Staff-only: a customer has no dashboard.
+            must_set_mpin=(
+                user.user_type.value in STAFF_USER_TYPES and user.mpin_hash is None
+            ),
             partner_id=partner_id,
         )
 
@@ -1320,3 +1352,315 @@ class AuthService:
         except Exception:
             pass  # Non-fatal — endpoints can still resolve it via DB when needed
         return None
+
+    # ── Admin session policy: unlock PIN + idle lock ───────────────────────────
+    # Doc Ref: Admin Portal §39 Security; migration 0084.
+    #
+    # The dashboard no longer logs an idle admin out — it locks behind a PIN, so
+    # a half-filled booking form survives a phone call. Tokens deliberately stay
+    # alive through the lock; the freeze happens in the client (and the PIN is
+    # checked against this DB row, not against the JWT).
+
+    POLICY_CONFIG_KEYS = (
+        CONFIG_ADMIN_IDLE_DEFAULT_MINUTES,
+        CONFIG_ADMIN_DAILY_LOGOUT_HOUR,
+        CONFIG_ADMIN_MPIN_MIN_LENGTH,
+        CONFIG_ADMIN_MPIN_MAX_ATTEMPTS,
+        CONFIG_ADMIN_MPIN_LOCKOUT_MINUTES,
+    )
+
+    async def _staff_user(self, user_id: UUID) -> User:
+        """Load a signed-in admin-portal user.
+
+        mpin_hash and idle_lock_minutes sit on the shared `users` row, so these
+        routes check the user type themselves — the /auth/admin/* prefix is a
+        URL, not a gate, and a CUSTOMER token must not reach them.
+        """
+        user = await self.user_repo.get_by_id(user_id)
+        if not user:
+            raise ResourceNotFoundException("User", user_id)
+        if user.user_type.value not in STAFF_USER_TYPES:
+            raise PermissionDeniedException(
+                "The dashboard unlock PIN is only available to admin staff."
+            )
+        return user
+
+    async def _admin_policy(self) -> dict:
+        """Read the five ADMIN_* configuration rows in one query.
+
+        A missing or unparseable row falls back to the 0084 seed value, and any
+        value is clamped into its safe range: a hand-edited row can make the
+        lock stricter, never switch it off.
+        """
+        rows = (
+            await self.db.execute(
+                text(
+                    "SELECT config_key, config_value FROM system_configurations "
+                    "WHERE config_key = ANY(:keys)"
+                ),
+                {"keys": list(self.POLICY_CONFIG_KEYS)},
+            )
+        ).all()
+        raw = dict(rows)
+
+        def as_int(key: str, fallback: int, low: int, high: int) -> int:
+            try:
+                value = int(str(raw[key]).strip())
+            except (KeyError, TypeError, ValueError):
+                return fallback
+            return max(low, min(high, value))
+
+        return {
+            "idle_default_minutes": as_int(
+                CONFIG_ADMIN_IDLE_DEFAULT_MINUTES,
+                IDLE_LOCK_MINUTES_DEFAULT,
+                IDLE_LOCK_MINUTES_MIN,
+                IDLE_LOCK_MINUTES_MAX,
+            ),
+            "daily_logout_hour": as_int(
+                CONFIG_ADMIN_DAILY_LOGOUT_HOUR,
+                DAILY_LOGOUT_HOUR_DEFAULT,
+                DAILY_LOGOUT_HOUR_MIN,
+                DAILY_LOGOUT_HOUR_MAX,
+            ),
+            "mpin_min_length": as_int(CONFIG_ADMIN_MPIN_MIN_LENGTH, MPIN_MIN_LENGTH_DEFAULT, 4, 12),
+            "mpin_max_attempts": as_int(CONFIG_ADMIN_MPIN_MAX_ATTEMPTS, MPIN_MAX_ATTEMPTS_DEFAULT, 1, 10),
+            "mpin_lockout_minutes": as_int(
+                CONFIG_ADMIN_MPIN_LOCKOUT_MINUTES, MPIN_LOCKOUT_MINUTES_DEFAULT, 1, 240
+            ),
+        }
+
+    @staticmethod
+    def _validate_mpin_length(mpin: str, min_length: int) -> None:
+        if len(mpin) < min_length:
+            raise ValidationException(
+                message=f"Unlock PIN must be at least {min_length} digits.",
+                code="MPIN_TOO_SHORT",
+            )
+
+    async def _confirm_password(self, user: User, current_password: Optional[str]) -> None:
+        """Password re-entry for any change that touches the gate itself.
+
+        Without it, a hijacked live session token could install, rotate or strip
+        the PIN that locks the real admin out. Success also clears an MPIN
+        lockout — re-proving the password is the only way back in before the
+        lockout window expires.
+        """
+        if not user.password_hash:
+            raise BusinessException(
+                message="This account signs in with an OTP, so confirm the unlock PIN instead.",
+                code="PASSWORD_NOT_SET",
+            )
+        if not current_password or not verify_password(
+            current_password, user.password_hash
+        ):
+            raise AuthenticationException(
+                message="Password confirmation is required.",
+                code="WRONG_PASSWORD",
+            )
+        user.mpin_failed_attempts = 0
+        user.mpin_locked_until = None
+
+    def _require_unlockable(self, user: User) -> None:
+        """Guard the PIN paths: set, and not currently in a lockout window."""
+        if user.mpin_hash is None:
+            raise BusinessException(
+                message="No unlock PIN is set for this account.",
+                code="MPIN_NOT_SET",
+            )
+        if user.mpin_locked_until is None:
+            return
+        if user.is_mpin_locked:
+            raise self._lockout_error(user)
+        # Window expired — start the next five attempts fresh.
+        user.mpin_locked_until = None
+        user.mpin_failed_attempts = 0
+
+    @staticmethod
+    def _lockout_error(user: User) -> BusinessException:
+        return BusinessException(
+            message=(
+                "Too many incorrect PIN attempts. Wait for the lock to pass, "
+                "or confirm your password."
+            ),
+            code="MPIN_LOCKED",
+            details={"locked_until": user.mpin_locked_until.isoformat()},
+        )
+
+    async def _check_mpin(
+        self, user: User, mpin: Optional[str], max_attempts: int, lockout_minutes: int
+    ) -> None:
+        """Verify a submitted PIN, counting failures against the lockout."""
+        if not mpin:
+            raise ValidationException(
+                message="Enter the current unlock PIN.", code="MPIN_REQUIRED"
+            )
+        if verify_password(mpin, user.mpin_hash):
+            user.mpin_failed_attempts = 0
+            user.mpin_locked_until = None
+            return
+
+        logger.warning(AUTH_EVENT_MPIN_FAILED, user_id=str(user.id))
+        remaining = max(0, max_attempts - (user.mpin_failed_attempts + 1))
+        if remaining:
+            user.mpin_failed_attempts += 1
+            await self.db.flush()
+            raise BusinessException(
+                message="Unlock PIN is incorrect.",
+                code="MPIN_INVALID",
+                details={"attempts_remaining": remaining},
+            )
+
+        # The attempt that trips the lock answers "locked", not "wrong, 0 left":
+        # what the admin needs next is the wait time, and the password re-entry
+        # that ends it early.
+        user.mpin_failed_attempts = max_attempts
+        user.mpin_locked_until = datetime.now(timezone.utc) + timedelta(
+            minutes=lockout_minutes
+        )
+        await self.db.flush()
+        logger.warning(AUTH_EVENT_MPIN_LOCKED, user_id=str(user.id))
+        await AuditLogger.log_auth_event(
+            self.db,
+            action_type=AUTH_EVENT_MPIN_LOCKED,
+            user_id=_user_audit_id(user.id),
+        )
+        raise self._lockout_error(user)
+
+    async def get_session_config(self, user_id: UUID) -> SessionConfigResponse:
+        """Everything the admin shell needs about this session, in one call.
+
+        `server_now` is what the client counts the daily-logout hour against, so
+        a wrong laptop clock cannot skip the forced logout.
+        """
+        user = await self._staff_user(user_id)
+        policy = await self._admin_policy()
+        has_mpin = user.mpin_hash is not None
+        return SessionConfigResponse(
+            has_mpin=has_mpin,
+            idle_minutes=user.idle_lock_minutes or policy["idle_default_minutes"],
+            idle_lock_minutes=user.idle_lock_minutes,
+            idle_default_minutes=policy["idle_default_minutes"],
+            daily_logout_hour=policy["daily_logout_hour"],
+            timezone=await get_platform_tz_name(self.db),
+            server_now=datetime.now(timezone.utc),
+            mpin_locked_until=user.mpin_locked_until if user.is_mpin_locked else None,
+            mpin_attempts_remaining=(
+                max(0, policy["mpin_max_attempts"] - user.mpin_failed_attempts)
+                if has_mpin
+                else None
+            ),
+            mpin_min_length=policy["mpin_min_length"],
+            access_token_expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        )
+
+    async def set_mpin(
+        self, user_id: UUID, mpin: str, current_password: Optional[str]
+    ) -> None:
+        user = await self._staff_user(user_id)
+        policy = await self._admin_policy()
+        if user.mpin_hash is not None:
+            raise BusinessException(
+                message="An unlock PIN is already set — change or remove it instead.",
+                code="MPIN_ALREADY_SET",
+            )
+        await self._confirm_password(user, current_password)
+        self._validate_mpin_length(mpin, policy["mpin_min_length"])
+        user.mpin_hash = hash_password(mpin)
+        await self.db.flush()
+        logger.info(AUTH_EVENT_MPIN_SET, user_id=str(user_id))
+        await AuditLogger.log_auth_event(
+            self.db,
+            action_type=AUTH_EVENT_MPIN_SET,
+            user_id=_user_audit_id(user_id),
+        )
+
+    async def change_mpin(
+        self, user_id: UUID, current_mpin: Optional[str], new_mpin: str
+    ) -> None:
+        user = await self._staff_user(user_id)
+        policy = await self._admin_policy()
+        self._require_unlockable(user)
+        await self._check_mpin(
+            user, current_mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"]
+        )
+        self._validate_mpin_length(new_mpin, policy["mpin_min_length"])
+        if new_mpin == current_mpin:
+            raise ValidationException(
+                message="Choose a PIN different from the current one.",
+                code="MPIN_UNCHANGED",
+            )
+        user.mpin_hash = hash_password(new_mpin)
+        await self.db.flush()
+        logger.info(AUTH_EVENT_MPIN_CHANGED, user_id=str(user_id))
+        await AuditLogger.log_auth_event(
+            self.db,
+            action_type=AUTH_EVENT_MPIN_CHANGED,
+            user_id=_user_audit_id(user_id),
+        )
+
+    async def verify_mpin(self, user_id: UUID, mpin: Optional[str]) -> None:
+        """Unlock the dashboard after an idle lock. Never issues tokens."""
+        user = await self._staff_user(user_id)
+        policy = await self._admin_policy()
+        self._require_unlockable(user)
+        await self._check_mpin(user, mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"])
+        logger.info(AUTH_EVENT_MPIN_VERIFIED, user_id=str(user_id))
+
+    async def remove_mpin(
+        self,
+        user_id: UUID,
+        current_password: Optional[str],
+        current_mpin: Optional[str] = None,
+    ) -> None:
+        user = await self._staff_user(user_id)
+        policy = await self._admin_policy()
+        if user.mpin_hash is None:
+            raise BusinessException(
+                message="No unlock PIN is set for this account.",
+                code="MPIN_NOT_SET",
+            )
+        if user.password_hash:
+            await self._confirm_password(user, current_password)
+        else:
+            # An OTP-only admin has no password to re-enter, so the PIN itself is
+            # the only proof available.
+            self._require_unlockable(user)
+            await self._check_mpin(
+            user, current_mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"]
+        )
+        user.mpin_hash = None
+        user.mpin_failed_attempts = 0
+        user.mpin_locked_until = None
+        await self.db.flush()
+        logger.info(AUTH_EVENT_MPIN_REMOVED, user_id=str(user_id))
+        await AuditLogger.log_auth_event(
+            self.db,
+            action_type=AUTH_EVENT_MPIN_REMOVED,
+            user_id=_user_audit_id(user_id),
+        )
+
+    async def set_idle_lock_minutes(
+        self, user_id: UUID, idle_lock_minutes: Optional[int]
+    ) -> int:
+        """Set how soon this admin's screen locks; None inherits the default.
+
+        Reduce-only: an admin may lock their own dashboard sooner than the
+        platform default, never later — otherwise the idle lock becomes opt-out.
+        """
+        user = await self._staff_user(user_id)
+        policy = await self._admin_policy()
+        if idle_lock_minutes is not None and idle_lock_minutes > policy[
+            "idle_default_minutes"
+        ]:
+            raise ValidationException(
+                message=(
+                    f"Your lock time can only be shorter than the platform default "
+                    f"of {policy['idle_default_minutes']} minutes."
+                ),
+                code="IDLE_LOCK_TOO_LONG",
+                details={"idle_default_minutes": policy["idle_default_minutes"]},
+            )
+        user.idle_lock_minutes = idle_lock_minutes
+        await self.db.flush()
+        return idle_lock_minutes or policy["idle_default_minutes"]

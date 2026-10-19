@@ -20,9 +20,14 @@ from app.modules.auth.schemas import (
     ChangePasswordRequest,
     FirebaseSignInRequest,
     ForgotPasswordRequest,
+    IdleLockMinutesRequest,
     LoginResponse,
     LogoutRequest,
     MessageResponse,
+    MpinChangeRequest,
+    MpinRemoveRequest,
+    MpinSetRequest,
+    MpinVerifyRequest,
     OTPSentResponse,
     OTPLoginRequest,
     PartnerLoginRequest,
@@ -32,6 +37,7 @@ from app.modules.auth.schemas import (
     ResetPasswordRequest,
     RevokeSessionRequest,
     SendOTPRequest,
+    SessionConfigResponse,
     SessionsResponse,
     VerifyOTPRequest,
 )
@@ -315,6 +321,148 @@ async def admin_otp_login(
         device_name=body.device_name,
         ip_address=ip_address,
     )
+
+
+# ════════════════════════════════════════════════════════════════
+#  ADMIN DASHBOARD SESSION POLICY — unlock PIN + idle lock
+#  Doc Ref: Admin Portal §39 Security; migration 0084.
+#
+#  The dashboard locks on idle instead of logging the admin out, and the PIN is
+#  checked against the users row, not the JWT. Tokens stay alive through a lock
+#  on purpose (W4 freezes calls in the client); /auth/refresh is allow-listed so
+#  the 15-minute token can still roll over while the screen is locked.
+#  ════════════════════════════════════════════════════════════════
+
+
+@router.get(
+    "/admin/session-config",
+    response_model=SessionConfigResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Session policy for the signed-in admin — idle lock, daily logout hour, PIN state",
+    description=(
+        "One round trip for the whole shell. The client derives the "
+        "forced-logout deadline from `server_now`, never from the laptop clock, "
+        "so a wrong local time cannot skip the daily logout."
+    ),
+)
+async def admin_session_config(
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    return await auth_service.get_session_config(UUID(current_user["sub"]))
+
+
+@router.post(
+    "/admin/mpin/set",
+    status_code=status.HTTP_200_OK,
+    summary="Install the dashboard unlock PIN",
+    description=(
+        "Requires the account password whenever one is set: without re-entry a "
+        "hijacked live session token could install the gate that locks the real "
+        "admin out. Returns the refreshed policy."
+    ),
+)
+async def admin_mpin_set(
+    body: MpinSetRequest,
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    user_id = UUID(current_user["sub"])
+    await auth_service.set_mpin(
+        user_id=user_id, mpin=body.mpin, current_password=body.current_password
+    )
+    return {
+        "success": True,
+        "data": (await auth_service.get_session_config(user_id)).model_dump(mode="json"),
+    }
+
+
+@router.post(
+    "/admin/mpin/change",
+    status_code=status.HTTP_200_OK,
+    summary="Replace the dashboard unlock PIN",
+)
+async def admin_mpin_change(
+    body: MpinChangeRequest,
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    user_id = UUID(current_user["sub"])
+    await auth_service.change_mpin(
+        user_id=user_id, current_mpin=body.current_mpin, new_mpin=body.new_mpin
+    )
+    return {
+        "success": True,
+        "data": (await auth_service.get_session_config(user_id)).model_dump(mode="json"),
+    }
+
+
+@router.post(
+    "/admin/mpin/verify",
+    status_code=status.HTTP_200_OK,
+    summary="Unlock the dashboard after an idle lock",
+    description=(
+        "Five wrong attempts lock the PIN for the configured window; that is "
+        "cleared by password re-entry, not by waiting it out. Issues no tokens — "
+        "the session was never dropped."
+    ),
+)
+async def admin_mpin_verify(
+    body: MpinVerifyRequest,
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    await auth_service.verify_mpin(
+        user_id=UUID(current_user["sub"]), mpin=body.mpin
+    )
+    return {"success": True, "data": {"unlocked": True}}
+
+
+@router.delete(
+    "/admin/mpin",
+    status_code=status.HTTP_200_OK,
+    summary="Remove the dashboard unlock PIN",
+    description=(
+        "Back to the old behaviour: with no PIN the dashboard logs out on idle, "
+        "because there is nothing to unlock with."
+    ),
+)
+async def admin_mpin_remove(
+    body: MpinRemoveRequest,
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    user_id = UUID(current_user["sub"])
+    await auth_service.remove_mpin(
+        user_id=user_id,
+        current_password=body.current_password,
+        current_mpin=body.current_mpin,
+    )
+    return {
+        "success": True,
+        "data": (await auth_service.get_session_config(user_id)).model_dump(mode="json"),
+    }
+
+
+@router.put(
+    "/admin/idle-lock-minutes",
+    status_code=status.HTTP_200_OK,
+    summary="Set how soon this admin's dashboard locks",
+    description=(
+        "Reduce-only against the platform default, so the idle lock is not "
+        "opt-out. Send null to inherit the default again."
+    ),
+)
+async def admin_idle_lock_minutes(
+    body: IdleLockMinutesRequest,
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    user_id = UUID(current_user["sub"])
+    effective = await auth_service.set_idle_lock_minutes(
+        user_id=user_id, idle_lock_minutes=body.idle_lock_minutes
+    )
+    return {"success": True, "data": {"idle_minutes": effective}}
 
 
 @router.post(

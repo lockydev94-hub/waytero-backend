@@ -275,6 +275,126 @@ class PartnerChangeFirstPasswordRequest(BaseModel):
         return v
 
 
+# ── Admin dashboard unlock PIN ────────────────────────────────────────────────
+# Doc: Admin Portal §39 Security — idle lock with MPIN re-entry.
+# Migration: 0084. Static shape lives here; the platform's minimum length is a
+# configuration value, so the service checks that part.
+
+_MPIN_RE = re.compile(r"^\d{6,12}$")
+
+
+def _validate_mpin_shape(value: str) -> str:
+    if not _MPIN_RE.match(value):
+        raise ValueError("Unlock PIN must be 6 to 12 digits")
+    return value
+
+
+class MpinSetRequest(BaseModel):
+    """POST /auth/admin/mpin/set — install the unlock PIN.
+
+    `current_password` is required whenever the account has a password: without
+    re-entry, a hijacked live session token could install the very gate that
+    locks the real admin out.
+    """
+
+    mpin: str
+    confirm_mpin: str
+    current_password: Optional[str] = None
+
+    @field_validator("mpin", "confirm_mpin")
+    @classmethod
+    def validate_mpin(cls, v: str) -> str:
+        return _validate_mpin_shape(v)
+
+    @model_validator(mode="after")
+    def mpins_match(self) -> "MpinSetRequest":
+        if self.mpin != self.confirm_mpin:
+            raise ValueError("PINs do not match")
+        return self
+
+
+class MpinChangeRequest(BaseModel):
+    """POST /auth/admin/mpin/change — replace the unlock PIN."""
+
+    current_mpin: str
+    new_mpin: str
+    confirm_mpin: str
+
+    @field_validator("current_mpin", "new_mpin", "confirm_mpin")
+    @classmethod
+    def validate_mpin(cls, v: str) -> str:
+        return _validate_mpin_shape(v)
+
+    @model_validator(mode="after")
+    def mpins_match(self) -> "MpinChangeRequest":
+        if self.new_mpin != self.confirm_mpin:
+            raise ValueError("PINs do not match")
+        return self
+
+
+class MpinVerifyRequest(BaseModel):
+    """POST /auth/admin/mpin/verify — unlock the dashboard after an idle lock."""
+
+    mpin: str
+
+    @field_validator("mpin")
+    @classmethod
+    def validate_mpin(cls, v: str) -> str:
+        return _validate_mpin_shape(v)
+
+
+class MpinRemoveRequest(BaseModel):
+    """DELETE /auth/admin/mpin — drop the unlock PIN.
+
+    Password re-entry when the account has one; `current_mpin` is the only
+    proof available to an OTP-only admin, and refusing them removal would be a
+    permanent lockout trap.
+    """
+
+    current_password: Optional[str] = None
+    current_mpin: Optional[str] = None
+
+    @field_validator("current_mpin")
+    @classmethod
+    def validate_mpin(cls, v: Optional[str]) -> Optional[str]:
+        return _validate_mpin_shape(v) if v else v
+
+
+class SessionConfigResponse(BaseModel):
+    """GET /auth/admin/session-config — everything the admin shell needs to know.
+
+    One round trip so the topbar, the idle timer and the forced-logout countdown
+    agree. `server_now` is the reference the client counts the daily-logout hour
+    against: a wrong laptop clock must not be able to skip 23:00.
+
+    `idle_minutes` is the effective value; `idle_lock_minutes` is the admin's own
+    setting (None = inherits) so the profile can label which one is in force.
+    """
+
+    has_mpin: bool
+    idle_minutes: int
+    idle_lock_minutes: Optional[int]
+    idle_default_minutes: int
+    daily_logout_hour: int
+    timezone: str
+    server_now: datetime
+    mpin_locked_until: Optional[datetime]
+    mpin_attempts_remaining: Optional[int] = None
+    mpin_min_length: int
+    access_token_expires_in: int
+
+
+class IdleLockMinutesRequest(BaseModel):
+    """PUT /auth/admin/idle-lock-minutes — how soon this admin's screen locks."""
+
+    idle_lock_minutes: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=240,
+        description="Minutes of inactivity before the dashboard locks; null inherits the platform default",
+    )
+
+
 class FirebaseSignInRequest(BaseModel):
     """Doc Ref: Customer web Google sign-in — POST /auth/firebase-sign-in
 
@@ -318,6 +438,9 @@ class AuthUserResponse(BaseModel):
     is_mobile_verified: bool
     is_email_verified: bool
     must_change_password: bool = False  # True when force_password_change flag is set
+    # Staff with no unlock PIN: the dashboard can only log them out on idle, so
+    # the profile nudges them to set one and get the lock behaviour instead.
+    must_set_mpin: bool = False
     partner_id: Optional[int] = (
         None  # Integer partners.id — populated for PARTNER user_type
     )
