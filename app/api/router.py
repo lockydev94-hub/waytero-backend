@@ -6,6 +6,7 @@
 # ============================================================
 
 from fastapi import APIRouter, Depends
+from app.core.branch_scope_gate import require_declared_branch_scope
 from app.core.dependencies import require_roles
 from app.modules.auth.api import router as auth_router
 from app.modules.customer.api import router as customer_router
@@ -15,6 +16,7 @@ from app.modules.vehicle.api import router as vehicle_router
 from app.modules.admin.api import router as admin_settings_router
 from app.modules.admin.api_dashboard import router as admin_dashboard_router
 from app.modules.admin.branch_api import router as admin_branch_router
+from app.modules.admin.branch_scope_api import router as admin_branch_scope_router
 from app.modules.admin.coupon_api import router as coupon_router
 from app.modules.admin.booking_api import router as admin_booking_router
 from app.modules.admin.customer_care_api import router as customer_care_router
@@ -81,7 +83,14 @@ from app.modules.admin.partner_settings_api import (
 from app.modules.admin.public_firebase_api import router as public_firebase_router
 from app.modules.admin.onboarding_docs_api import router as onboarding_docs_router
 
-api_router = APIRouter()
+# One gate for the whole API, mounted here rather than on each admin router,
+# because a dependency on a router propagates to every route included in it —
+# including a route someone adds next month, which is scoped the day it is
+# written instead of quietly showing one office the other's rows. It only ever
+# speaks to an /admin or /auth/admin request from one of the four branch roles,
+# and only when that route is not in branch_scope_registry.DECLARED. See
+# app/core/branch_scope_gate.py.
+api_router = APIRouter(dependencies=[Depends(require_declared_branch_scope)])
 
 # ── Role groups used by the router-level auth deps below ────────────────────
 # These mirror the admin portal's nav matrix (Frontend/admin-portal/src/constants).
@@ -134,6 +143,15 @@ api_router.include_router(
     prefix="/admin/branches",
     tags=["Admin Branches"],
     dependencies=[Depends(require_roles(*ALL_STAFF))],
+)
+
+# The branch review punch list — SUPER_ADMIN only, because it names staff
+# accounts and reports what is still unreviewed.
+api_router.include_router(
+    admin_branch_scope_router,
+    prefix="/admin/branch-scope",
+    tags=["Admin Branch Scope"],
+    dependencies=[Depends(require_roles("SUPER_ADMIN"))],
 )
 
 api_router.include_router(
