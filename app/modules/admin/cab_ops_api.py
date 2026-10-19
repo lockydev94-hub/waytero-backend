@@ -32,12 +32,33 @@ from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.branch_scope import (
+    BranchScope,
+    city_scope_sql,
+    get_branch_scope,
+    require_path_row_scope,
+)
 from app.core.database import get_db
 from app.core.dependencies import require_roles
 from app.core.exceptions import BusinessException, ResourceNotFoundException
 from app.shared.responses.base import success_response
 
-router = APIRouter()
+
+# One check for every /{cab_booking_id}… route on this router. A cab row carries
+# no city of its own, so the branch is established through its master booking;
+# master_bookings.city_id is NOT NULL, so allow_unassigned=False — a cab with no
+# city would be a bug, not head-office work, and must not read as "everyone's".
+require_cab_ops_branch_scope = require_path_row_scope(
+    table="cab_bookings",
+    id_param="cab_booking_id",
+    id_column="cab_bookings.id",
+    city_column="mb.city_id",
+    join="JOIN master_bookings mb ON mb.id = cab_bookings.master_booking_id",
+    allow_unassigned=False,
+    label="Cab booking",
+)
+
+router = APIRouter(dependencies=[Depends(require_cab_ops_branch_scope)])
 
 ADMIN_ROLES = ("SUPER_ADMIN", "ADMIN", "CCO")
 ADMIN_ONLY = ("SUPER_ADMIN", "ADMIN")
@@ -148,6 +169,7 @@ class ReassignCabRequest(BaseModel):
 async def list_cab_ops_queue(
     current_user: dict = Depends(require_roles(*ADMIN_ROLES)),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
     city_id: Optional[int] = Query(None),
     partner_id: Optional[int] = Query(None),
     limit: int = Query(50, ge=1, le=200),
@@ -156,12 +178,24 @@ async def list_cab_ops_queue(
     filters = [
         "cb.booking_status IN ('PENDING_PARTNER_ACCEPTANCE')",
     ]
-    if city_id is not None:
+    if city_id is not None and not scope.restricted:
         filters.append("mb.city_id = :city_id")
         params["city_id"] = city_id
     if partner_id is not None:
         filters.append("cb.pending_partner_id = :partner_id")
         params["partner_id"] = partner_id
+
+    # The branch lives on the master booking, and this queue is a page behind a
+    # badge count that shares `where_clause` — a filter left out of the count
+    # would tell a Cuttack manager there are 40 jobs when 3 are theirs.
+    # A branch account's own city is the scope, so the ?city_id picker above is
+    # ignored for it: intersecting with a stale value would only ever return an
+    # empty console.
+    scope_clause, scope_params = city_scope_sql(
+        scope, "mb.city_id", allow_unassigned=False
+    )
+    filters.append(f"({scope_clause})")
+    params.update(scope_params)
 
     where_clause = " AND ".join(filters)
     sql = text(
@@ -278,6 +312,7 @@ async def list_cab_ops_queue(
 async def list_cab_ops_in_trip(
     current_user: dict = Depends(require_roles(*ADMIN_ROLES)),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
     city_id: Optional[int] = Query(None),
     status_filter: Optional[str] = Query(None, alias="status"),
     limit: int = Query(50, ge=1, le=200),
@@ -290,9 +325,17 @@ async def list_cab_ops_in_trip(
     for i, st in enumerate(statuses):
         params[f"st_{i}"] = st
     filters = [f"cb.booking_status IN ({placeholders})"]
-    if city_id is not None:
+    if city_id is not None and not scope.restricted:
         filters.append("mb.city_id = :city_id")
         params["city_id"] = city_id
+
+    # Same clause feeds the page and the COUNT below it — see the queue note.
+    scope_clause, scope_params = city_scope_sql(
+        scope, "mb.city_id", allow_unassigned=False
+    )
+    filters.append(f"({scope_clause})")
+    params.update(scope_params)
+
     where_clause = " AND ".join(filters)
 
     sql = text(
@@ -421,6 +464,7 @@ async def list_cab_ops_in_trip(
 async def list_cab_ops_sos_alerts(
     current_user: dict = Depends(require_roles(*ADMIN_ROLES)),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
     limit: int = Query(50, ge=1, le=200),
 ) -> CabOpsSosResponse:
     """Surfaces the booking_timeline rows that the trip-assistance / driver
@@ -436,8 +480,13 @@ async def list_cab_ops_sos_alerts(
     BREAKDOWN_REPORTED / AWAITING_SWAP) so resolved/cancelled bookings
     don't pollute the console.
     """
+    # master_bookings is already joined, so the branch is a clause append. An SOS
+    # raised in the other city is not this office's emergency to work.
+    scope_clause, scope_params = city_scope_sql(
+        scope, "mb.city_id", allow_unassigned=False
+    )
     sql = text(
-        """
+        f"""
         SELECT
             cb.id          AS cab_booking_id,
             cb.booking_number,
@@ -474,11 +523,14 @@ async def list_cab_ops_sos_alerts(
         LEFT JOIN drivers  d ON d.id = a.driver_id
         LEFT JOIN partners p ON p.id = a.partner_id
         WHERE bt.event_type IN ('SOS_RAISED', 'ESCALATION_RAISED', 'BREAKDOWN_REPORTED')
+          AND ({scope_clause})
         ORDER BY bt.event_timestamp DESC
         LIMIT :limit
         """
     )
-    rows = (await db.execute(sql, {"limit": limit})).mappings().all()
+    rows = (
+        await db.execute(sql, {"limit": limit, **scope_params})
+    ).mappings().all()
     items = [
         CabOpsSosAlert(
             cab_booking_id=int(r["cab_booking_id"]),

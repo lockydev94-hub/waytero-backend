@@ -21,6 +21,7 @@ from app.core.branch_scope import (
     build_branch_scope,
     city_scope_sql,
     orm_scope_filter,
+    require_path_row_scope,
     require_row_scope,
     scope_header_branch_id,
 )
@@ -241,8 +242,9 @@ class _Headers:
 
 
 class _Request:
-    def __init__(self, values: dict) -> None:
+    def __init__(self, values: dict, path_params: dict | None = None) -> None:
         self.headers = _Headers(values)
+        self.path_params = path_params or {}
 
 
 def test_branch_header_parsing() -> None:
@@ -329,6 +331,82 @@ async def test_super_admin_skips_the_row_query_entirely() -> None:
     await require_row_scope(
         db, _scope(None, is_super=True), table="enquiries",
         id_column="id", id_value=5, city_column="city_id",
+    )
+    assert db.sql == ""
+
+
+# ── the same rule, for a whole router ────────────────────────────
+# One dependency on the bookings router stands in for ~30 per-handler checks, so
+# these four tests are the reason that is safe: the id is read before the
+# handler runs, the check is bound with the type the column wants, and a route
+# that takes no id is left alone.
+
+
+_BOOKING_GUARD = require_path_row_scope(
+    table="master_bookings",
+    id_param="booking_id",
+    city_column="city_id",
+    allow_unassigned=False,
+    label="Booking",
+)
+
+
+@pytest.mark.asyncio
+async def test_the_router_guard_refuses_another_branches_booking() -> None:
+    db = _FakeScopeDb((10,))  # the row is Bhubaneswar's
+    with pytest.raises(ResourceNotFoundException) as exc:
+        await _BOOKING_GUARD(
+            request=_Request({}, {"booking_id": "4127"}),
+            db=db,
+            scope=_scope(CUTTACK),
+        )
+    assert "4127" in exc.value.message
+    # An int, not the string out of the path: asyncpg will not compare a BIGINT
+    # with text, and the failure it raises is an InternalClientError.
+    assert db.params == {"__scope_row_id": 4127}
+
+
+@pytest.mark.asyncio
+async def test_the_router_guard_passes_the_owners_row() -> None:
+    db = _FakeScopeDb((20,))
+    await _BOOKING_GUARD(
+        request=_Request({}, {"booking_id": "4127"}), db=db, scope=_scope(CUTTACK)
+    )
+    assert db.params == {"__scope_row_id": 4127}
+
+
+@pytest.mark.asyncio
+async def test_the_router_guard_leaves_a_route_with_no_id_alone() -> None:
+    """The list pages on the same router are scoped in their own query, where the
+    city column is already joined — a guard that ran a pointless lookup on every
+    one of them would cost a query to prove nothing."""
+    db = _FakeScopeDb((10,))
+    await _BOOKING_GUARD(request=_Request({}, {}), db=db, scope=_scope(CUTTACK))
+    assert db.sql == ""
+
+
+@pytest.mark.asyncio
+async def test_the_router_guard_binds_a_uuid_path_id_as_a_uuid() -> None:
+    conversation_id = uuid4()
+    guard = require_path_row_scope(
+        table="chat_conversations", id_param="conversation_id", city_column="city_id"
+    )
+    db = _FakeScopeDb((20,))
+    await guard(
+        request=_Request({}, {"conversation_id": str(conversation_id)}),
+        db=db,
+        scope=_scope(CUTTACK),
+    )
+    assert db.params == {"__scope_row_id": conversation_id}
+
+
+@pytest.mark.asyncio
+async def test_the_router_guard_asks_nothing_of_a_super_admin() -> None:
+    db = _FakeScopeDb((10,))
+    await _BOOKING_GUARD(
+        request=_Request({}, {"booking_id": "4127"}),
+        db=db,
+        scope=_scope(None, is_super=True),
     )
     assert db.sql == ""
 

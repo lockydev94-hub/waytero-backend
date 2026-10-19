@@ -29,8 +29,9 @@
 from __future__ import annotations
 
 import re
+import uuid
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from fastapi import Depends, Request
 from sqlalchemy import Select, ColumnElement, or_, text as sa_text
@@ -163,6 +164,61 @@ def city_scope_sql(
     if scope.include_unassigned and allow_unassigned:
         clause = f"({clause} OR {column} IS NULL)"
     return clause, {name: sorted(scope.cities)}
+
+
+class ScopeSql:
+    """One statement's worth of city predicates, with their params collected.
+
+    `city_scope_sql` returns a clause *and* the parameter it needs, and a
+    dashboard query wants half a dozen of them in a single statement. Doing that
+    pairing here instead of at each call site is what turns two mistakes that are
+    otherwise easy to make — a clause whose param was never bound (a runtime
+    error, caught by luck) and a clause bound to another fragment's param (a
+    wrong number, caught by nothing) — into one that cannot happen.
+    """
+
+    def __init__(self, scope: BranchScope) -> None:
+        self.scope = scope
+        self.params: dict[str, Any] = {}
+
+    def city(
+        self,
+        column: str,
+        *,
+        param: str,
+        allow_unassigned: bool = True,
+    ) -> str:
+        """The predicate for `column`, its param registered under `param`.
+
+        `param` is required because two fragments of one statement must not
+        share a bind name: the same list bound twice under one name is the same
+        value, but a name reused across *different* columns is how a clause ends
+        up filtering on the wrong one.
+        """
+        if not _IDENTIFIER.match(param):
+            raise ValueError(f"ScopeSql.city: {param} must be a bare identifier")
+        clause, extra = city_scope_sql(
+            self.scope, column, param=param, allow_unassigned=allow_unassigned
+        )
+        self.params.update(extra)
+        return clause
+
+    def through_bookings(self, alias: str, *, param: str) -> str:
+        """A service row's city is its master booking's.
+
+        cab_bookings, hotel_reservations and tour_bookings carry no location of
+        their own — the master booking they hang off does, which is why no
+        service table needed a column in migration 0085. EXISTS rather than a
+        join, because these fragments are COUNTs and a join would let one master
+        with two services be counted twice.
+        """
+        if not _IDENTIFIER.match(alias):
+            raise ValueError(f"ScopeSql.through_bookings: {alias} must be a bare identifier")
+        clause = self.city("mb.city_id", param=param, allow_unassigned=False)
+        return (
+            f"EXISTS (SELECT 1 FROM master_bookings mb "
+            f"WHERE mb.id = {alias}.master_booking_id AND {clause})"
+        )
 
 
 def orm_scope_filter(
@@ -316,6 +372,68 @@ async def get_branch_scope(
     )
     request.state.branch_scope = scope
     return scope
+
+
+def _coerce_id(raw: Any) -> Any:
+    """Bind a path parameter with the type its column expects.
+
+    request.path_params is read before FastAPI casts anything, so every id
+    arrives as a string. asyncpg will not quietly turn "12" into a BIGINT or a
+    UUID, so the conversion happens here rather than in a database error.
+    """
+    text_value = str(raw)
+    if text_value.isdigit():
+        return int(text_value)
+    try:
+        return uuid.UUID(text_value)
+    except (ValueError, AttributeError):
+        return text_value
+
+
+def require_path_row_scope(
+    *,
+    table: str,
+    id_param: str,
+    city_column: str,
+    id_column: str = "id",
+    join: str = "",
+    label: Optional[str] = None,
+    allow_unassigned: bool = True,
+) -> Callable:
+    """Router-level guard for resources addressed by an id in the path.
+
+    Attached to a router once instead of copied into every route: the bookings
+    router has ~30 of them, and a check that lives in each handler is a check
+    that goes missing from one. Because it is a dependency it runs before the
+    handler, so the row is never loaded, mutated or emailed before it has been
+    established that this caller's branch owns it.
+
+    Routes whose path has no `id_param` (list pages, queues, the resource
+    pickers) fall through untouched — they are scoped in their own query, where
+    the city column is already joined.
+    """
+
+    async def dependency(
+        request: Request,
+        db: AsyncSession = Depends(get_db),
+        scope: BranchScope = Depends(get_branch_scope),
+    ) -> None:
+        raw = request.path_params.get(id_param)
+        if raw is None:
+            return
+        await require_row_scope(
+            db,
+            scope,
+            table=table,
+            id_column=id_column,
+            id_value=_coerce_id(raw),
+            city_column=city_column,
+            join=join,
+            label=label,
+            allow_unassigned=allow_unassigned,
+        )
+
+    return dependency
 
 
 async def require_row_scope(

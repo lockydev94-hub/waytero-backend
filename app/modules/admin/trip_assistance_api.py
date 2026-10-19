@@ -37,7 +37,9 @@ from sqlalchemy import select, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.branch_scope import BranchScope, get_branch_scope, orm_scope_filter
 from app.core.database import get_db
+from app.core.exceptions import ResourceNotFoundException
 from app.modules.booking import services as advance_service
 from app.modules.booking.services import breakdown as breakdown_service
 from app.modules.booking.models import (
@@ -77,11 +79,19 @@ async def _log_timeline(
     db.add(entry)
 
 
-async def _get_cab_booking_by_number(db: AsyncSession, booking_number: str):
+async def _get_cab_booking_by_number(
+    db: AsyncSession, booking_number: str, scope: BranchScope
+):
     """
     Lookup cab_booking by booking_number (WT-CAB-XXXXXX format).
     Returns (master_booking, cab_booking, assignment).
     Raises 404 if not found.
+
+    The booking_number arrives as a query/body parameter, not a path id, so the
+    by-id guards cannot reach it here — this is the single choke point every
+    trip-assistance route reads through, so the branch check lives on it once.
+    The city is the master booking's (cab rows carry none); master_bookings.city_id
+    is NOT NULL, so a missing city is treated as nobody's, not head-office work.
     """
     q = select(CabBooking).where(
         CabBooking.booking_number == booking_number.strip().upper()
@@ -104,6 +114,9 @@ async def _get_cab_booking_by_number(db: AsyncSession, booking_number: str):
     mb = (await db.execute(mb_q)).scalar_one_or_none()
     if not mb:
         raise HTTPException(404, "Master booking not found.")
+
+    if scope.restricted and mb.city_id not in scope.cities:
+        raise ResourceNotFoundException("Cab booking", booking_number)
 
     return mb, cb
 
@@ -328,13 +341,14 @@ class GenerateInvoiceRequest(BaseModel):
 async def lookup_booking(
     booking_number: str = Query(..., description="Cab booking number (WT-CAB-...)"),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Lookup a cab booking by its booking number.
     Returns full booking + assignment + trip + billing details.
     Used by admin to pull the booking into the assistance console.
     """
-    mb, cb = await _get_cab_booking_by_number(db, booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, booking_number, scope)
     return await _build_full_detail(db, mb, cb)
 
 
@@ -349,6 +363,7 @@ async def list_active_trips(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     List all cab bookings that need admin trip assistance.
@@ -387,7 +402,22 @@ async def list_active_trips(
 
     filter_cond = or_(in_progress_cond, payment_not_collected_cond, cash_pending_cond)
 
-    total_q = select(func.count(CabBooking.id)).where(filter_cond)
+    # The cab row carries no city, so the trip-assistance list narrows through the
+    # master booking. An IN subquery rather than a join keeps the COUNT and the
+    # page filtering on the same set — a badge count that ignored the branch
+    # would tell a Cuttack manager there are jobs here that are not theirs.
+    master_ids_q = orm_scope_filter(
+        select(MasterBooking.id),
+        MasterBooking.city_id,
+        scope,
+        allow_unassigned=False,
+    )
+
+    total_q = (
+        select(func.count(CabBooking.id))
+        .where(filter_cond)
+        .where(CabBooking.master_booking_id.in_(master_ids_q))
+    )
     total = (await db.execute(total_q)).scalar() or 0
 
     offset = (page - 1) * page_size
@@ -397,6 +427,7 @@ async def list_active_trips(
                 select(CabBooking)
                 .options(selectinload(CabBooking.assignments))
                 .where(filter_cond)
+                .where(CabBooking.master_booking_id.in_(master_ids_q))
                 .order_by(CabBooking.pickup_datetime.asc().nullslast())
                 .offset(offset)
                 .limit(page_size)
@@ -446,6 +477,7 @@ async def list_active_trips(
 async def admin_start_trip(
     payload: TripStartRequest,
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Admin starts a trip on behalf of a driver.
@@ -454,7 +486,7 @@ async def admin_start_trip(
     Records trip_start_km, trip_started_at.
     Transitions cab_booking → STARTED, master_booking → IN_PROGRESS.
     """
-    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number, scope)
 
     if cb.booking_status != "DRIVER_ASSIGNED":
         raise HTTPException(
@@ -519,6 +551,7 @@ async def admin_start_trip(
 async def admin_close_trip(
     payload: TripCloseRequest,
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Admin closes/completes a trip on behalf of driver.
@@ -541,7 +574,7 @@ async def admin_close_trip(
     from app.modules.admin.services import DefaultPricingService
     from app.modules.admin.models import CommissionRule
 
-    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number, scope)
 
     # ── Guard 1: status ───────────────────────────────────────────────────────
     if cb.booking_status != "STARTED":
@@ -852,12 +885,13 @@ async def admin_close_trip(
 async def get_customer_wallet(
     booking_number: str = Query(..., description="Cab booking number"),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Fetch customer wallet balance for a booking.
     Used by Collect Payment modal to show live balance before WALLET deduction.
     """
-    mb, cb = await _get_cab_booking_by_number(db, booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, booking_number, scope)
 
     wallet_row = (
         (
@@ -940,6 +974,7 @@ async def get_customer_wallet(
 async def admin_collect_payment(
     payload: CollectPaymentRequest,
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Record how payment was collected after trip completion.
@@ -952,7 +987,7 @@ async def admin_collect_payment(
 
     Commission is always looked up from commission rules (not accepted from payload).
     """
-    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number, scope)
 
     # ── Guard: status ─────────────────────────────────────────────────────────
     if cb.booking_status != "COMPLETED":
@@ -1227,6 +1262,7 @@ async def admin_collect_payment(
 async def generate_invoice(
     payload: GenerateInvoiceRequest,
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Generate invoice number for a completed booking.
@@ -1234,7 +1270,7 @@ async def generate_invoice(
     For PDF: invoke from frontend using Cloudinary after this call.
     Doc Ref: BRD Part 3 §45, DB Schema Part 7 §15
     """
-    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number, scope)
 
     if cb.booking_status not in ("COMPLETED", "SETTLEMENT_PENDING", "SETTLED"):
         raise HTTPException(
@@ -1343,8 +1379,9 @@ class UpdateInvoiceUrlRequest(BaseModel):
 async def update_invoice_url(
     payload: UpdateInvoiceUrlRequest,
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
-    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, payload.booking_number, scope)
     cb.invoice_url = payload.invoice_url.strip()
     await _log_timeline(
         db,
@@ -1369,6 +1406,7 @@ async def update_invoice_url(
 async def download_invoice_pdf(
     booking_number: str = Query(..., description="Cab booking number (WT-CAB-...)"),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Generate and stream a premium PDF invoice for a completed + paid booking.
@@ -1384,7 +1422,7 @@ async def download_invoice_pdf(
     from app.modules.admin.coupon_models import CouponUsage
     from sqlalchemy import func as _func3
 
-    mb, cb = await _get_cab_booking_by_number(db, booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, booking_number, scope)
 
     # Guard: must be completed and payment recorded
     if cb.booking_status not in ("COMPLETED", "SETTLEMENT_PENDING", "SETTLED"):
@@ -1564,6 +1602,7 @@ async def download_invoice_pdf(
 async def get_commission_preview(
     booking_number: str = Query(..., description="Cab booking number"),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Get the applicable commission percentage for a booking.
@@ -1574,7 +1613,7 @@ async def get_commission_preview(
     """
     from app.modules.admin.models import CommissionRule
 
-    mb, cb = await _get_cab_booking_by_number(db, booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, booking_number, scope)
 
     # Get latest assignment partner — active only.
     partner_id = None
@@ -1681,6 +1720,7 @@ async def get_trip_pricing(
         None, description="End odometer reading (optional, for live preview)"
     ),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Fetch pricing rule for a booking's city + vehicle_category + trip_type.
@@ -1695,7 +1735,7 @@ async def get_trip_pricing(
       calculated_amount: computed if end_km given
       actual_distance: computed if end_km given
     """
-    mb, cb = await _get_cab_booking_by_number(db, booking_number)
+    mb, cb = await _get_cab_booking_by_number(db, booking_number, scope)
 
     # Load city
     city = (

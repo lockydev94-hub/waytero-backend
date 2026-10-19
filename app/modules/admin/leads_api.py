@@ -20,6 +20,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text as _text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.branch_scope import (
+    BranchScope,
+    city_scope_sql,
+    get_branch_scope,
+    require_row_scope,
+)
 from app.core.database import get_db
 from app.core.dependencies import require_roles
 from app.core.exceptions import ResourceNotFoundException, ValidationException
@@ -60,6 +66,7 @@ async def list_partner_applications(
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     filters = ["1 = 1"]
     params: dict = {}
@@ -76,6 +83,12 @@ async def list_partner_applications(
             "OR pa.mobile ILIKE :search OR pa.email ILIKE :search)"
         )
         params["search"] = f"%{search.strip()}%"
+    # An application whose free-text city matched no branch stays NULL and is
+    # head-office triage, so the nullable-queue default (allow_unassigned=True)
+    # is right: HQ works the unmatched leads, a sub-branch never sees them.
+    scope_clause, scope_params = city_scope_sql(scope, "pa.city_id")
+    filters.append(f"({scope_clause})")
+    params.update(scope_params)
 
     where = " AND ".join(filters)
     offset = (page - 1) * page_size
@@ -146,13 +159,19 @@ async def list_partner_applications(
 async def partner_application_stats(
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    # Counts the caller's own applications, matching the list above the tiles so
+    # the two cannot disagree.
+    scope_clause, scope_params = city_scope_sql(scope, "city_id")
     rows = (
         (
             await db.execute(
                 _text(
-                    "SELECT status, COUNT(*) AS c FROM partner_applications GROUP BY status"
-                )
+                    f"SELECT status, COUNT(*) AS c FROM partner_applications "
+                    f"WHERE {scope_clause} GROUP BY status"
+                ),
+                scope_params,
             )
         )
         .mappings()
@@ -178,8 +197,18 @@ async def update_partner_application(
     body: PartnerApplicationUpdate,
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     body.validate_all()
+    await require_row_scope(
+        db,
+        scope,
+        table="partner_applications",
+        id_column="id",
+        id_value=application_id,
+        city_column="city_id",
+        label="Partner application",
+    )
 
     existing = (
         await db.execute(
@@ -251,6 +280,7 @@ async def list_contact_messages(
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     filters = ["1 = 1"]
     params: dict = {}
@@ -264,6 +294,12 @@ async def list_contact_messages(
             "OR cm.message ILIKE :search)"
         )
         params["search"] = f"%{search.strip()}%"
+    # NULL is head office's, so a sub-branch simply matches no rows here — an
+    # empty list, never a 403: the inbox still renders, it just has nothing to
+    # show. allow_unassigned=True keeps HQ's unassigned mail on HQ's screen.
+    scope_clause, scope_params = city_scope_sql(scope, "cm.city_id")
+    filters.append(f"({scope_clause})")
+    params.update(scope_params)
 
     where = " AND ".join(filters)
     offset = (page - 1) * page_size
@@ -324,14 +360,28 @@ async def list_contact_messages(
 async def contact_message_stats(
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    # Both numbers use the caller's own scope predicate, so the unread badge
+    # counts the same rows the list shows. A sub-branch with no city match gets
+    # 0 / 0 — the page renders empty, it is not an error.
+    scope_clause, scope_params = city_scope_sql(scope, "city_id")
     unread = (
         await db.execute(
-            _text("SELECT COUNT(*) AS c FROM contact_messages WHERE is_read = false")
+            _text(
+                f"SELECT COUNT(*) AS c FROM contact_messages "
+                f"WHERE is_read = false AND ({scope_clause})"
+            ),
+            scope_params,
         )
     ).scalar()
     total = (
-        await db.execute(_text("SELECT COUNT(*) AS c FROM contact_messages"))
+        await db.execute(
+            _text(
+                f"SELECT COUNT(*) AS c FROM contact_messages WHERE {scope_clause}"
+            ),
+            scope_params,
+        )
     ).scalar()
     return {"unread": int(unread or 0), "total": int(total or 0)}
 
@@ -346,7 +396,19 @@ async def mark_contact_message_read(
     read: bool = Query(True),
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    # A by-id write is out-of-scope as 404 (never the empty-list path the inbox
+    # takes): a sub-branch must not toggle read state on head-office mail.
+    await require_row_scope(
+        db,
+        scope,
+        table="contact_messages",
+        id_column="id",
+        id_value=message_id,
+        city_column="city_id",
+        label="Contact message",
+    )
     existing = (
         await db.execute(
             _text("SELECT id FROM contact_messages WHERE id = :id"),

@@ -22,6 +22,14 @@ from sqlalchemy import select, func, and_, desc, or_, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.branch_scope import (
+    BranchScope,
+    get_branch_scope,
+    orm_scope_filter,
+    require_path_row_scope,
+    require_row_scope,
+    city_scope_sql,
+)
 from app.core.database import get_db
 from app.core.dependencies import get_current_user, require_roles
 from app.modules.booking import services as advance_service
@@ -140,9 +148,28 @@ async def _send_booking_email(
         pass
 
 
+# One check for every /{booking_id}… route on this router — accept, reject,
+# cancel, reschedule, assign, reassign, check in, check out, settle, invoice and
+# the notes on it (~30 of them). Attached to the router instead of copied into
+# each handler, so a by-id route added next month is scoped the day it is
+# written and a handler that forgets the check is not possible.
+#
+# The cab / hotel / tour ids under a booking need no check of their own: reaching
+# the booking they belong to is what establishes the branch. master_bookings
+# .city_id is NOT NULL, so allow_unassigned=False — a booking with no city would
+# be a bug, not head-office work, and it must not read as "everyone's".
+require_booking_branch_scope = require_path_row_scope(
+    table="master_bookings",
+    id_param="booking_id",
+    city_column="city_id",
+    allow_unassigned=False,
+    label="Booking",
+)
+
 router = APIRouter(
     dependencies=[
-        Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO", "FINANCE_MANAGER"))
+        Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO", "FINANCE_MANAGER")),
+        Depends(require_booking_branch_scope),
     ]
 )
 
@@ -542,6 +569,29 @@ class HotelCollectPaymentRequest(BaseModel):
 # ════════════════════════════════════════════════════════════════
 # HELPERS
 # ════════════════════════════════════════════════════════════════
+
+
+async def _require_partner_scope(
+    db: AsyncSession, scope: BranchScope, partner_id: int
+) -> None:
+    """Establish that this partner is the caller's to work with.
+
+    Drivers and vehicles have no location of their own — the partner they belong
+    to does (partners.city_id, and a branch is one city). So the assignment
+    pickers are scoped through the partner instead of inventing a city column on
+    tables that never had one, which is also the only answer that keeps a
+    driver's row in exactly one branch.
+    """
+    await require_row_scope(
+        db,
+        scope,
+        table="partners",
+        id_column="id",
+        id_value=partner_id,
+        city_column="city_id",
+        allow_unassigned=False,
+        label="Partner",
+    )
 
 
 async def _get_master_booking(db: AsyncSession, booking_id: int) -> MasterBooking:
@@ -1073,6 +1123,7 @@ async def list_bookings(
         None, description="Filter by journey_start_date YYYY-MM-DD"
     ),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Paginated list of all master bookings with enriched customer/city data.
@@ -1080,11 +1131,19 @@ async def list_bookings(
     """
     q = select(MasterBooking).options(selectinload(MasterBooking.services))
 
+    # Branch first: a branch's city *is* the answer, so the optional city filter is
+    # a super-admin's tool and ignored for a branch account rather than
+    # intersected with a stale value from another office's URL.
+    # master_bookings.city_id is NOT NULL, so an office's rows are always
+    # resolvable and an unassigned row would be a bug, not head-office work —
+    # allow_unassigned=False keeps a NULL out of a branch's booking list.
+    q = orm_scope_filter(q, MasterBooking.city_id, scope, allow_unassigned=False)
+
     if booking_status:
         q = q.where(MasterBooking.booking_status == booking_status.upper())
     if payment_status:
         q = q.where(MasterBooking.payment_status == payment_status.upper())
-    if city_id:
+    if city_id and not scope.restricted:
         q = q.where(MasterBooking.city_id == city_id)
     if journey_date:
         from datetime import date as _date
@@ -1266,29 +1325,50 @@ async def list_bookings(
 
 
 @router.get("/stats", response_model=BookingStatsOut, tags=["Admin Bookings"])
-async def booking_stats(db: AsyncSession = Depends(get_db)):
-    """Dashboard stats: total, by status, today count."""
+async def booking_stats(
+    db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
+):
+    """Dashboard stats: total, by status, today count.
+
+    Every number here is a count over the same rows the caller's booking list
+    shows, so the header of the page and the page itself cannot disagree — a
+    branch manager reading "412 bookings" above a list of 9 would have no way to
+    tell which one is wrong.
+    """
     from datetime import date as _date
 
     today = _date.today()
-    total = (await db.execute(select(func.count(MasterBooking.id)))).scalar() or 0
+
+    def _scoped(stmt):
+        return orm_scope_filter(
+            stmt, MasterBooking.city_id, scope, allow_unassigned=False
+        )
+
+    total = (await db.execute(_scoped(select(func.count(MasterBooking.id))))).scalar() or 0
     today_count = (
         await db.execute(
-            select(func.count(MasterBooking.id)).where(
-                func.date(MasterBooking.created_at) == today
+            _scoped(
+                select(func.count(MasterBooking.id)).where(
+                    func.date(MasterBooking.created_at) == today
+                )
             )
         )
     ).scalar() or 0
 
     def _count(status: str):
-        return select(func.count(MasterBooking.id)).where(
-            MasterBooking.booking_status == status
+        return _scoped(
+            select(func.count(MasterBooking.id)).where(
+                MasterBooking.booking_status == status
+            )
         )
 
     pending_assign = (
         await db.execute(
-            select(func.count(CabBooking.id)).where(
-                CabBooking.booking_status == "PENDING_ASSIGNMENT"
+            _scoped(
+                select(func.count(CabBooking.id))
+                .join(MasterBooking, MasterBooking.id == CabBooking.master_booking_id)
+                .where(CabBooking.booking_status == "PENDING_ASSIGNMENT")
             )
         )
     ).scalar() or 0
@@ -1320,6 +1400,7 @@ async def list_pending_acceptance(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Paginated list of cab bookings in PENDING_PARTNER_ACCEPTANCE,
@@ -1329,6 +1410,17 @@ async def list_pending_acceptance(
     """
     from app.modules.partner.constants import SYSTEM_REJECT_REASON_TIMEOUT
 
+    # The branch lives on the master booking, not on the cab row, so the queue
+    # narrows through it. An IN subquery rather than a join: `base` is a
+    # select(CabBooking) with eager-loaded relationships, and joining the master
+    # into it would change what the pagination count is counting.
+    master_ids_q = orm_scope_filter(
+        select(MasterBooking.id),
+        MasterBooking.city_id,
+        scope,
+        allow_unassigned=False,
+    )
+
     base = (
         select(CabBooking)
         .options(
@@ -1336,6 +1428,7 @@ async def list_pending_acceptance(
             selectinload(CabBooking.master_booking),
         )
         .where(CabBooking.booking_status == "PENDING_PARTNER_ACCEPTANCE")
+        .where(CabBooking.master_booking_id.in_(master_ids_q))
         .order_by(CabBooking.acceptance_deadline.asc().nullslast())
     )
 
@@ -1388,6 +1481,7 @@ async def list_pending_acceptance(
 @router.get("/accept-queue", tags=["Admin Bookings"])
 async def list_admin_accept_queue(
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     Bookings placed on the customer website that are waiting for admin
@@ -1402,12 +1496,19 @@ async def list_admin_accept_queue(
     """
     items: list[dict] = []
 
+    # One clause for all three service types — the modal pops for the booking
+    # that arrived in *this* office, and the accept/reject buttons on it would
+    # otherwise hand a Cuttack manager a Bhubaneswar pickup to assign.
+    scope_clause, scope_params = city_scope_sql(
+        scope, "mb.city_id", allow_unassigned=False
+    )
+
     # ── CAB ──
     rows = (
         (
             await db.execute(
                 text(
-                    """
+                    f"""
             SELECT mb.id AS master_booking_id,
                    mb.booking_number AS master_booking_number,
                    cb.id AS service_id,
@@ -1425,9 +1526,11 @@ async def list_admin_accept_queue(
             WHERE mb.booking_status = 'DRAFT'
               AND cb.booking_status = 'PENDING_ASSIGNMENT'
               AND mb.created_at > NOW() - INTERVAL '72 hours'
+              AND ({scope_clause})
             ORDER BY mb.created_at DESC
             """
-                )
+                ),
+                scope_params,
             )
         )
         .mappings()
@@ -1457,7 +1560,7 @@ async def list_admin_accept_queue(
         (
             await db.execute(
                 text(
-                    """
+                    f"""
             SELECT mb.id AS master_booking_id,
                    mb.booking_number AS master_booking_number,
                    hr.id AS service_id,
@@ -1476,9 +1579,11 @@ async def list_admin_accept_queue(
             WHERE mb.booking_status = 'DRAFT'
               AND hr.reservation_status = 'PENDING_PAYMENT'
               AND mb.created_at > NOW() - INTERVAL '72 hours'
+              AND ({scope_clause})
             ORDER BY mb.created_at DESC
             """
-                )
+                ),
+                scope_params,
             )
         )
         .mappings()
@@ -1508,7 +1613,7 @@ async def list_admin_accept_queue(
         (
             await db.execute(
                 text(
-                    """
+                    f"""
             SELECT mb.id AS master_booking_id,
                    mb.booking_number AS master_booking_number,
                    tb.id AS service_id,
@@ -1525,9 +1630,11 @@ async def list_admin_accept_queue(
             LEFT JOIN customers c ON c.id = mb.customer_id
             WHERE tb.booking_status = 'PENDING_CONFIRMATION'
               AND mb.created_at > NOW() - INTERVAL '72 hours'
+              AND ({scope_clause})
             ORDER BY mb.created_at DESC
             """
-                )
+                ),
+                scope_params,
             )
         )
         .mappings()
@@ -3068,15 +3175,21 @@ async def list_assignable_partners(
         None, description="Filter partners that have vehicles matching this category"
     ),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     List APPROVED partners for assignment with enriched data:
     - has_cab_service: whether partner has CAB service registered
     - available_vehicles: count of APPROVED vehicles matching vehicle_category_id (if provided)
     - partner_type, mobile for display
+
+    A branch picks from the partners that work in its city: this list is the
+    picker for assign-partner, so anything shown here is something the caller
+    could legitimately go on to assign a booking to.
     """
     q = select(Partner).where(Partner.status.in_(["APPROVED", "ACTIVE"]))
-    if city_id:
+    q = orm_scope_filter(q, Partner.city_id, scope, allow_unassigned=False)
+    if city_id and not scope.restricted:
         q = q.where(Partner.city_id == city_id)
     partners = (await db.execute(q.order_by(Partner.business_name))).scalars().all()
 
@@ -3155,8 +3268,10 @@ async def list_assignable_partners(
 async def get_partner_detail(
     partner_id: int,
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Get partner profile details for display in the assign-driver modal."""
+    await _require_partner_scope(db, scope, partner_id)
     partner = (
         await db.execute(select(Partner).where(Partner.id == partner_id))
     ).scalar_one_or_none()
@@ -3188,12 +3303,14 @@ async def get_partner_detail(
 async def list_assignable_drivers(
     partner_id: int = Query(...),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     List APPROVED drivers for a partner with availability status and busy flag.
     is_busy=True means driver is currently on an active trip assignment.
     Doc Ref: Driver §2, DriverAvailability §6-7, Dispatch Rules §25
     """
+    await _require_partner_scope(db, scope, partner_id)
     # Find driver_ids active on trips (ASSIGNED, DRIVER_ASSIGNED, STARTED)
     active_driver_ids_q = (
         select(CabBookingAssignment.driver_id)
@@ -3260,6 +3377,7 @@ async def list_assignable_vehicles(
     partner_id: int = Query(...),
     vehicle_category_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """
     List APPROVED/ACTIVE vehicles for a partner.
@@ -3268,6 +3386,7 @@ async def list_assignable_vehicles(
     breakdown flow (migration 0041) and must not be re-assignable.
     Each vehicle includes is_busy flag for UI display.
     """
+    await _require_partner_scope(db, scope, partner_id)
     # Get vehicle_ids on ACTIVE (closed_at IS NULL) assignments only —
     # closed handover rows no longer mark the vehicle as busy.
     active_vehicle_ids_q = (
@@ -4978,11 +5097,16 @@ class _HotelAdvanceRefundPayload(BaseModel):
 
 
 async def _load_hotel_reservation(
-    db: AsyncSession, reservation_id: int
+    db: AsyncSession, reservation_id: int, scope: BranchScope
 ) -> HotelReservation:
     """Thin loader used by the switch endpoints. Returns the ORM row, 404 if
     missing — no lock; the switch service itself takes SELECT FOR UPDATE on
-    the rows it mutates."""
+    the rows it mutates.
+
+    These three routes address a reservation, not a booking, so the router's
+    {booking_id} guard cannot reach them: the branch is the original
+    reservation's master booking's city.
+    """
     hr = (
         await db.execute(
             select(HotelReservation).where(HotelReservation.id == reservation_id)
@@ -4992,6 +5116,16 @@ async def _load_hotel_reservation(
         raise HTTPException(
             status_code=404, detail=f"Hotel reservation {reservation_id} not found"
         )
+    await require_row_scope(
+        db,
+        scope,
+        table="master_bookings",
+        id_column="id",
+        id_value=hr.master_booking_id,
+        city_column="city_id",
+        allow_unassigned=False,
+        label="Hotel reservation",
+    )
     return hr
 
 
@@ -5003,11 +5137,12 @@ async def hotel_switch_quote(
     reservation_id: int,
     payload: _HotelSwitchTargetPayload,
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Preview-only quote for a hotel switch. Returns target_total, the
     available advance on the original, the suggested strategy, and whether
     the target hotel has rooms for the requested window. Does NOT mutate."""
-    hr = await _load_hotel_reservation(db, reservation_id)
+    hr = await _load_hotel_reservation(db, reservation_id, scope)
     return await quote_switch(
         db,
         hr,
@@ -5030,6 +5165,7 @@ async def hotel_switch_commit(
     payload: _HotelSwitchCommitPayload,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_roles("ADMIN", "SUPER_ADMIN", "CCO")),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Commit a hotel switch. Branches between PRE_CHECKIN_SWITCH and
     POST_CHECKIN_SPLIT based on the original reservation's status."""
@@ -5041,7 +5177,7 @@ async def hotel_switch_commit(
                 f"Allowed: {', '.join(HOTEL_ADVANCE_STRATEGIES)}"
             ),
         )
-    hr = await _load_hotel_reservation(db, reservation_id)
+    hr = await _load_hotel_reservation(db, reservation_id, scope)
     actor_id = None
     sub = (current_user or {}).get("sub")
     if sub:
@@ -5114,6 +5250,7 @@ async def hotel_advance_refund(
     payload: _HotelAdvanceRefundPayload,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(require_roles("ADMIN", "SUPER_ADMIN", "CCO")),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Record a Razorpay refund on an advance payment. Two-step flow:
     the switch marks the advance as fully pending-refund (`reference_number
@@ -5123,7 +5260,7 @@ async def hotel_advance_refund(
     Status flips to REFUNDED only when the cumulative refunded_amount
     reaches the advance's amount.
     """
-    hr = await _load_hotel_reservation(db, reservation_id)
+    hr = await _load_hotel_reservation(db, reservation_id, scope)
     adv = (
         (
             await db.execute(
@@ -5222,6 +5359,7 @@ async def list_hotel_switch_events(
     page: int = Query(1, ge=1),
     page_size: int = Query(25, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Paginated audit page for hotel switch / split events. Joins both
     reservation numbers so the UI can show "original → new" without a second
@@ -5259,6 +5397,15 @@ async def list_hotel_switch_events(
             date_to + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc
         )
 
+    # A switch is worked by the office the stay belongs to. The event row carries
+    # no city of its own, so it is read through the original reservation's master
+    # booking — the same city the switch moved nights *in*.
+    scope_clause, scope_params = city_scope_sql(
+        scope, "omb.city_id", allow_unassigned=False
+    )
+    where.append(f"({scope_clause})")
+    params.update(scope_params)
+
     where_sql = " AND ".join(where)
     offset = (page - 1) * page_size
 
@@ -5276,6 +5423,7 @@ async def list_hotel_switch_events(
                 FROM hotel_reservation_split_events e
                 JOIN hotel_reservations orig ON orig.id = e.original_reservation_id
                 JOIN hotel_reservations new  ON new.id = e.new_reservation_id
+                JOIN master_bookings omb     ON omb.id = orig.master_booking_id
                 WHERE {where_sql}
                 ORDER BY e.created_at DESC
                 LIMIT :limit OFFSET :offset
@@ -5294,6 +5442,7 @@ async def list_hotel_switch_events(
                 f"SELECT COUNT(*) AS n FROM hotel_reservation_split_events e "
                 f"JOIN hotel_reservations orig ON orig.id = e.original_reservation_id "
                 f"JOIN hotel_reservations new  ON new.id = e.new_reservation_id "
+                f"JOIN master_bookings omb ON omb.id = orig.master_booking_id "
                 f"WHERE {where_sql}"
             ),
             params,

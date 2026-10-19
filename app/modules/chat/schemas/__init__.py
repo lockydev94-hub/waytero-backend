@@ -45,6 +45,10 @@ class ConversationCreateRequest(BaseModel):
     subject: Optional[str] = Field(None, max_length=50)
     message: Optional[str] = Field(None, min_length=1, max_length=5000)
     guest: Optional[GuestIdentity] = None
+    # The city page the widget was opened on, if the site passed one through.
+    # Left NULL when the visitor gave no hint — unassigned means head office, so
+    # we never guess a branch here.
+    city_id: Optional[int] = Field(None, description="Page hint: city of the branch")
 
 
 class SendMessageRequest(BaseModel):

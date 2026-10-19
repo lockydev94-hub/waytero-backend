@@ -21,6 +21,7 @@ from uuid import UUID
 from sqlalchemy import select, text as _text, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.branch_scope import BranchScope, city_scope_sql
 from app.core.exceptions import (
     BusinessException,
     PermissionDeniedException,
@@ -200,6 +201,10 @@ async def create_or_open_conversation(
             ),
             guest_mobile=body.guest.mobile if body.guest else None,
             subject=body.subject.strip() if body.subject else None,
+            # The branch is whatever the page hinted, never derived — with no
+            # hint this stays NULL and the thread is head-office triage. Only set
+            # on creation; reopening an existing thread must not move its city.
+            city_id=getattr(body, "city_id", None),
             status="OPEN" if online else "WAITING",
             assigned_admin_id=await pick_agent() if online else None,
         )
@@ -392,11 +397,27 @@ def _assert_owner(
 
 
 async def list_conversations(
-    db: AsyncSession, *, status: str | None, q: str | None, page: int, page_size: int
+    db: AsyncSession,
+    *,
+    status: str | None,
+    q: str | None,
+    page: int,
+    page_size: int,
+    scope: BranchScope,
 ) -> dict:
-    """Admin inbox: conversations with the customer display name/mobile."""
+    """Admin inbox: conversations with the customer display name/mobile.
+
+    The board is a branch queue: an agent sees the threads opened on their own
+    city's pages, plus unassigned ones when they are the head office. A thread
+    with no city is not nobody's — it is head-office triage, which is why this
+    does not filter the NULL rows away for HQ.
+    """
     conditions = ["1 = 1"]
     params: dict = {}
+
+    scope_clause, scope_params = city_scope_sql(scope, "cc.city_id")
+    conditions.append(f"({scope_clause})")
+    params.update(scope_params)
 
     if status:
         conditions.append("cc.status = :status")

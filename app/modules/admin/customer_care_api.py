@@ -23,8 +23,15 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.branch_scope import (
+    BranchScope,
+    city_scope_sql,
+    get_branch_scope,
+    require_row_scope,
+)
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
+from app.modules.admin.cab_route_service import assert_city_active
 from app.modules.auth.models.user import User
 from app.modules.booking.models import (
     MasterBooking,
@@ -346,11 +353,20 @@ async def list_care_logs(
     search: Optional[str] = Query(None, description="customer name or mobile"),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     await _ensure_care_log_table(db)
 
     where_parts = ["1=1"]
     params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
+
+    # cl.city_id was added nullable by 0085, so a log with no city is head-office
+    # work — allow_unassigned left at its default keeps it out of a sub-branch's
+    # list but in HQ's. The same where_sql drives the COUNT above, so the total
+    # and the page cannot disagree.
+    scope_clause, scope_params = city_scope_sql(scope, "cl.city_id")
+    where_parts.append(f"({scope_clause})")
+    params.update(scope_params)
 
     if status_filter:
         where_parts.append("cl.status = :status")
@@ -415,17 +431,47 @@ async def list_care_logs(
 
 
 # ── 2. Look up customer by mobile ────────────────────────────
+def _customer_in_branch_sql(scope: BranchScope) -> tuple[str, dict]:
+    """Is this customer in the caller's book at all?
+
+    A customer row's own city is only one answer and often no answer: it arrived
+    with 0085 and is NULL for everyone registered before it. So the trip history
+    and the care history get a vote too — a Cuttack agent who is asked about a
+    Bhubaneswar regular is legitimately their customer, and a mobile that matches
+    nothing in the branch is not.
+
+    Head office also owns the customers nobody has placed yet, same as the queues.
+    """
+    if not scope.restricted:
+        return "1 = 1", {}
+    params = {"scope_cities": sorted(scope.cities)}
+    home = "c.city_id = ANY(:scope_cities)"
+    if scope.include_unassigned:
+        home = f"({home} OR c.city_id IS NULL)"
+    booked = (
+        "EXISTS (SELECT 1 FROM master_bookings mbv "
+        "WHERE mbv.customer_id = c.id AND mbv.city_id = ANY(:scope_cities))"
+    )
+    cared = (
+        "EXISTS (SELECT 1 FROM customer_care_logs clv "
+        "WHERE clv.customer_id = c.id AND clv.city_id = ANY(:scope_cities))"
+    )
+    return f"({home} OR {booked} OR {cared})", params
+
+
 @router.get("/lookup", response_model=CustomerLookupResult, tags=["Customer Care"])
 async def lookup_customer(
     mobile: str = Query(..., min_length=10),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     await _ensure_care_log_table(db)
 
+    branch_clause, branch_params = _customer_in_branch_sql(scope)
     r = await db.execute(
         text(
-            """
+            f"""
         SELECT
             c.id AS customer_id, c.customer_code,
             u.id AS user_id,
@@ -438,10 +484,11 @@ async def lookup_customer(
         FROM users u
         JOIN customers c ON c.user_id = u.id
         WHERE u.mobile_number = :mobile AND u.user_type = 'CUSTOMER'
+          AND ({branch_clause})
         LIMIT 1
     """
         ),
-        {"mobile": mobile},
+        {"mobile": mobile, **branch_params},
     )
 
     row = r.mappings().one_or_none()
@@ -463,12 +510,14 @@ async def get_customer_profile(
     customer_id: int,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Basic customer profile by id — used by the admin booking pages to
     pre-fill the primary guest / passenger with the customer's own details."""
+    branch_clause, branch_params = _customer_in_branch_sql(scope)
     r = await db.execute(
         text(
-            """
+            f"""
         SELECT
             c.id AS customer_id, c.customer_code,
             u.id AS user_id,
@@ -480,10 +529,11 @@ async def get_customer_profile(
         FROM customers c
         JOIN users u ON u.id = c.user_id
         WHERE c.id = :cid AND u.user_type = 'CUSTOMER'
+          AND ({branch_clause})
         LIMIT 1
     """
         ),
-        {"cid": customer_id},
+        {"cid": customer_id, **branch_params},
     )
 
     row = r.mappings().one_or_none()
@@ -502,7 +552,20 @@ async def register_customer_by_admin(
     payload: CustomerRegisterByAdmin,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    # A customer is registered in the caller's city: a branch cannot file a
+    # customer it will never own work for, and a super admin's supplied city has
+    # to be active. Supplying nothing keeps the customer city-less, i.e.
+    # head-office — the same rule the enquiry lists already follow.
+    if scope.restricted:
+        effective_city_id = scope.city_id
+    elif payload.city_id is not None:
+        await assert_city_active(db, payload.city_id, "Customer city")
+        effective_city_id = payload.city_id
+    else:
+        effective_city_id = None
+
     # Check duplicate
     dup = await db.execute(
         text("SELECT id FROM users WHERE mobile_number = :mob"),
@@ -562,7 +625,7 @@ async def register_customer_by_admin(
             "code": cust_code,
             "first_name": payload.first_name,
             "last_name": payload.last_name,
-            "city_id": payload.city_id,
+            "city_id": effective_city_id,
         },
     )
 
@@ -621,20 +684,33 @@ async def get_customer_records(
     page_size: int = Query(10, ge=1, le=50),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     await _ensure_care_log_table(db)
 
+    # A customer's history is shown through city-carrying transactional rows, so
+    # a branch sees only the part of that history that happened in its city. The
+    # master booking's city is NOT NULL (allow_unassigned=False); a care log's
+    # 0085 city is nullable, so an unassigned log stays head-office only.
+    mb_scope, mb_params = city_scope_sql(
+        scope, "master_bookings.city_id", allow_unassigned=False
+    )
+    cl_scope, cl_params = city_scope_sql(scope, "customer_care_logs.city_id")
+
     # Bookings
     b_total_r = await db.execute(
-        text("SELECT COUNT(*) FROM master_bookings WHERE customer_id = :cid"),
-        {"cid": customer_id},
+        text(
+            f"SELECT COUNT(*) FROM master_bookings WHERE customer_id = :cid AND ({mb_scope})"
+        ),
+        {"cid": customer_id, **mb_params},
     )
     b_total = b_total_r.scalar() or 0
     b_offset = (booking_page - 1) * page_size
 
+    b_mb_scope, b_mb_params = city_scope_sql(scope, "mb.city_id", allow_unassigned=False)
     b_rows = await db.execute(
         text(
-            """
+            f"""
         SELECT mb.id, mb.booking_number, mb.booking_status, mb.payment_status,
                CAST(mb.total_amount AS FLOAT) AS total_amount,
                CAST(mb.journey_start_date AS TEXT) AS journey_start_date,
@@ -643,25 +719,29 @@ async def get_customer_records(
         FROM master_bookings mb
         LEFT JOIN cities ci ON ci.id = mb.city_id
         WHERE mb.customer_id = :cid
+          AND ({b_mb_scope})
         ORDER BY mb.created_at DESC
         LIMIT :limit OFFSET :offset
     """
         ),
-        {"cid": customer_id, "limit": page_size, "offset": b_offset},
+        {"cid": customer_id, "limit": page_size, "offset": b_offset, **b_mb_params},
     )
     bookings = [CustomerBookingHistoryOut(**dict(r)) for r in b_rows.mappings().all()]
 
     # Issues
     i_total_r = await db.execute(
-        text("SELECT COUNT(*) FROM customer_care_logs WHERE customer_id = :cid"),
-        {"cid": customer_id},
+        text(
+            f"SELECT COUNT(*) FROM customer_care_logs WHERE customer_id = :cid AND ({cl_scope})"
+        ),
+        {"cid": customer_id, **cl_params},
     )
     i_total = i_total_r.scalar() or 0
     i_offset = (issue_page - 1) * page_size
 
+    i_cl_scope, i_cl_params = city_scope_sql(scope, "cl.city_id")
     i_rows = await db.execute(
         text(
-            """
+            f"""
         SELECT
             cl.id, cl.log_number, cl.customer_id,
             u.first_name || ' ' || COALESCE(u.last_name, '') AS customer_name,
@@ -677,11 +757,12 @@ async def get_customer_records(
         LEFT JOIN master_bookings mb ON mb.id = cl.booking_id
         LEFT JOIN users cb_u ON cb_u.id = cl.created_by
         WHERE cl.customer_id = :cid
+          AND ({i_cl_scope})
         ORDER BY cl.created_at DESC
         LIMIT :limit OFFSET :offset
     """
         ),
-        {"cid": customer_id, "limit": page_size, "offset": i_offset},
+        {"cid": customer_id, "limit": page_size, "offset": i_offset, **i_cl_params},
     )
     issues = [CustomerCareLogOut(**dict(r)) for r in i_rows.mappings().all()]
 
@@ -705,24 +786,30 @@ async def create_care_log(
     payload: CustomerCareLogCreate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     await _ensure_care_log_table(db)
 
+    # A branch raises the log in its own city, so the row it just created is one
+    # it can still see on its filtered list; scope.city_id is that city for a
+    # branch (and for a super admin narrowed to one) and None otherwise, which
+    # files an unassigned log as head-office work.
     log_num = _log_number()
     await db.execute(
         text(
             """
         INSERT INTO customer_care_logs
-            (log_number, customer_id, issue_type, subject, description, status, priority,
+            (log_number, customer_id, city_id, issue_type, subject, description, status, priority,
              booking_id, created_by, created_at, updated_at)
         VALUES
-            (:log_num, :cid, :itype, :subject, :desc, 'OPEN', :priority,
+            (:log_num, :cid, :city_id, :itype, :subject, :desc, 'OPEN', :priority,
              :bid, :created_by, NOW(), NOW())
     """
         ),
         {
             "log_num": log_num,
             "cid": payload.customer_id,
+            "city_id": scope.city_id,
             "itype": payload.issue_type,
             "subject": payload.subject,
             "desc": payload.description,
@@ -766,8 +853,23 @@ async def update_care_log(
     payload: CustomerCareLogUpdate,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     await _ensure_care_log_table(db)
+
+    # By-id write: the list filters, but a PATCH that takes log_id in the path has
+    # to check the row before touching it. Out-of-scope is a 404, not a 403, so a
+    # Cuttack manager editing a Bhubaneswar log gets the same answer as a
+    # nonexistent one.
+    await require_row_scope(
+        db,
+        scope,
+        table="customer_care_logs",
+        id_column="id",
+        id_value=log_id,
+        city_column="city_id",
+        label="Care log",
+    )
 
     sets = ["updated_at = NOW()"]
     params: dict = {"log_id": log_id, "resolver": str(current_user["sub"])}
@@ -828,8 +930,13 @@ async def cab_booking_meta(
     city_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Returns vehicle categories with pricing for a given city (for admin cab booking form)."""
+    # A branch can only price and book in its own city, so the city it asks
+    # about is forced to its scope's; a super admin's request is taken as-is.
+    effective_city_id = scope.city_id if scope.restricted else city_id
+
     cats_r = await db.execute(
         text(
             """
@@ -841,7 +948,7 @@ async def cab_booking_meta(
     cats = [dict(r) for r in cats_r.mappings().all()]
 
     # Pricing per category per trip_type
-    if city_id:
+    if effective_city_id:
         pricing_r = await db.execute(
             text(
                 """
@@ -852,7 +959,7 @@ async def cab_booking_meta(
             WHERE city_id = :city_id
         """
             ),
-            {"city_id": city_id},
+            {"city_id": effective_city_id},
         )
     else:
         pricing_r = await db.execute(
@@ -882,8 +989,16 @@ async def cab_booking_meta(
             "toll": float(row["toll"] or 0),
         }
 
+    # The city picker shows a branch only its own city — offering another city
+    # here would be a booking the branch cannot honestly file.
+    city_scope_clause, city_scope_params = city_scope_sql(
+        scope, "id", allow_unassigned=False
+    )
     cities_r = await db.execute(
-        text("SELECT id, name FROM cities WHERE is_active = TRUE ORDER BY name")
+        text(
+            f"SELECT id, name FROM cities WHERE is_active = TRUE AND ({city_scope_clause}) ORDER BY name"
+        ),
+        city_scope_params,
     )
     cities = [dict(r) for r in cities_r.mappings().all()]
 
@@ -896,8 +1011,19 @@ async def create_cab_booking_by_admin(
     payload: CabBookingCreateByAdmin,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Admin creates a cab booking on behalf of a customer."""
+
+    # The booking's city is not trusted from the form: a branch files it in its
+    # own city, always, and the pricing lookup and the stored row use that same
+    # city so a booking cannot be priced in one city and recorded in another. A
+    # super admin supplies one, and it has to be an active city.
+    if scope.restricted:
+        effective_city_id = scope.city_id
+    else:
+        await assert_city_active(db, payload.city_id, "Booking city")
+        effective_city_id = payload.city_id
 
     # Verify customer exists
     cust_r = await db.execute(
@@ -923,7 +1049,7 @@ async def create_cab_booking_by_admin(
         """
             ),
             {
-                "cid": payload.city_id,
+                "cid": effective_city_id,
                 "vcid": payload.vehicle_category_id,
                 "ttype": payload.trip_type,
             },
@@ -984,7 +1110,7 @@ async def create_cab_booking_by_admin(
         uuid=_uuid.uuid4(),
         booking_number=mbk_number,
         customer_id=payload.customer_id,
-        city_id=payload.city_id,
+        city_id=effective_city_id,
         booking_status="CONFIRMED",
         payment_status="PENDING",
         total_amount=estimated_amount,
@@ -1059,15 +1185,24 @@ async def create_cab_booking_by_admin(
 # admin-created booking is priced by exactly the same rules as a customer one.
 
 
-async def _load_active_hotel(db: AsyncSession, hotel_id: int) -> Hotel:
+async def _load_active_hotel(
+    db: AsyncSession, hotel_id: int, scope: BranchScope
+) -> Hotel:
     """Fetch the Hotel ORM row (needed by resolve_hotel_commission and for
-    tax_mode). Only ACTIVE, non-deleted hotels are bookable."""
+    tax_mode). Only ACTIVE, non-deleted hotels are bookable.
+
+    The scope check is not decoration: `/hotel-booking/meta` only offers a branch
+    its own city's hotels, but the id arrives from the request body, so a pasted
+    one has to fail the same way it does for a hotel that does not exist (404).
+    """
     hotel = (
         await db.execute(
             select(Hotel).where(Hotel.id == hotel_id, Hotel.deleted_at.is_(None))
         )
     ).scalar_one_or_none()
     if hotel is None:
+        raise HTTPException(status_code=404, detail="Hotel not found")
+    if scope.restricted and hotel.city_id not in scope.cities:
         raise HTTPException(status_code=404, detail="Hotel not found")
     if str(hotel.status) != "ACTIVE":
         raise HTTPException(status_code=400, detail="Hotel is not active / bookable")
@@ -1137,6 +1272,7 @@ async def hotel_booking_meta(
     city_id: Optional[int] = Query(None),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Active, bookable hotels with their active room categories, for the admin
     hotel-booking form. Optionally filtered by city."""
@@ -1145,6 +1281,14 @@ async def hotel_booking_meta(
     if city_id:
         where.append("h.city_id = :city_id")
         params["city_id"] = city_id
+
+    # hotels.city_id is NOT NULL, so allow_unassigned=False; a branch picks only
+    # hotels in its own city, which bounds the hotel-booking flow downstream.
+    hotel_scope, hotel_params = city_scope_sql(
+        scope, "h.city_id", allow_unassigned=False
+    )
+    where.append(f"({hotel_scope})")
+    params.update(hotel_params)
     where_sql = " AND ".join(where)
 
     hotels_r = await db.execute(
@@ -1188,8 +1332,14 @@ async def hotel_booking_meta(
     for h in hotels:
         h["room_categories"] = cats_by_hotel.get(h["id"], [])
 
+    city_scope_clause, city_scope_params = city_scope_sql(
+        scope, "id", allow_unassigned=False
+    )
     cities_r = await db.execute(
-        text("SELECT id, name FROM cities WHERE is_active = TRUE ORDER BY name")
+        text(
+            f"SELECT id, name FROM cities WHERE is_active = TRUE AND ({city_scope_clause}) ORDER BY name"
+        ),
+        city_scope_params,
     )
     cities = [dict(r) for r in cities_r.mappings().all()]
 
@@ -1202,10 +1352,11 @@ async def hotel_booking_quote(
     payload: HotelBookingQuoteRequest,
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Price a stay without creating anything — drives the admin form's live
     fare panel."""
-    hotel = await _load_active_hotel(db, payload.hotel_id)
+    hotel = await _load_active_hotel(db, payload.hotel_id, scope)
     quote = await _compute_hotel_quote(
         db,
         hotel,
@@ -1226,13 +1377,16 @@ async def create_hotel_booking_by_admin(
     payload: HotelBookingCreateByAdmin,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Admin creates a hotel reservation on behalf of a customer. Prices the
     stay server-side, writes the master booking + reservation + service link +
     timeline, and decrements per-night inventory (guarded by the DB
     CHECK(available_rooms >= 0) constraint)."""
 
-    # Verify customer exists (and grab their city for the master booking).
+    # Verify the customer exists. The booking's branch is the hotel's city, not
+    # the customer's — a Bhubaneswar regular staying in a Cuttack hotel is
+    # Cuttack's work — so their own city_id is not what scopes this route.
     cust_r = await db.execute(
         text("SELECT id, city_id FROM customers WHERE id = :cid"),
         {"cid": payload.customer_id},
@@ -1241,7 +1395,7 @@ async def create_hotel_booking_by_admin(
     if not cust:
         raise HTTPException(status_code=404, detail="Customer not found")
 
-    hotel = await _load_active_hotel(db, payload.hotel_id)
+    hotel = await _load_active_hotel(db, payload.hotel_id, scope)
     q = await _compute_hotel_quote(
         db,
         hotel,
@@ -1451,6 +1605,7 @@ async def edit_hotel_booking_by_admin(
     payload: HotelBookingEditByAdmin,
     db: AsyncSession = Depends(get_db),
     current_user: dict = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     """Change a confirmed reservation to the customer's new requirement (dates,
     rooms, room category, occupancy, extra beds). Only permitted while the stay
@@ -1478,6 +1633,21 @@ async def edit_hotel_booking_by_admin(
     if not hr:
         raise HTTPException(status_code=404, detail="Reservation not found")
 
+    # The stay belongs to the branch its master booking is filed under, which is
+    # the hotel's city. Checked before the status rule so another office's
+    # reservation reads as absent rather than as a booking with an interesting
+    # status to probe.
+    await require_row_scope(
+        db,
+        scope,
+        table="master_bookings",
+        id_column="id",
+        id_value=hr["master_booking_id"],
+        city_column="city_id",
+        allow_unassigned=False,
+        label="Hotel reservation",
+    )
+
     res_status = str(hr["reservation_status"] or "").upper()
     if res_status != "CONFIRMED":
         raise HTTPException(
@@ -1488,7 +1658,7 @@ async def edit_hotel_booking_by_admin(
             ),
         )
 
-    hotel = await _load_active_hotel(db, int(hr["hotel_id"]))
+    hotel = await _load_active_hotel(db, int(hr["hotel_id"]), scope)
     q = await _compute_hotel_quote(
         db,
         hotel,
@@ -1651,11 +1821,16 @@ async def edit_hotel_booking_by_admin(
 async def care_stats(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     await _ensure_care_log_table(db)
+    # These counts sit on the same rows the care-log list shows — a dashboard
+    # badge that ignored the branch would tell a Cuttack manager to expect 40
+    # open issues when their queue has 3.
+    scope_clause, scope_params = city_scope_sql(scope, "customer_care_logs.city_id")
     r = await db.execute(
         text(
-            """
+            f"""
         SELECT
             COUNT(*) AS total,
             COUNT(*) FILTER (WHERE status = 'OPEN')     AS open_count,
@@ -1665,8 +1840,10 @@ async def care_stats(
             COUNT(*) FILTER (WHERE priority = 'URGENT') AS urgent_count,
             COUNT(*) FILTER (WHERE DATE(created_at) = CURRENT_DATE) AS today_count
         FROM customer_care_logs
+        WHERE ({scope_clause})
     """
-        )
+        ),
+        scope_params,
     )
     row = dict(r.mappings().one())
     return {k: int(v or 0) for k, v in row.items()}

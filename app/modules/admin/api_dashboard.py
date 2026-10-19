@@ -148,17 +148,21 @@ router = APIRouter()
     summary="Today's operational KPIs",
     description=(
         "Returns today's bookings, active trips, active partners/drivers, "
-        "today's revenue and pending settlements. "
+        "today's revenue and pending settlements — for the signed-in account's "
+        "branch, or the whole platform for a super admin. "
         "Refresh every 30 s on the frontend."
     ),
 )
-async def get_dashboard(db: AsyncSession = Depends(get_db)):
-    data = await AdminDashboardService.get_dashboard(db)
+async def get_dashboard(
+    db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
+):
+    data = await AdminDashboardService.get_dashboard(db, scope)
     return DashboardStats(**data)
 
 
 # ════════════════════════════════════════════════════════════════
-#  §4  ANALYTICS — platform summary totals
+#  §4  ANALYTICS — summary totals for the caller's branch
 # ════════════════════════════════════════════════════════════════
 
 
@@ -166,15 +170,20 @@ async def get_dashboard(db: AsyncSession = Depends(get_db)):
     "/analytics",
     response_model=SystemSummary,
     tags=["Admin – Dashboard"],
-    summary="Platform-wide summary totals",
+    summary="Summary totals for this caller's branch",
     description=(
         "Returns lifetime totals: customers, partners, drivers, vehicles, bookings, "
-        "monthly revenue, and pending approval counts. "
+        "monthly revenue, and pending approval counts. A super admin's view is the "
+        "whole platform; a branch account's is its own office, which is why the "
+        "numbers on this card and the numbers in its lists come from the same WHERE. "
         "Used in the Dashboard Platform Summary KPI row."
     ),
 )
-async def get_analytics(db: AsyncSession = Depends(get_db)):
-    data = await AdminDashboardService.get_system_summary(db)
+async def get_analytics(
+    db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
+):
+    data = await AdminDashboardService.get_system_summary(db, scope)
     return SystemSummary(**data)
 
 
@@ -183,11 +192,14 @@ async def get_analytics(db: AsyncSession = Depends(get_db)):
     "/system-summary",
     response_model=SystemSummary,
     tags=["Admin – Dashboard"],
-    summary="Platform-wide summary totals (alias)",
+    summary="Summary totals (alias)",
     include_in_schema=False,
 )
-async def get_system_summary(db: AsyncSession = Depends(get_db)):
-    data = await AdminDashboardService.get_system_summary(db)
+async def get_system_summary(
+    db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
+):
+    data = await AdminDashboardService.get_system_summary(db, scope)
     return SystemSummary(**data)
 
 
@@ -196,10 +208,17 @@ async def get_system_summary(db: AsyncSession = Depends(get_db)):
     response_model=List[CityPerformanceItem],
     tags=["Admin – Dashboard"],
     summary="Top 5 cities by bookings this month (cab + hotel)",
+    description=(
+        "A comparison across offices. A branch account owns one office, so it "
+        "gets one bar — the chart is not hidden from it, it is just honest about "
+        "what there is to compare."
+    ),
 )
-async def get_city_performance(db: AsyncSession = Depends(get_db)):
-
-    rows = await AdminDashboardService.get_city_performance(db)
+async def get_city_performance(
+    db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
+):
+    rows = await AdminDashboardService.get_city_performance(db, scope)
     return [CityPerformanceItem(**r) for r in rows]
 
 
@@ -209,8 +228,11 @@ async def get_city_performance(db: AsyncSession = Depends(get_db)):
     tags=["Admin – Dashboard"],
     summary="Monthly revenue + booking count for the last 6 months",
 )
-async def get_revenue_trend(db: AsyncSession = Depends(get_db)):
-    rows = await AdminDashboardService.get_revenue_trend(db)
+async def get_revenue_trend(
+    db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
+):
+    rows = await AdminDashboardService.get_revenue_trend(db, scope)
     return [RevenueTrendItem(**r) for r in rows]
 
 
@@ -218,13 +240,14 @@ async def get_revenue_trend(db: AsyncSession = Depends(get_db)):
     "/dashboard/recent-activity",
     response_model=List[RecentActivityItem],
     tags=["Admin – Dashboard"],
-    summary="Latest 10 platform events (bookings + partner actions)",
+    summary="Latest events in this branch (bookings + partner actions)",
 )
 async def get_recent_activity(
     limit: int = Query(10, ge=1, le=30),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
-    rows = await AdminDashboardService.get_recent_activity(db, limit=limit)
+    rows = await AdminDashboardService.get_recent_activity(db, limit=limit, scope=scope)
     return [RecentActivityItem(**r) for r in rows]
 
 
@@ -4975,16 +4998,18 @@ async def list_staff_work_hours(
     "/action-counts",
     response_model=Dict[str, int],
     tags=["Admin – Sidebar"],
-    summary="Pending items per Operations queue",
+    summary="Pending items per Operations queue, in this branch",
     description=(
         "One call for every sidebar badge: how many items in each queue are "
-        "waiting on somebody right now. A queue the caller cannot open still "
-        "returns its count — the badge is a number, not a record — and the "
-        "client hides zero. Cached for 45 seconds because the portal polls "
-        "every 60."
+        "waiting on somebody right now, in the caller's branch. A queue the "
+        "caller cannot open still returns its count — the badge is a number, not "
+        "a record — and the client hides zero. Cached per branch for 45 seconds "
+        "because the portal polls every 60; one shared cache entry would show "
+        "every branch whoever happened to ask first."
     ),
 )
 async def action_counts(
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ) -> Dict[str, int]:
-    return await AdminDashboardService.get_action_counts(db)
+    return await AdminDashboardService.get_action_counts(db, scope)

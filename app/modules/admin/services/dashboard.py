@@ -27,7 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from app.core.timezone import get_platform_tz
-from app.core.branch_scope import BranchScope
+from app.core.branch_scope import BranchScope, ScopeSql
 from app.core.exceptions import (
     BusinessException,
     PermissionDeniedException,
@@ -44,8 +44,21 @@ from app.modules.admin.schemas.dashboard import (
 
 # Sidebar badges: 45 s is shorter than the portal's 60 s poll, so a queue is
 # never served from a cache that is staler than the refresh the client does.
-ACTION_COUNTS_CACHE_KEY = "admin:action_counts"
+ACTION_COUNTS_CACHE_PREFIX = "admin:action_counts"
 ACTION_COUNTS_TTL_SECONDS = 45
+
+
+def action_counts_cache_key(scope: BranchScope) -> str:
+    """One cache entry per branch, never one for the platform.
+
+    The badge counts are per-branch facts, and they are cached. A single key
+    would serve whichever branch asked first to every other branch's sidebar —
+    and the first caller after deployment is whoever happens to be logged in, so
+    the wrong number would be correct half the time in testing and wrong in
+    production. "all" is the super admin's unfiltered view, which is a real
+    thing to cache and is not any branch's answer.
+    """
+    return f"{ACTION_COUNTS_CACHE_PREFIX}:{scope.branch_id or 'all'}"
 
 # The staff register. SUPER_ADMIN is a row only a super admin may enumerate:
 # it is not a hireable role (StaffUserCreate refuses it) and a manager has no
@@ -64,86 +77,166 @@ MANAGER_VISIBLE_ROLES = (
     "FINANCE_MANAGER",
 )
 
-# (nav key, count query). The keys are the sidebar's, so the client can index
-# the response without a mapping table of its own.
+# (nav key, count query) — built per caller, because every arm of the UNION has
+# to carry this branch's city or the sidebar lies. The keys are the sidebar's, so
+# the client can index the response without a mapping table of its own.
 _CLOSED_CAPTURE_STATUSES = "'CLOSED', 'DONE', 'EXPIRED'"
 
-_ACTION_COUNT_QUERIES: tuple[tuple[str, str], ...] = tuple(
-    (
-        ("bookings", "SELECT 'bookings' AS nav_key, COUNT(*) AS c FROM cab_bookings "
-                      "WHERE booking_status = 'PENDING_ASSIGNMENT'"),
-        ("cab-ops", "SELECT 'cab-ops' AS nav_key, COUNT(*) AS c FROM cab_bookings "
-                     "WHERE booking_status = 'PENDING_PARTNER_ACCEPTANCE'"),
-        ("trip-assistance",
-         "SELECT 'trip-assistance' AS nav_key, COUNT(*) AS c FROM cab_bookings "
-         "WHERE booking_status IN ('DRIVER_ASSIGNED', 'STARTED') "
-         "   OR (booking_status = 'COMPLETED' AND payment_mode IS NULL) "
-         "   OR (booking_status = 'COMPLETED' AND cash_pending_at = 'DRIVER')"),
-        ("customer-care",
-         "SELECT 'customer-care' AS nav_key, COUNT(*) AS c FROM customer_care_logs "
-         "WHERE status IN ('OPEN', 'IN_PROGRESS')"),
-        ("chat",
-         "SELECT 'chat' AS nav_key, COUNT(*) AS c FROM chat_conversations "
-         "WHERE status = 'WAITING' OR (status = 'OPEN' AND unread_admin_count > 0)"),
-        ("callback-requests",
-         f"SELECT 'callback-requests' AS nav_key, COUNT(*) AS c FROM callback_requests "
-         f"WHERE status NOT IN ({_CLOSED_CAPTURE_STATUSES})"),
-        ("contact-messages",
-         "SELECT 'contact-messages' AS nav_key, COUNT(*) AS c FROM contact_messages "
-         "WHERE is_read = false"),
-        ("enquiries",
-         f"SELECT 'enquiries' AS nav_key, COUNT(*) AS c FROM enquiries "
-         f"WHERE status NOT IN ({_CLOSED_CAPTURE_STATUSES})"),
-        ("partner-applications",
-         "SELECT 'partner-applications' AS nav_key, COUNT(*) AS c FROM partner_applications "
-         "WHERE status = 'NEW'"),
-        ("guest-feedback",
-         "SELECT 'guest-feedback' AS nav_key, COUNT(*) AS c FROM booking_reviews "
-         "WHERE status = 'PENDING'"),
-        ("account-deletion",
-         "SELECT 'account-deletion' AS nav_key, COUNT(*) AS c "
-         "FROM account_deletion_requests WHERE status = 'PENDING'"),
+
+def _action_counts_statement(scope: BranchScope) -> tuple[str, dict[str, Any]]:
+    """The eleven queue counts as one UNION, scoped to this caller.
+
+    Written out per queue rather than generated from a table: each reaches its
+    city a different way — its own `city_id` column (the capture queues, which
+    migration 0085 gave one), its booking (the cab queues and guest feedback,
+    which have no location of their own), its partner (deletions and approvals) —
+    and a template that hides which one is a template that quietly counts another
+    branch's work.
+    """
+    city = ScopeSql(scope)
+    parts = [
+        (
+            "SELECT 'bookings' AS nav_key, COUNT(*) AS c FROM cab_bookings cb "
+            f"WHERE cb.booking_status = 'PENDING_ASSIGNMENT' "
+            f"AND ({city.through_bookings('cb', param='ac_bookings')})"
+        ),
+        (
+            "SELECT 'cab-ops' AS nav_key, COUNT(*) AS c FROM cab_bookings cb "
+            f"WHERE cb.booking_status = 'PENDING_PARTNER_ACCEPTANCE' "
+            f"AND ({city.through_bookings('cb', param='ac_cab_ops')})"
+        ),
+        (
+            "SELECT 'trip-assistance' AS nav_key, COUNT(*) AS c FROM cab_bookings cb "
+            "WHERE (cb.booking_status IN ('DRIVER_ASSIGNED', 'STARTED') "
+            "   OR (cb.booking_status = 'COMPLETED' AND cb.payment_mode IS NULL) "
+            "   OR (cb.booking_status = 'COMPLETED' AND cb.cash_pending_at = 'DRIVER')) "
+            f"AND ({city.through_bookings('cb', param='ac_trip_assist')})"
+        ),
+        (
+            "SELECT 'customer-care' AS nav_key, COUNT(*) AS c FROM customer_care_logs cl "
+            f"WHERE cl.status IN ('OPEN', 'IN_PROGRESS') "
+            f"AND ({city.city('cl.city_id', param='ac_care')})"
+        ),
+        (
+            "SELECT 'chat' AS nav_key, COUNT(*) AS c FROM chat_conversations cc "
+            "WHERE (cc.status = 'WAITING' "
+            "       OR (cc.status = 'OPEN' AND cc.unread_admin_count > 0)) "
+            f"AND ({city.city('cc.city_id', param='ac_chat')})"
+        ),
+        (
+            f"SELECT 'callback-requests' AS nav_key, COUNT(*) AS c FROM callback_requests cr "
+            f"WHERE cr.status NOT IN ({_CLOSED_CAPTURE_STATUSES}) "
+            f"AND ({city.city('cr.city_id', param='ac_callback')})"
+        ),
+        (
+            "SELECT 'contact-messages' AS nav_key, COUNT(*) AS c FROM contact_messages cm "
+            f"WHERE cm.is_read = false "
+            f"AND ({city.city('cm.city_id', param='ac_messages')})"
+        ),
+        (
+            f"SELECT 'enquiries' AS nav_key, COUNT(*) AS c FROM enquiries e "
+            f"WHERE e.status NOT IN ({_CLOSED_CAPTURE_STATUSES}) "
+            f"AND ({city.city('e.city_id', param='ac_enquiries')})"
+        ),
+        (
+            "SELECT 'partner-applications' AS nav_key, COUNT(*) AS c "
+            "FROM partner_applications pa "
+            f"WHERE pa.status = 'NEW' "
+            f"AND ({city.city('pa.city_id', param='ac_partner_apps')})"
+        ),
+        (
+            "SELECT 'guest-feedback' AS nav_key, COUNT(*) AS c FROM booking_reviews br "
+            f"WHERE br.status = 'PENDING' "
+            f"AND ({city.through_bookings('br', param='ac_feedback')})"
+        ),
+        (
+            "SELECT 'account-deletion' AS nav_key, COUNT(*) AS c "
+            "FROM account_deletion_requests adr "
+            "WHERE adr.status = 'PENDING' "
+            f"AND ({_deletion_city_clause(city)})"
+        ),
+    ]
+    return "\nUNION ALL\n".join(parts), city.params
+
+
+def _deletion_city_clause(city: ScopeSql) -> str:
+    """A deletion request's office is the office of the customer asking for it.
+
+    `account_deletion_requests` has no city and no booking — only the customer
+    row, whose own `city_id` is nullable. A request whose customer cannot be
+    resolved therefore belongs to no branch, including the head office: the
+    predicate is false for it, which leaves it visible to a super admin (whose
+    clause is vacuous) and invisible to everyone else. That is the fail-closed
+    direction, and a deletion request is not a queue a branch acts on this round.
+    """
+    if not city.scope.restricted:
+        return "1 = 1"
+    return (
+        "EXISTS (SELECT 1 FROM customers cu WHERE cu.id = adr.customer_id AND "
+        + city.city("cu.city_id", param="ac_deletion")
+        + ")"
     )
-)
 
 
 class AdminDashboardService:
 
     # ── §3 Dashboard KPIs ────────────────────────────────────────────────────
     @staticmethod
-    async def get_dashboard(db: AsyncSession) -> Dict[str, Any]:
+    async def get_dashboard(
+        db: AsyncSession, scope: BranchScope
+    ) -> Dict[str, Any]:
+        """The KPI row on the landing page, for one caller's branch.
+
+        Every figure is scoped, including the money: a Cuttack manager reading a
+        "today's revenue" that contains Bhubaneswar's bookings has no way to tell
+        the number is not theirs, and no way to decide anything with it. A
+        settlement and a partner approval are scoped through the party that owes
+        or is waiting, because a settlement has no city of its own.
+        """
+        city = ScopeSql(scope)
         r = await db.execute(
             text(
-                """
+                f"""
             SELECT
-                (SELECT COUNT(*) FROM cab_bookings WHERE DATE(created_at) = CURRENT_DATE)
-                    AS today_cab_bookings,
-                (SELECT COUNT(*) FROM hotel_reservations WHERE DATE(created_at) = CURRENT_DATE)
-                    AS today_hotel_reservations,
-                (SELECT COUNT(*) FROM cab_bookings
-                 WHERE booking_status IN ('STARTED','DRIVER_ASSIGNED'))
-                    AS active_trips,
+                (SELECT COUNT(*) FROM cab_bookings cb
+                 WHERE DATE(cb.created_at) = CURRENT_DATE
+                   AND ({city.through_bookings("cb", param="dash_cab_today")})
+                ) AS today_cab_bookings,
+                (SELECT COUNT(*) FROM hotel_reservations hr
+                 WHERE DATE(hr.created_at) = CURRENT_DATE
+                   AND ({city.through_bookings("hr", param="dash_hotel_today")})
+                ) AS today_hotel_reservations,
+                (SELECT COUNT(*) FROM cab_bookings cb
+                 WHERE cb.booking_status IN ('STARTED','DRIVER_ASSIGNED')
+                   AND ({city.through_bookings("cb", param="dash_cab_active")})
+                ) AS active_trips,
                 COALESCE((
                     SELECT SUM(cb.final_amount)
                     FROM cab_bookings cb
                     WHERE cb.booking_status = 'COMPLETED'
                       AND DATE(cb.trip_ended_at) = CURRENT_DATE
+                      AND ({city.through_bookings("cb", param="dash_cab_rev")})
                 ), 0) +
                 COALESCE((
                     SELECT SUM(hr.total_amount)
                     FROM hotel_reservations hr
                     WHERE hr.payment_collected_status = 'PAID'
                       AND DATE(hr.payment_collected_at) = CURRENT_DATE
+                      AND ({city.through_bookings("hr", param="dash_hotel_rev")})
                 ), 0) AS today_revenue,
                 COALESCE((
-                    SELECT SUM(net_payable_amount) FROM settlements
-                    WHERE settlement_status = 'PENDING'
+                    SELECT SUM(s.net_payable_amount) FROM settlements s
+                    JOIN partners p ON p.id = s.partner_id
+                    WHERE s.settlement_status = 'PENDING'
+                      AND ({city.city("p.city_id", param="dash_settle", allow_unassigned=False)})
                 ), 0) AS pending_settlements,
-                (SELECT COUNT(*) FROM partners
-                 WHERE status IN ('PENDING','UNDER_REVIEW','DOCUMENT_PENDING'))
-                    AS pending_partner_approvals
+                (SELECT COUNT(*) FROM partners p
+                 WHERE p.status IN ('PENDING','UNDER_REVIEW','DOCUMENT_PENDING')
+                   AND ({city.city("p.city_id", param="dash_partner", allow_unassigned=False)})
+                ) AS pending_partner_approvals
         """
-            )
+            ),
+            city.params,
         )
         row = r.mappings().one()
         return {
@@ -157,33 +250,58 @@ class AdminDashboardService:
 
     # ── §4 System Summary ────────────────────────────────────────────────────
     @staticmethod
-    async def get_system_summary(db: AsyncSession) -> Dict[str, Any]:
+    async def get_system_summary(
+        db: AsyncSession, scope: BranchScope
+    ) -> Dict[str, Any]:
+        city = ScopeSql(scope)
+
+        # A customer's office is the one on their customer row, not a branch of
+        # their own. Written as EXISTS rather than a join so that a super admin —
+        # for whom the predicate is vacuous — still gets the count of every
+        # customer account, including any that has no customer row yet.
+        customers_clause = (
+            "1 = 1"
+            if not scope.restricted
+            else "EXISTS (SELECT 1 FROM customers cu WHERE cu.user_id = u.id AND "
+            + city.city("cu.city_id", param="sum_customers")
+            + ")"
+        )
+
         r = await db.execute(
             text(
-                """
+                f"""
             SELECT
-                (SELECT COUNT(*) FROM users WHERE user_type = 'CUSTOMER') AS total_customers,
-                (SELECT COUNT(*) FROM partners WHERE deleted_at IS NULL) AS total_partners,
-                (SELECT COUNT(*) FROM partners WHERE status = 'ACTIVE' AND deleted_at IS NULL) AS active_partners,
-                (SELECT COUNT(*) FROM hotels) AS total_hotels,
-                (SELECT COUNT(*) FROM hotels WHERE status = 'ACTIVE') AS active_hotels,
+                (SELECT COUNT(*) FROM users u WHERE u.user_type = 'CUSTOMER'
+                 AND ({customers_clause})) AS total_customers,
+                (SELECT COUNT(*) FROM partners p WHERE p.deleted_at IS NULL
+                 AND ({city.city("p.city_id", param="sum_partners", allow_unassigned=False)})) AS total_partners,
+                (SELECT COUNT(*) FROM partners p WHERE p.status = 'ACTIVE' AND p.deleted_at IS NULL
+                 AND ({city.city("p.city_id", param="sum_active_partners", allow_unassigned=False)})) AS active_partners,
+                (SELECT COUNT(*) FROM hotels h
+                 WHERE ({city.city("h.city_id", param="sum_hotels", allow_unassigned=False)})) AS total_hotels,
+                (SELECT COUNT(*) FROM hotels h WHERE h.status = 'ACTIVE'
+                 AND ({city.city("h.city_id", param="sum_active_hotels", allow_unassigned=False)})) AS active_hotels,
                 COALESCE((
                     SELECT SUM(cb.final_amount)
                     FROM cab_bookings cb
                     WHERE cb.booking_status = 'COMPLETED'
                       AND cb.trip_ended_at >= DATE_TRUNC('month', NOW())
+                      AND ({city.through_bookings("cb", param="sum_cab_rev")})
                 ), 0) +
                 COALESCE((
                     SELECT SUM(hr.total_amount)
                     FROM hotel_reservations hr
                     WHERE hr.reservation_status NOT IN ('CANCELLED','EXPIRED')
                       AND hr.created_at >= DATE_TRUNC('month', NOW())
+                      AND ({city.through_bookings("hr", param="sum_hotel_rev")})
                 ), 0) AS monthly_revenue,
-                (SELECT COUNT(*) FROM hotels
-                 WHERE status IN ('PENDING','UNDER_REVIEW','DOCUMENT_PENDING'))
+                (SELECT COUNT(*) FROM hotels h
+                 WHERE h.status IN ('PENDING','UNDER_REVIEW','DOCUMENT_PENDING')
+                 AND ({city.city("h.city_id", param="sum_hotel_pending", allow_unassigned=False)}))
                     AS pending_hotel_approvals
         """
-            )
+            ),
+            city.params,
         )
         row = r.mappings().one()
         return {
@@ -199,20 +317,29 @@ class AdminDashboardService:
     # ── Dashboard Charts ─────────────────────────────────────────────────────
 
     @staticmethod
-    async def get_city_performance(db: AsyncSession) -> List[Dict[str, Any]]:
-        """Top 5 cities by combined cab + hotel bookings this month."""
+    async def get_city_performance(
+        db: AsyncSession, scope: BranchScope
+    ) -> List[Dict[str, Any]]:
+        """Top 5 cities by combined cab + hotel bookings this month.
+
+        For a branch account this chart is one bar: the chart compares offices,
+        and an account that owns one office has one thing to compare.
+        """
+        city = ScopeSql(scope)
         r = await db.execute(
             text(
-                """
+                f"""
             SELECT ci.name AS city, COUNT(*) AS bookings
             FROM master_bookings mb
             JOIN cities ci ON ci.id = mb.city_id
             WHERE mb.created_at >= DATE_TRUNC('month', NOW())
+              AND ({city.city("mb.city_id", param="perf_city", allow_unassigned=False)})
             GROUP BY ci.name
             ORDER BY bookings DESC
             LIMIT 5
         """
-            )
+            ),
+            city.params,
         )
         return [
             {"city": row["city"], "bookings": int(row["bookings"])}
@@ -220,11 +347,14 @@ class AdminDashboardService:
         ]
 
     @staticmethod
-    async def get_revenue_trend(db: AsyncSession) -> List[Dict[str, Any]]:
+    async def get_revenue_trend(
+        db: AsyncSession, scope: BranchScope
+    ) -> List[Dict[str, Any]]:
         """Monthly revenue + booking count for the last 6 calendar months."""
+        city = ScopeSql(scope)
         r = await db.execute(
             text(
-                """
+                f"""
             WITH months AS (
                 SELECT generate_series(
                     DATE_TRUNC('month', NOW()) - INTERVAL '5 months',
@@ -233,21 +363,23 @@ class AdminDashboardService:
                 ) AS month_start
             ),
             cab_rev AS (
-                SELECT DATE_TRUNC('month', trip_ended_at) AS m,
-                       COALESCE(SUM(final_amount), 0) AS rev,
+                SELECT DATE_TRUNC('month', cb.trip_ended_at) AS m,
+                       COALESCE(SUM(cb.final_amount), 0) AS rev,
                        COUNT(*) AS cnt
-                FROM cab_bookings
-                WHERE booking_status = 'COMPLETED'
-                  AND trip_ended_at >= DATE_TRUNC('month', NOW()) - INTERVAL '5 months'
+                FROM cab_bookings cb
+                WHERE cb.booking_status = 'COMPLETED'
+                  AND cb.trip_ended_at >= DATE_TRUNC('month', NOW()) - INTERVAL '5 months'
+                  AND ({city.through_bookings("cb", param="trend_cab")})
                 GROUP BY m
             ),
             hotel_rev AS (
-                SELECT DATE_TRUNC('month', created_at) AS m,
-                       COALESCE(SUM(total_amount), 0) AS rev,
+                SELECT DATE_TRUNC('month', hr.created_at) AS m,
+                       COALESCE(SUM(hr.total_amount), 0) AS rev,
                        COUNT(*) AS cnt
-                FROM hotel_reservations
-                WHERE reservation_status NOT IN ('CANCELLED','EXPIRED')
-                  AND created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '5 months'
+                FROM hotel_reservations hr
+                WHERE hr.reservation_status NOT IN ('CANCELLED','EXPIRED')
+                  AND hr.created_at >= DATE_TRUNC('month', NOW()) - INTERVAL '5 months'
+                  AND ({city.through_bookings("hr", param="trend_hotel")})
                 GROUP BY m
             )
             SELECT
@@ -259,7 +391,8 @@ class AdminDashboardService:
             LEFT JOIN hotel_rev ON hotel_rev.m = months.month_start
             ORDER BY months.month_start
         """
-            )
+            ),
+            city.params,
         )
         return [
             {
@@ -272,12 +405,19 @@ class AdminDashboardService:
 
     @staticmethod
     async def get_recent_activity(
-        db: AsyncSession, limit: int = 10
+        db: AsyncSession, limit: int = 10, *, scope: BranchScope
     ) -> List[Dict[str, Any]]:
-        """Latest meaningful events from booking_timelines + partner_verification_logs."""
+        """Latest meaningful events from booking_timelines + partner_verification_logs.
+
+        Filtered before the LIMIT, not after: the feed is "the newest ten things
+        that happened here", and taking the platform's newest ten and then
+        dropping the ones that are not yours would leave a branch manager with a
+        list of three that is missing seven events they never see they had.
+        """
+        city = ScopeSql(scope)
         booking_events = await db.execute(
             text(
-                """
+                f"""
             SELECT
                 bt.id::text AS id,
                 bt.event_type,
@@ -290,16 +430,17 @@ class AdminDashboardService:
                 'TRIP_CLOSED_BY_PARTNER','HOTEL_CHECKED_IN','HOTEL_CHECKED_OUT',
                 'HOTEL_COMPLETED','PAYMENT_CASH_COLLECTED','HOTEL_PAYMENT_COLLECTED'
             )
+              AND ({city.city("mb.city_id", param="act_bookings", allow_unassigned=False)})
             ORDER BY bt.event_timestamp DESC
             LIMIT :lim
         """
             ),
-            {"lim": limit},
+            {**city.params, "lim": limit},
         )
 
         partner_events = await db.execute(
             text(
-                """
+                f"""
             SELECT
                 pvl.id::text AS id,
                 pvl.action AS event_type,
@@ -311,11 +452,12 @@ class AdminDashboardService:
             WHERE pvl.action IN (
                 'ADMIN_ACTIVE','ADMIN_APPROVED','PARTNER_REGISTERED'
             )
+              AND ({city.city("p.city_id", param="act_partners", allow_unassigned=False)})
             ORDER BY pvl.created_at DESC
             LIMIT :lim
         """
             ),
-            {"lim": limit // 2},
+            {**city.params, "lim": limit // 2},
         )
 
         _STATUS_MAP = {
@@ -1862,7 +2004,9 @@ class AdminDashboardService:
 
     # ── Sidebar action counts (Admin Portal §5 — Operations badges) ──────────
     @staticmethod
-    async def get_action_counts(db: AsyncSession) -> Dict[str, int]:
+    async def get_action_counts(
+        db: AsyncSession, scope: BranchScope
+    ) -> Dict[str, int]:
         """How many items in each queue are waiting on somebody right now.
 
         One round trip, not eleven: the sidebar polls this every minute for
@@ -1871,25 +2015,26 @@ class AdminDashboardService:
         chances for one slow table to stall a badge.
 
         Each fragment is the WHERE clause the matching queue page already uses,
-        so a badge and the list under it cannot disagree. A nav key with no
-        honest pending concept is left out rather than given a number that
-        means something else: hotel switches are an append-only audit (no row
-        ever waits for a switch), and settlements are still writing `status`
-        while every reader filters on `settlement_status`.
+        plus this caller's branch, so a badge and the list under it cannot
+        disagree. A nav key with no honest pending concept is left out rather
+        than given a number that means something else: hotel switches are an
+        append-only audit (no row ever waits for a switch), and settlements are
+        still writing `status` while every reader filters on `settlement_status`.
         """
         cache = RedisCache(await get_redis())
+        cache_key = action_counts_cache_key(scope)
         try:
-            cached = await cache.get(ACTION_COUNTS_CACHE_KEY)
+            cached = await cache.get(cache_key)
         except Exception:  # Redis being down must not blank the sidebar
             cached = None
         if isinstance(cached, dict):
             return {k: int(v) for k, v in cached.items()}
 
-        union_sql = "\nUNION ALL\n".join(sql for _, sql in _ACTION_COUNT_QUERIES)
-        rows = (await db.execute(text(union_sql))).mappings().all()
+        union_sql, params = _action_counts_statement(scope)
+        rows = (await db.execute(text(union_sql), params)).mappings().all()
         counts = {row["nav_key"]: int(row["c"] or 0) for row in rows}
         try:
-            await cache.set(ACTION_COUNTS_CACHE_KEY, counts, ACTION_COUNTS_TTL_SECONDS)
+            await cache.set(cache_key, counts, ACTION_COUNTS_TTL_SECONDS)
         except Exception:
             pass
         return counts

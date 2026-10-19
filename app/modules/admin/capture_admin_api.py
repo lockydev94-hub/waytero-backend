@@ -34,6 +34,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text as _text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.branch_scope import (
+    BranchScope,
+    city_scope_sql,
+    get_branch_scope,
+    require_row_scope,
+)
 from app.core.database import get_db
 from app.core.dependencies import require_roles
 from app.core.exceptions import ResourceNotFoundException, ValidationException
@@ -167,6 +173,7 @@ async def list_enquiries(
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     filters = ["1 = 1"]
     params: dict = {}
@@ -185,6 +192,13 @@ async def list_enquiries(
             " OR e.message ILIKE :search)"
         )
         params["search"] = f"%{search.strip()}%"
+    # A website enquiry with no city is head-office triage, so a branch must not
+    # see it and HQ must — the nullable-column default (allow_unassigned=True) is
+    # exactly that. This clause is the only thing keeping a Cuttack CCO off
+    # Bhubaneswar's leads.
+    scope_clause, scope_params = city_scope_sql(scope, "e.city_id")
+    filters.append(f"({scope_clause})")
+    params.update(scope_params)
     where = " AND ".join(filters)
     offset = (page - 1) * page_size
 
@@ -252,11 +266,20 @@ async def list_enquiries(
 async def enquiry_stats(
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    # The tiles above the enquiry list must count the same rows the list returns
+    # (same column, same allow_unassigned) or a branch manager reads a total that
+    # has no page behind it.
+    scope_clause, scope_params = city_scope_sql(scope, "city_id")
     rows = (
         (
             await db.execute(
-                _text("SELECT status, COUNT(*) AS c FROM enquiries GROUP BY status")
+                _text(
+                    f"SELECT status, COUNT(*) AS c FROM enquiries "
+                    f"WHERE {scope_clause} GROUP BY status"
+                ),
+                scope_params,
             )
         )
         .mappings()
@@ -280,8 +303,21 @@ async def update_enquiry(
     body: EnquiryUpdate,
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     body.validate_all()
+    # The id came from the path, not from a scoped list — establish the branch
+    # owns this enquiry before the FOR UPDATE, or a Cuttack CCO edits a
+    # Bhubaneswar lead by pasting its id. Out-of-scope reads as 404.
+    await require_row_scope(
+        db,
+        scope,
+        table="enquiries",
+        id_column="id",
+        id_value=enquiry_id,
+        city_column="city_id",
+        label="Enquiry",
+    )
 
     existing = (
         await db.execute(
@@ -343,13 +379,25 @@ async def create_quotation(
     body: QuotationCreate,
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     body.validate_all()
+    await require_row_scope(
+        db,
+        scope,
+        table="enquiries",
+        id_column="id",
+        id_value=enquiry_id,
+        city_column="city_id",
+        label="Enquiry",
+    )
 
     enquiry = (
         (
             await db.execute(
-                _text("SELECT id, service_type FROM enquiries WHERE id = :id"),
+                _text(
+                    "SELECT id, service_type, city_id FROM enquiries WHERE id = :id"
+                ),
                 {"id": enquiry_id},
             )
         )
@@ -365,15 +413,19 @@ async def create_quotation(
                 _text(
                     """
                     INSERT INTO quotations
-                        (enquiry_id, service_type, summary, amount, valid_till,
-                         terms, status, created_by)
-                    VALUES (:enquiry_id, :service_type, :summary, :amount,
-                            :valid_till, :terms, :status, :created_by)
+                        (enquiry_id, city_id, service_type, summary, amount,
+                         valid_till, terms, status, created_by)
+                    VALUES (:enquiry_id, :city_id, :service_type, :summary,
+                            :amount, :valid_till, :terms, :status, :created_by)
                     RETURNING id
                     """
                 ),
                 {
                     "enquiry_id": enquiry_id,
+                    # A quotation inherits its enquiry's city: it is worked by the
+                    # same office that raised it, and a NULL here would silently
+                    # refile a Cuttack quote under head office.
+                    "city_id": enquiry["city_id"],
                     "service_type": body.service_type or enquiry["service_type"],
                     "summary": body.summary.strip(),
                     "amount": body.amount,
@@ -415,6 +467,7 @@ async def list_quotations(
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     filters = ["1 = 1"]
     params: dict = {}
@@ -424,6 +477,12 @@ async def list_quotations(
     if status:
         filters.append("q.status = :status")
         params["status"] = _one_of(QUOTATION_STATUSES, "status", status)
+    # A quotation carries the city of the enquiry it was raised from, so scoping
+    # on q.city_id is enough: even if a caller guesses another branch's
+    # enquiry_id, the city filter returns nothing rather than that branch's quote.
+    scope_clause, scope_params = city_scope_sql(scope, "q.city_id")
+    filters.append(f"({scope_clause})")
+    params.update(scope_params)
     where = " AND ".join(filters)
     offset = (page - 1) * page_size
 
@@ -478,8 +537,18 @@ async def update_quotation(
     body: QuotationUpdate,
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     body.validate_all()
+    await require_row_scope(
+        db,
+        scope,
+        table="quotations",
+        id_column="id",
+        id_value=quotation_id,
+        city_column="city_id",
+        label="Quotation",
+    )
 
     existing = (
         await db.execute(
@@ -526,6 +595,7 @@ async def list_callbacks(
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     filters = ["1 = 1"]
     params: dict = {}
@@ -535,6 +605,11 @@ async def list_callbacks(
     if search:
         filters.append("(cb.mobile ILIKE :search OR cb.name ILIKE :search)")
         params["search"] = f"%{search.strip()}%"
+    # Callbacks are the same unassigned-to-HQ queue as enquiries; a caller's
+    # "call these back" list must be their branch's only.
+    scope_clause, scope_params = city_scope_sql(scope, "cb.city_id")
+    filters.append(f"({scope_clause})")
+    params.update(scope_params)
     where = " AND ".join(filters)
     offset = (page - 1) * page_size
 
@@ -596,13 +671,19 @@ async def list_callbacks(
 async def callback_stats(
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
+    # Same rows as the callback list, or the open-work tile disagrees with the
+    # queue the CCO is actually looking at.
+    scope_clause, scope_params = city_scope_sql(scope, "city_id")
     rows = (
         (
             await db.execute(
                 _text(
-                    "SELECT status, COUNT(*) AS c FROM callback_requests GROUP BY status"
-                )
+                    f"SELECT status, COUNT(*) AS c FROM callback_requests "
+                    f"WHERE {scope_clause} GROUP BY status"
+                ),
+                scope_params,
             )
         )
         .mappings()
@@ -626,8 +707,18 @@ async def update_callback(
     body: CallbackUpdate,
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     body.validate_all()
+    await require_row_scope(
+        db,
+        scope,
+        table="callback_requests",
+        id_column="id",
+        id_value=callback_id,
+        city_column="city_id",
+        label="Callback request",
+    )
 
     existing = (
         await db.execute(
@@ -679,6 +770,7 @@ async def list_feedback(
     page_size: int = Query(20, ge=1, le=100),
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     filters = ["br.source = 'GUEST_WEB'"]
     params: dict = {}
@@ -700,12 +792,28 @@ async def list_feedback(
             " OR br.review ILIKE :search)"
         )
         params["search"] = f"%{search.strip()}%"
+    # booking_reviews has no city of its own — the branch is its master booking's.
+    # Reached through a join to a NOT NULL column, so allow_unassigned=False: a
+    # missing booking is a data bug, not head-office work, and must not leak to HQ.
+    scope_clause, scope_params = city_scope_sql(
+        scope, "mb.city_id", allow_unassigned=False
+    )
+    filters.append(f"({scope_clause})")
+    params.update(scope_params)
     where = " AND ".join(filters)
     offset = (page - 1) * page_size
 
+    # The count joins master_bookings so the scope predicate on mb.city_id is
+    # resolvable there too; a scope clause that only reached the page query would
+    # leave the "N results" header counting every branch.
     total = (
         await db.execute(
-            _text(f"SELECT COUNT(*) FROM booking_reviews br WHERE {where}"), params
+            _text(
+                f"SELECT COUNT(*) FROM booking_reviews br "
+                f"JOIN master_bookings mb ON mb.id = br.master_booking_id "
+                f"WHERE {where}"
+            ),
+            params,
         )
     ).scalar()
 
@@ -804,11 +912,26 @@ async def list_feedback(
 
 async def _moderate(
     db: AsyncSession,
+    scope: BranchScope,
     feedback_id: int,
     status: str,
     reason: Optional[str],
     actor: str,
 ) -> dict:
+    # feedback_id is the caller's, so the review's branch is its master booking's
+    # — checked through the join, allow_unassigned=False for the same NOT NULL
+    # reason as the list. Approving/rejecting another office's review is 404.
+    await require_row_scope(
+        db,
+        scope,
+        table="booking_reviews",
+        id_column="booking_reviews.id",
+        id_value=feedback_id,
+        city_column="mb.city_id",
+        join="JOIN master_bookings mb ON mb.id = booking_reviews.master_booking_id",
+        allow_unassigned=False,
+        label="Feedback",
+    )
     existing = (
         (
             await db.execute(
@@ -858,8 +981,11 @@ async def approve_feedback(
     feedback_id: int,
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
-    return await _moderate(db, feedback_id, "APPROVED", None, current_user["sub"])
+    return await _moderate(
+        db, scope, feedback_id, "APPROVED", None, current_user["sub"]
+    )
 
 
 @router.post(
@@ -872,7 +998,8 @@ async def reject_feedback(
     body: FeedbackReject,
     current_user: dict = Depends(require_roles("SUPER_ADMIN", "ADMIN", "CCO")),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
 ):
     return await _moderate(
-        db, feedback_id, "REJECTED", body.reason.strip(), current_user["sub"]
+        db, scope, feedback_id, "REJECTED", body.reason.strip(), current_user["sub"]
     )

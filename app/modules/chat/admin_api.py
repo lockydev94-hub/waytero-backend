@@ -21,6 +21,11 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.branch_scope import (
+    BranchScope,
+    get_branch_scope,
+    require_path_row_scope,
+)
 from app.core.database import get_db
 from app.core.dependencies import require_roles
 from app.modules.chat.schemas import AdminPresenceRequest, AdminReplyRequest
@@ -36,6 +41,21 @@ from app.modules.chat.services.presence import is_support_online, mark_presence
 router = APIRouter()
 
 SUPPORT_ROLES = ("SUPER_ADMIN", "ADMIN", "CCO")
+
+# One guard for every /admin/chat/conversations/{conversation_id}… route —
+# detail, reply, claim and close. It runs before the handler reads the row, so a
+# Cuttack agent cannot open or answer a Bhubaneswar thread by pasting its id,
+# and out-of-scope is 404 not 403. chat_conversations.id is a UUID, which the
+# helper binds as a UUID (asyncpg will not compare a uuid column with text).
+# city_id is nullable and reached directly (not by join), so allow_unassigned
+# stays default-true: a thread with no city hint is head-office work.
+require_chat_branch_scope = require_path_row_scope(
+    table="chat_conversations",
+    id_param="conversation_id",
+    city_column="city_id",
+    label="Chat conversation",
+)
+router.dependencies.append(Depends(require_chat_branch_scope))
 
 
 @router.post(
@@ -65,10 +85,11 @@ async def list_chat_conversations(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     admin=Depends(require_roles(*SUPPORT_ROLES)),
+    scope: BranchScope = Depends(get_branch_scope),
     db: AsyncSession = Depends(get_db),
 ):
     return await list_conversations(
-        db, status=status, q=q, page=page, page_size=page_size
+        db, status=status, q=q, page=page, page_size=page_size, scope=scope
     )
 
 

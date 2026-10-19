@@ -31,13 +31,34 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.branch_scope import (
+    BranchScope,
+    city_scope_sql,
+    get_branch_scope,
+    require_path_row_scope,
+)
 from app.core.database import get_db
 from app.core.dependencies import require_roles
 from app.modules.booking.services import breakdown as breakdown_service
 from app.modules.partner.constants import BREAKDOWN_REASONS
 from app.shared.responses.base import success_response
 
-router = APIRouter()
+
+# Breakdown / swap / handover are all addressed by /{cab_booking_id}. The cab row
+# has no city, so the branch is established through its master booking; the
+# available-vehicles and available-partners pickers then filter on that same
+# booking's city, so scoping the booking scopes the pickers too.
+require_breakdown_branch_scope = require_path_row_scope(
+    table="cab_bookings",
+    id_param="cab_booking_id",
+    id_column="cab_bookings.id",
+    city_column="mb.city_id",
+    join="JOIN master_bookings mb ON mb.id = cab_bookings.master_booking_id",
+    allow_unassigned=False,
+    label="Cab booking",
+)
+
+router = APIRouter(dependencies=[Depends(require_breakdown_branch_scope)])
 ADMIN_ROLES = ("SUPER_ADMIN", "ADMIN", "CCO")
 ADMIN_ONLY = ("SUPER_ADMIN", "ADMIN")
 
@@ -180,14 +201,25 @@ async def list_breakdown_reasons(
 async def list_active_breakdowns(
     current_user: dict = Depends(require_roles(*ADMIN_ROLES)),
     db: AsyncSession = Depends(get_db),
+    scope: BranchScope = Depends(get_branch_scope),
     city_id: Optional[int] = Query(None),
     limit: int = Query(50, ge=1, le=200),
 ) -> ActiveBreakdownsResponse:
     params: dict[str, Any] = {"limit": limit}
     where = ["cb.booking_status IN ('BREAKDOWN_REPORTED', 'AWAITING_SWAP')"]
-    if city_id is not None:
+    if city_id is not None and not scope.restricted:
         where.append("mb.city_id = :city_id")
         params["city_id"] = city_id
+
+    # Broken-down cabs waiting on a swap are worked in the office that owns the
+    # booking; master_bookings is joined so this is a clause append. A branch's
+    # own city is the scope, so the ?city_id picker is ignored for it.
+    scope_clause, scope_params = city_scope_sql(
+        scope, "mb.city_id", allow_unassigned=False
+    )
+    where.append(f"({scope_clause})")
+    params.update(scope_params)
+
     where_clause = " AND ".join(where)
 
     sql = text(

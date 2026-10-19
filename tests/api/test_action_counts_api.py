@@ -14,7 +14,7 @@ import asyncio
 import redis.asyncio as aioredis
 
 from app.core.config import settings
-from app.modules.admin.services.dashboard import ACTION_COUNTS_CACHE_KEY
+from app.modules.admin.services.dashboard import ACTION_COUNTS_CACHE_PREFIX
 
 COUNTS = "/api/v1/admin/action-counts"
 
@@ -34,13 +34,18 @@ NAV_KEYS = {
 
 
 def _drop_cached_counts() -> None:
-    """Force the query itself to run — a warm cache would hide a bad fragment."""
+    """Force the query itself to run — a warm cache would hide a bad fragment.
+
+    Every branch key, not one fixed key: the entry is namespaced per office, so
+    clearing "the" cache entry would leave the next caller's stale.
+    """
 
     async def drop() -> None:
         client = await aioredis.from_url(
             settings.REDIS_URL, encoding="utf-8", decode_responses=True
         )
-        await client.delete(ACTION_COUNTS_CACHE_KEY)
+        async for key in client.scan_iter(f"{ACTION_COUNTS_CACHE_PREFIX}:*"):
+            await client.delete(key)
         await client.aclose()
 
     asyncio.run(drop())
@@ -70,3 +75,16 @@ def test_every_fragment_runs_against_the_real_schema(client_staff) -> None:
 
 def test_action_counts_is_not_for_partners(client) -> None:
     assert client.get(COUNTS).status_code == 403
+
+
+def test_every_fragment_runs_scoped_for_a_branch_account(client_cuttack_admin) -> None:
+    """The same eleven arms, but with a city predicate bound in each one — the
+    version that runs all day on a branch manager's screen, and the only version
+    where an unbound parameter or a clause glued to the wrong side of an OR would
+    reach a real Postgres. The head-office test above cannot see either: an
+    unrestricted caller compiles to `1 = 1` eleven times."""
+    _drop_cached_counts()
+
+    body = client_cuttack_admin.get(COUNTS).json()
+    assert set(body) == NAV_KEYS
+    assert all(isinstance(value, int) and value >= 0 for value in body.values())
