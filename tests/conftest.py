@@ -23,6 +23,7 @@ from app.modules.auth.api import get_auth_service, get_otp_service
 from app.modules.auth.constants import HEARTBEAT_MAX_SECONDS
 from app.modules.auth.schemas import (
     AuthUserResponse,
+    BranchSummary,
     LoginResponse,
     OTPSentResponse,
     RefreshResponse,
@@ -45,6 +46,23 @@ class StubAuthService:
         self.heartbeats: list[int] = []
         self.work_hours_days: int | None = None
         self.mpin_otp_sends = 0
+        # Branch facts, set by _make_client from the same payload the overridden
+        # get_current_user carries, so a login/me test cannot disagree with the
+        # scope the caller is being enforced against.
+        self.branch_payload: dict | None = None
+        self.is_super = False
+
+    def _branch(self) -> BranchSummary | None:
+        if self.branch_payload is None:
+            return None
+        return BranchSummary(
+            id=self.branch_payload["id"],
+            name=self.branch_payload["name"],
+            code=self.branch_payload["code"],
+            city_id=self.branch_payload["city_id"],
+            city_name=self.branch_payload["name"],
+            is_headquarters=self.branch_payload["is_headquarters"],
+        )
 
     def _login_response(
         self, user_type: str, session_id: UUID | None = None
@@ -63,6 +81,8 @@ class StubAuthService:
                 is_email_verified=True,
                 user_code=f"{user_type[:3].upper()}-000001",
                 last_login_at=datetime.now(timezone.utc),
+                branch=self._branch(),
+                is_super=self.is_super,
             ),
             tokens={
                 "access_token": f"{user_type.lower()}-access-token",
@@ -149,6 +169,8 @@ class StubAuthService:
             mpin_attempts_remaining=5,
             mpin_min_length=6,
             access_token_expires_in=900,
+            branch=self._branch(),
+            is_super=self.is_super,
         )
 
     async def set_mpin(self, **_: object) -> None:
@@ -287,6 +309,9 @@ def _make_client(
 
     if branch is ...:
         branch = HQ_BRANCH if roles[0] in STAFF_BRANCH_TYPES else None
+
+    auth_service.branch_payload = branch
+    auth_service.is_super = roles[0] == "SUPER_ADMIN"
 
     async def override_auth_service() -> StubAuthService:
         return auth_service

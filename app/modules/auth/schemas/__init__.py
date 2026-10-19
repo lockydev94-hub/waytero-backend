@@ -363,6 +363,25 @@ class MpinRemoveRequest(BaseModel):
         return _validate_mpin_shape(v) if v else v
 
 
+class BranchSummary(BaseModel):
+    """The office a staff account answers to — the chip in the portal topbar.
+
+    Display only. Enforcement never reads this: get_current_user re-derives the
+    branch from the users row on every request, so a super admin moving someone
+    to another branch takes effect on the next call rather than when the token
+    happens to expire.
+    """
+
+    id: int
+    name: str
+    code: str
+    city_id: int
+    city_name: Optional[str] = None
+    is_headquarters: bool = False
+
+    model_config = {"from_attributes": True}
+
+
 class SessionConfigResponse(BaseModel):
     """GET /auth/admin/session-config — everything the admin shell needs to know.
 
@@ -388,6 +407,11 @@ class SessionConfigResponse(BaseModel):
     mpin_attempts_remaining: Optional[int] = None
     mpin_min_length: int
     access_token_expires_in: int
+    # The shell boots on this call, so the topbar branch chip comes with it
+    # instead of costing a second round trip. `is_super` is what the switcher
+    # renders for — a branch account gets a chip, never a selector.
+    branch: Optional[BranchSummary] = None
+    is_super: bool = False
 
 
 class IdleLockMinutesRequest(BaseModel):
@@ -466,6 +490,10 @@ class AuthUserResponse(BaseModel):
     partner_id: Optional[int] = (
         None  # Integer partners.id — populated for PARTNER user_type
     )
+    # Staff-only: which office this account works from, and whether it sees all
+    # of them. A customer/partner/driver has neither, so both stay None/False.
+    branch: Optional[BranchSummary] = None
+    is_super: bool = False
 
     model_config = {"from_attributes": True}
 

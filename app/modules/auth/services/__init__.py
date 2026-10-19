@@ -102,6 +102,7 @@ from app.modules.auth.repositories import (
 )
 from app.modules.auth.schemas import (
     AuthUserResponse,
+    BranchSummary,
     LoginResponse,
     OTPSentResponse,
     RefreshResponse,
@@ -1270,7 +1271,12 @@ class AuthService:
             raise ResourceNotFoundException("User", user_id)
         await self.role_repo.ensure_default_role_for_user(user)
         roles, permissions = await self._get_access_context(user.id)
-        return self._build_user_response(user, roles, permissions)
+        return self._build_user_response(
+            user,
+            roles,
+            permissions,
+            branch=await self._resolve_branch(user),
+        )
 
     async def _enforce_login_rate_limit(self, scope: str) -> None:
         rate_key = REDIS_LOGIN_RATE_KEY.format(scope=scope)
@@ -1315,6 +1321,7 @@ class AuthService:
         roles: list[str],
         permissions: list[str],
         partner_id: Optional[int] = None,
+        branch: Optional[BranchSummary] = None,
     ) -> AuthUserResponse:
         return AuthUserResponse(
             id=user.id,
@@ -1336,6 +1343,8 @@ class AuthService:
             user_code=user.user_code,
             last_login_at=user.last_login_at,
             partner_id=partner_id,
+            branch=branch,
+            is_super=user.user_type == UserType.SUPER_ADMIN,
         )
 
     async def _create_session_and_tokens(
@@ -1367,6 +1376,7 @@ class AuthService:
 
         # Resolve integer partner_id for PARTNER user type (needed by vehicle/booking endpoints)
         partner_int_id = await self._resolve_partner_int_id(user)
+        branch = await self._resolve_branch(user)
 
         access_payload = {
             "sub": str(user.id),
@@ -1409,7 +1419,11 @@ class AuthService:
 
         return LoginResponse(
             user=self._build_user_response(
-                user, roles, permissions, partner_id=partner_int_id
+                user,
+                roles,
+                permissions,
+                partner_id=partner_int_id,
+                branch=branch,
             ),
             tokens=TokenResponse(
                 access_token=access_token,
@@ -1434,6 +1448,43 @@ class AuthService:
         except Exception:
             pass  # Non-fatal — endpoints can still resolve it via DB when needed
         return None
+
+    async def _resolve_branch(self, user: User) -> Optional[BranchSummary]:
+        """The office this staff account answers to, for the portal's topbar.
+
+        Display only — nothing enforces on it. get_current_user re-reads
+        users.branch_id on every request, so a super admin moving someone takes
+        effect immediately even if the client still shows the old chip.
+
+        City name comes along because the chip reads better with "Cuttack" than
+        with a code, and this is the one query that already has the branch row.
+        """
+        if user.branch_id is None:
+            return None
+        row = (
+            await self.db.execute(
+                text(
+                    "SELECT b.name, b.code, b.city_id, b.is_headquarters, c.name "
+                    "FROM branches b "
+                    "LEFT JOIN cities c ON c.id = b.city_id "
+                    "WHERE b.id = :branch_id"
+                ),
+                {"branch_id": user.branch_id},
+            )
+        ).first()
+        if row is None:
+            # The FK is RESTRICT, so this is unreachable while a row exists;
+            # returning None keeps a stale id from crashing the login that a
+            # branch-less account would otherwise have got.
+            return None
+        return BranchSummary(
+            id=user.branch_id,
+            name=row[0],
+            code=row[1],
+            city_id=row[2],
+            city_name=row[4],
+            is_headquarters=bool(row[3]),
+        )
 
     # ── Admin session policy: unlock PIN + idle lock ───────────────────────────
     # Doc Ref: Admin Portal §39 Security; migration 0084.
@@ -1652,6 +1703,8 @@ class AuthService:
             ),
             mpin_min_length=policy["mpin_min_length"],
             access_token_expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            branch=await self._resolve_branch(user),
+            is_super=user.user_type == UserType.SUPER_ADMIN,
         )
 
     async def send_mpin_otp(self, user_id: UUID) -> OTPSentResponse:
