@@ -1258,35 +1258,6 @@ class AuthService:
             expires_at=expires_at,
         )
 
-        access_payload = {
-            "sub": str(user.id),
-            "role": roles[0] if roles else user.user_type.value,
-            "roles": roles,
-            "permissions": permissions,
-            "user_type": user.user_type.value,
-            "session_id": str(session.id),
-        }
-        access_token = create_access_token(access_payload)
-        refresh_token = create_refresh_token(access_payload)
-        session.refresh_token_hash = _hash_token(refresh_token)
-        await self.db.flush()
-
-        await self.user_repo.update_last_login(user.id)
-        logger.info(
-            AUTH_EVENT_LOGIN_SUCCESS,
-            user_id=str(user.id),
-            user_type=user.user_type.value,
-            session_id=str(session.id),
-        )
-
-        # Platform audit log (audit_logs)
-        await AuditLogger.log_auth_event(
-            self.db,
-            action_type=AUTH_EVENT_LOGIN_SUCCESS,
-            user_id=_user_audit_id(user.id),
-            ip_address=ip_address,
-        )
-
         # Resolve integer partner_id for PARTNER user type (needed by vehicle/booking endpoints)
         partner_int_id = await self._resolve_partner_int_id(user)
 
