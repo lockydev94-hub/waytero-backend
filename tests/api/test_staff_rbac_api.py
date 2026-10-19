@@ -68,50 +68,54 @@ def test_the_staff_register_still_answers_for_a_manager(client_staff) -> None:
 
 
 # ── And by which office ───────────────────────────────────────────────────────
-# The gate above says a manager may open the register. Migration 0085 says the
-# register is no longer one list. These run against the developer database, so
-# they assert the relationship between two callers' lists rather than a row count
-# that whoever next seeds the database would break.
+# The gate above says a manager may open the register. Migration 0085 made the
+# register one list per office.
+#
+# One client per test, on purpose: the async engine is a module-level singleton
+# and every TestClient runs its own event loop, so a test that asks for two
+# clients fails inside its fixtures with asyncpg's "attached to a different
+# loop". Two managers not sharing a register is therefore pinned as each
+# manager's own invariant, which says the same thing without needing the other's
+# rows. Reaching across by id is pinned in tests/unit/test_staff_branch_rules.py
+# — that is where the 404 decision is made, and it needs no database at all.
 
 REGISTER = "/api/v1/admin/staff"
 
-
-def _ids(client) -> set[str]:
-    return {item["id"] for item in client.get(REGISTER).json()["items"]}
+BRANCH_STAFF_TYPES = {"ADMIN", "CCO", "VERIFICATION_OFFICER", "FINANCE_MANAGER"}
 
 
-def _branches(client) -> set:
-    return {item["branch_id"] for item in client.get(REGISTER).json()["items"]}
+def _items(client) -> list[dict]:
+    return client.get(REGISTER).json()["items"]
 
 
-def test_two_branch_managers_do_not_share_a_register(
-    client_hq_admin, client_cuttack_admin
-) -> None:
-    """The head office has staff, the sub-branch may not have any yet — but neither
-    may appear in the other's list, and that holds whatever rows exist."""
-    assert _branches(client_hq_admin) == {1} or _branches(client_hq_admin) == set()
-    assert _branches(client_cuttack_admin) <= {2}
-    assert _ids(client_hq_admin) & _ids(client_cuttack_admin) == set()
+@pytest.mark.parametrize(
+    "who,own_branch", [("client_hq_admin", 1), ("client_cuttack_admin", 2)]
+)
+def test_a_manager_enumerates_only_their_own_office(request, who, own_branch) -> None:
+    """The branch ids are 0085's bootstrap rows, not invented ones: 1 is the
+    Bhubaneswar head office, 2 is Cuttack. How many people either office has today
+    is the owner's business, so what is asserted is which offices can appear."""
+    items = _items(request.getfixturevalue(who))
+    assert {item["branch_id"] for item in items} <= {own_branch}
+    assert {item["user_type"] for item in items} <= BRANCH_STAFF_TYPES
 
 
-def test_a_manager_cannot_read_another_branches_staff_row(
-    client_hq_admin, client_cuttack_admin
-) -> None:
-    """404, not 403: the answer a Cuttack manager gets for a Bhubaneswar id has to
-    be the answer they get for an id that was never issued."""
-    hq_only = _ids(client_hq_admin) - _ids(client_cuttack_admin)
-    if not hq_only:
-        pytest.skip("the head office has no staff row to reach across to")
-
-    assert client_cuttack_admin.get(f"{REGISTER}/{hq_only.pop()}").status_code == 404
+def test_the_master_admin_is_not_a_row_a_manager_enumerates(client_hq_admin) -> None:
+    """SUPER_ADMIN carries no branch, which is precisely why it must not surface in
+    a branch register: whoever could PATCH that account's role would hold the only
+    account that can assign branches at all."""
+    assert "SUPER_ADMIN" not in {
+        item["user_type"] for item in _items(client_hq_admin)
+    }
 
 
-def test_the_master_admin_is_not_a_row_a_manager_enumerates(
-    client_hq_admin, client_super_admin
-) -> None:
-    """SUPER_ADMIN has no branch, so it drops out of every branch list — and the
-    service hides it from non-supers even when a branch could match it. This is
-    the one test that needs the developer database to hold a master account, which
-    it does: nothing works without one."""
-    invisible = _ids(client_super_admin) - _ids(client_hq_admin)
-    assert invisible, "a super admin's own register should show at least the master account"
+def test_the_master_admin_still_sees_the_whole_org(client_super_admin) -> None:
+    """The other half of the filter — what it excludes is the caller's branch and
+    the master account's absence from it, not the register. A super admin is the
+    one caller whose list contains the master account."""
+    user_types = {item["user_type"] for item in _items(client_super_admin)}
+    assert user_types <= BRANCH_STAFF_TYPES | {"SUPER_ADMIN"}
+    assert "SUPER_ADMIN" in user_types, (
+        "the developer database has no master admin, so this suite has nothing to "
+        "check the super admin's own view against"
+    )
