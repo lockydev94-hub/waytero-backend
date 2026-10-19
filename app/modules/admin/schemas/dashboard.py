@@ -372,6 +372,45 @@ class SettlementReport(BaseModel):
     pending_count: int
 
 
+# ── Staff working hours (Admin Portal §39 — leave / attendance) ──────────────
+
+
+class StaffWorkDay(BaseModel):
+    """One staff member for one platform-timezone day."""
+
+    user_id: UUID
+    user_code: Optional[str] = None
+    full_name: Optional[str] = None
+    user_type: str
+    work_date: date
+    first_login_at: datetime
+    # The resolved end of the day: the recorded logout, or — when the laptop
+    # was simply closed — the last beat plus a minute, never past midnight.
+    last_logout_at: Optional[datetime] = None
+    last_seen_at: datetime
+    session_count: int
+    heartbeat_count: int
+    active_seconds: int
+    active_minutes: int
+
+
+class WorkHoursTotals(BaseModel):
+    days: int
+    staff_count: int
+    active_seconds: int
+    active_minutes: int
+
+
+class StaffWorkHoursResponse(BaseModel):
+    items: List[StaffWorkDay]
+    period_totals: WorkHoursTotals
+    total: int
+    page: int
+    page_size: int
+    date_from: date
+    date_to: date
+
+
 # ── Notifications Broadcast ───────────────────────────────────────────────────
 
 

@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from typing import Iterator
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,8 +16,10 @@ if str(BACKEND_ROOT) not in sys.path:
 
 from app.core.dependencies import get_current_user
 from app.core.database import engine as app_engine
+from app.core.security import create_access_token
 from app.main import create_application
 from app.modules.auth.api import get_auth_service, get_otp_service
+from app.modules.auth.constants import HEARTBEAT_MAX_SECONDS
 from app.modules.auth.schemas import (
     AuthUserResponse,
     LoginResponse,
@@ -38,6 +41,9 @@ class StubAuthService:
         # can assert a flow instead of a canned reply.
         self.mpin_set = False
         self.idle_lock_minutes: int | None = None
+        self.heartbeats: list[int] = []
+        self.work_hours_days: int | None = None
+        self.mpin_otp_sends = 0
 
     def _login_response(
         self, user_type: str, session_id: UUID | None = None
@@ -54,6 +60,8 @@ class StubAuthService:
                 permissions=["auth.self.read", "auth.sessions.read"],
                 is_mobile_verified=True,
                 is_email_verified=True,
+                user_code=f"{user_type[:3].upper()}-000001",
+                last_login_at=datetime.now(timezone.utc),
             ),
             tokens={
                 "access_token": f"{user_type.lower()}-access-token",
@@ -129,6 +137,7 @@ class StubAuthService:
     async def get_session_config(self, user_id: UUID) -> SessionConfigResponse:
         return SessionConfigResponse(
             has_mpin=self.mpin_set,
+            has_password=True,
             idle_minutes=self.idle_lock_minutes or 5,
             idle_lock_minutes=self.idle_lock_minutes,
             idle_default_minutes=5,
@@ -144,6 +153,12 @@ class StubAuthService:
     async def set_mpin(self, **_: object) -> None:
         self.mpin_set = True
 
+    async def send_mpin_otp(self, user_id: UUID) -> OTPSentResponse:
+        # The route must send to the session subject's own number; the stub
+        # records that it was called at all.
+        self.mpin_otp_sends += 1
+        return OTPSentResponse(mobile_number="9876543210")
+
     async def change_mpin(self, **_: object) -> None:
         self.mpin_set = True
 
@@ -158,6 +173,27 @@ class StubAuthService:
     ) -> int:
         self.idle_lock_minutes = idle_lock_minutes
         return idle_lock_minutes or 5
+
+    async def record_heartbeat(self, *, user_id: UUID, delta_seconds: int) -> int:
+        # Same clamp the service applies, so the API test proves the route
+        # passes the value through rather than trusting the client.
+        self.heartbeats.append(delta_seconds)
+        return max(1, min(HEARTBEAT_MAX_SECONDS, delta_seconds))
+
+    async def get_my_work_hours(self, *, user_id: UUID, days: int = 30) -> dict:
+        today = datetime.now(timezone.utc).date()
+        self.work_hours_days = days
+        return {
+            "items": [],
+            "period_totals": {
+                "days": 0,
+                "staff_count": 1,
+                "active_seconds": 0,
+                "active_minutes": 0,
+            },
+            "date_from": (today - timedelta(days=days - 1)).isoformat(),
+            "date_to": today.isoformat(),
+        }
 
 
 @pytest.fixture(autouse=True)
@@ -181,10 +217,29 @@ def _reset_engine_pool():
     asyncio.run(app_engine.dispose(close=False))
 
 
-@pytest.fixture
-def client() -> TestClient:
+def _make_client(roles: list[str]) -> Iterator[TestClient]:
+    """TestClient whose caller carries `roles` and the stub auth service.
+
+    The role list belongs to the caller, not the stub: /auth/* routes only need
+    any signed-in identity, while every /admin/* gate reads the JWT roles — so
+    an admin-path test has to present as an admin.
+
+    The Authorization header is a real signed token because
+    AuthenticationGuardMiddleware default-denies every /api/v1 path outside the
+    public allowlist; `get_current_user` is still overridden, so the guard is
+    satisfied while the roles under test come from the fixture.
+    """
     app = create_application()
     auth_service = StubAuthService()
+    access_token = create_access_token(
+        {
+            "sub": str(auth_service.user_id),
+            "role": roles[0],
+            "roles": roles,
+            "user_type": roles[0],
+        },
+        expires_delta=timedelta(hours=1),
+    )
 
     async def override_auth_service() -> StubAuthService:
         return auth_service
@@ -195,8 +250,8 @@ def client() -> TestClient:
     async def override_current_user() -> dict[str, object]:
         return {
             "sub": str(auth_service.user_id),
-            "role": "PARTNER",
-            "roles": ["PARTNER"],
+            "role": roles[0],
+            "roles": roles,
             "permissions": [
                 "auth.self.read",
                 "auth.sessions.read",
@@ -209,6 +264,25 @@ def client() -> TestClient:
     app.dependency_overrides[get_current_user] = override_current_user
 
     with TestClient(app) as test_client:
+        test_client.headers["Authorization"] = f"Bearer {access_token}"
         yield test_client
 
     app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def client() -> Iterator[TestClient]:
+    """Signed in as a PARTNER — enough for /auth/*, refused by /admin/*."""
+    yield from _make_client(["PARTNER"])
+
+
+@pytest.fixture
+def client_staff() -> Iterator[TestClient]:
+    """Signed in as an ADMIN: passes the ALL_STAFF gates."""
+    yield from _make_client(["ADMIN"])
+
+
+@pytest.fixture
+def client_super_admin() -> Iterator[TestClient]:
+    """Signed in as SUPER_ADMIN — the working-hours report is gated on this."""
+    yield from _make_client(["SUPER_ADMIN"])

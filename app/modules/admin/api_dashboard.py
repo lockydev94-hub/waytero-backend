@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
 from app.core.dependencies import require_admin, require_roles
+from app.core.exceptions import ValidationException
 from app.modules.admin.services.dashboard import AdminDashboardService
 from app.modules.admin.services.audit_logger import AuditLogger
 from app.modules.admin.schemas.dashboard import (
@@ -65,6 +66,7 @@ from app.modules.admin.schemas.dashboard import (
     AuditLogListResponse,
     AuditLogSummary,
     AdminActionResponse,
+    StaffWorkHoursResponse,
 )
 
 # ── Section-scoped imports (kept aliased at module level so the big
@@ -4848,3 +4850,44 @@ async def list_expiring_documents(
         r["is_expired"] = bool(exp and exp < today)
 
     return {"items": rows, "total": len(rows), "days_window": days}
+
+
+# ════════════════════════════════════════════════════════════════
+#  §39  STAFF WORKING HOURS — leave / attendance (SUPER_ADMIN only)
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get(
+    "/staff-work-hours",
+    response_model=StaffWorkHoursResponse,
+    tags=["Admin – Staff Work Hours"],
+    summary="Who was in the dashboard, when, and for how long",
+    description=(
+        "One row per staff member per day, bucketed in the platform timezone: "
+        "first sign-in, end of day, and the minutes actually worked (idle gaps "
+        "and locked screens are not counted). SUPER_ADMIN only — an admin's own "
+        "days come from GET /auth/admin/work-hours."
+    ),
+    dependencies=[Depends(require_roles("SUPER_ADMIN"))],
+)
+async def list_staff_work_hours(
+    date_from: _date = Query(..., description="First day of the range"),
+    date_to: _date = Query(..., description="Last day of the range, inclusive"),
+    user_id: Optional[UUID] = Query(None, description="Limit to one staff member"),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    if date_to < date_from:
+        raise ValidationException(
+            message="date_to must not be before date_from.", code="INVALID_DATE_RANGE"
+        )
+    data = await AdminDashboardService.get_staff_work_hours(
+        db,
+        date_from=date_from,
+        date_to=date_to,
+        user_id=user_id,
+        page=page,
+        page_size=page_size,
+    )
+    return StaffWorkHoursResponse(**data)

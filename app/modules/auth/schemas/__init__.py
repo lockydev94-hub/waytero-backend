@@ -292,14 +292,17 @@ def _validate_mpin_shape(value: str) -> str:
 class MpinSetRequest(BaseModel):
     """POST /auth/admin/mpin/set — install the unlock PIN.
 
-    `current_password` is required whenever the account has a password: without
-    re-entry, a hijacked live session token could install the very gate that
-    locks the real admin out.
+    Proof of ownership is mandatory because the PIN is the gate the admin will
+    be locked behind: without re-verification a hijacked live session token
+    could install the PIN that locks out the real admin. Password accounts
+    re-enter the password; an account that signs in with OTP only has no
+    password, so `otp` (from POST /auth/admin/mpin/otp) is the alternative.
     """
 
     mpin: str
     confirm_mpin: str
     current_password: Optional[str] = None
+    otp: Optional[str] = None
 
     @field_validator("mpin", "confirm_mpin")
     @classmethod
@@ -372,6 +375,9 @@ class SessionConfigResponse(BaseModel):
     """
 
     has_mpin: bool
+    # Which factor the profile has to ask for: a password account re-enters the
+    # password, an OTP-only account confirms an OTP to its own mobile.
+    has_password: bool = False
     idle_minutes: int
     idle_lock_minutes: Optional[int]
     idle_default_minutes: int
@@ -393,6 +399,18 @@ class IdleLockMinutesRequest(BaseModel):
         le=240,
         description="Minutes of inactivity before the dashboard locks; null inherits the platform default",
     )
+
+
+class HeartbeatRequest(BaseModel):
+    """POST /auth/admin/heartbeat — the portal's actively-worked seconds.
+
+    `le=3600` bounds what a caller can even ask for; the service clamps what is
+    actually recorded to one minute, so a buggy or dishonest client cannot
+    inflate a working day. The ceiling is deliberately loose so a laptop that
+    slept between beats can report the real gap it measured.
+    """
+
+    delta_seconds: int = Field(..., ge=1, le=3600)
 
 
 class FirebaseSignInRequest(BaseModel):
@@ -441,6 +459,10 @@ class AuthUserResponse(BaseModel):
     # Staff with no unlock PIN: the dashboard can only log them out on idle, so
     # the profile nudges them to set one and get the lock behaviour instead.
     must_set_mpin: bool = False
+    # The profile's Identity tab is the admin's own record, so their own code
+    # and last sign-in belong there; nobody else's account data is exposed.
+    user_code: Optional[str] = None
+    last_login_at: Optional[datetime] = None
     partner_id: Optional[int] = (
         None  # Integer partners.id — populated for PARTNER user_type
     )

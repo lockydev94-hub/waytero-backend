@@ -6,7 +6,7 @@
 
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request, status
+from fastapi import APIRouter, Depends, Query, Request, status
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,7 @@ from app.modules.auth.schemas import (
     ChangePasswordRequest,
     FirebaseSignInRequest,
     ForgotPasswordRequest,
+    HeartbeatRequest,
     IdleLockMinutesRequest,
     LoginResponse,
     LogoutRequest,
@@ -353,13 +354,32 @@ async def admin_session_config(
 
 
 @router.post(
+    "/admin/mpin/otp",
+    response_model=OTPSentResponse,
+    status_code=status.HTTP_200_OK,
+    summary="OTP to this admin's own mobile, to prove ownership before installing a PIN",
+    description=(
+        "Password accounts confirm the password instead; this exists for admins "
+        "who only ever sign in with OTP. The number comes from the session "
+        "subject, never from the request body."
+    ),
+)
+async def admin_mpin_otp(
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    return await auth_service.send_mpin_otp(UUID(current_user["sub"]))
+
+
+@router.post(
     "/admin/mpin/set",
     status_code=status.HTTP_200_OK,
     summary="Install the dashboard unlock PIN",
     description=(
         "Requires the account password whenever one is set: without re-entry a "
         "hijacked live session token could install the gate that locks the real "
-        "admin out. Returns the refreshed policy."
+        "admin out. An OTP-only admin confirms the OTP from "
+        "POST /auth/admin/mpin/otp. Returns the refreshed policy."
     ),
 )
 async def admin_mpin_set(
@@ -369,7 +389,10 @@ async def admin_mpin_set(
 ):
     user_id = UUID(current_user["sub"])
     await auth_service.set_mpin(
-        user_id=user_id, mpin=body.mpin, current_password=body.current_password
+        user_id=user_id,
+        mpin=body.mpin,
+        current_password=body.current_password,
+        otp=body.otp,
     )
     return {
         "success": True,
@@ -459,10 +482,58 @@ async def admin_idle_lock_minutes(
     auth_service: AuthService = Depends(get_auth_service),
 ):
     user_id = UUID(current_user["sub"])
-    effective = await auth_service.set_idle_lock_minutes(
+    await auth_service.set_idle_lock_minutes(
         user_id=user_id, idle_lock_minutes=body.idle_lock_minutes
     )
-    return {"success": True, "data": {"idle_minutes": effective}}
+    # Same shape as the PIN mutations: the shell re-arms its idle timer from the
+    # refreshed policy rather than guessing what the effective minute count is.
+    return {
+        "success": True,
+        "data": (await auth_service.get_session_config(user_id)).model_dump(mode="json"),
+    }
+
+
+@router.post(
+    "/admin/heartbeat",
+    status_code=status.HTTP_200_OK,
+    summary="Record actively-worked seconds for today",
+    description=(
+        "Called by the portal while the admin is actually interacting with it. "
+        "Idle gaps, locked screens and closed laptops are not work time, so the "
+        "seconds arrive here instead of being derived from login and logout. "
+        "The server keeps at most a minute per call."
+    ),
+)
+async def admin_heartbeat(
+    body: HeartbeatRequest,
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    user_id = UUID(current_user["sub"])
+    recorded = await auth_service.record_heartbeat(
+        user_id=user_id, delta_seconds=body.delta_seconds
+    )
+    return {"success": True, "data": {"recorded_seconds": recorded}}
+
+
+@router.get(
+    "/admin/work-hours",
+    status_code=status.HTTP_200_OK,
+    summary="This admin's own recent working days",
+    description=(
+        "The profile tab shows the signed-in admin their own attendance. The "
+        "all-staff report lives at GET /admin/staff-work-hours and is "
+        "super-admin only."
+    ),
+)
+async def admin_my_work_hours(
+    days: int = Query(30, ge=1, le=366),
+    current_user: dict = Depends(get_current_user),
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    user_id = UUID(current_user["sub"])
+    data = await auth_service.get_my_work_hours(user_id=user_id, days=days)
+    return {"success": True, "data": data}
 
 
 @router.post(

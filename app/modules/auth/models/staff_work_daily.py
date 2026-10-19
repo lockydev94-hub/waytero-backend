@@ -93,6 +93,7 @@ class StaffWorkDaily(Base):
     @property
     def active_minutes(self) -> int:
         return round(self.active_seconds / 60)
+
     def __repr__(self):
         return (
             f"<StaffWorkDaily user_id={self.user_id} date={self.work_date} "

@@ -112,6 +112,13 @@ HEARTBEAT_MAX_SECONDS = 60
 DAILY_LOGOUT_HOUR_MIN = 0
 DAILY_LOGOUT_HOUR_MAX = 23
 
+# OTP scope for installing the unlock PIN on an account that has no password.
+# `set_mpin` demands proof of ownership first — a hijacked live token must not
+# be able to install the gate that locks out the real admin — and an OTP-only
+# admin has no password to re-enter, so the code goes to their own registered
+# mobile. Scoping it here keeps that OTP unusable for a login.
+OTP_PURPOSE_MPIN_SET = "MPIN_SET"
+
 AUTH_EVENT_MPIN_SET = "MPIN_SET"
 AUTH_EVENT_MPIN_CHANGED = "MPIN_CHANGED"
 AUTH_EVENT_MPIN_VERIFIED = "MPIN_VERIFIED"

@@ -191,15 +191,19 @@ class FakeSessionRepo:
             if session.id == session_id:
                 session.last_used_at = datetime.now(timezone.utc)
 
-    async def deactivate_all_user_sessions(self, user_id):
+    async def deactivate_all_user_sessions(self, user_id, logout_at=None):
         self.revoked_all = True
         for session in self.sessions:
             session.is_active = False
+            if logout_at is not None:
+                session.logout_at = logout_at
 
-    async def deactivate_session(self, session_id):
+    async def deactivate_session(self, session_id, logout_at=None):
         for session in self.sessions:
             if session.id == session_id:
                 session.is_active = False
+                if logout_at is not None:
+                    session.logout_at = logout_at
 
     async def get_active_sessions(self, user_id):
         return [session for session in self.sessions if session.is_active]
@@ -209,6 +213,21 @@ class FakeSessionRepo:
             if session.id == session_id:
                 return session
         return None
+
+
+class FakeWorkRepo:
+    def __init__(self) -> None:
+        self.closed: list = []
+        self.opened: list = []
+
+    async def open_day(self, *, user_id, work_date):
+        self.opened.append((user_id, work_date))
+
+    async def close_day(self, *, user_id, work_date):
+        self.closed.append((user_id, work_date))
+
+    async def record_activity(self, *, user_id, work_date, active_seconds):
+        self.closed.append(("activity", active_seconds))
 
 
 class FakeRoleRepo:
@@ -241,6 +260,7 @@ def build_service() -> (
     service.user_repo = user_repo
     service.session_repo = session_repo
     service.role_repo = role_repo
+    service.work_repo = FakeWorkRepo()
 
     async def verify_otp(*args, **kwargs):
         return True
@@ -499,3 +519,30 @@ async def test_logout_all_devices_deactivates_sessions() -> None:
     await service.logout(user.id, refresh_token=None, logout_all=True)
 
     assert session_repo.revoked_all is True
+    # `sessions.logout_at` was declared in migration 0001 and never written;
+    # sign-out is the only honest place to stamp it.
+    assert session_repo.sessions[0].logout_at is not None
+    # A partner signs out through the same method but has no dashboard day row.
+    assert service.work_repo.closed == []
+
+
+@pytest.mark.asyncio
+async def test_staff_logout_closes_the_work_day() -> None:
+    service, user_repo, session_repo, role_repo, _ = build_service()
+    user = User(
+        id=uuid4(),
+        mobile_number="9876543211",
+        user_type=UserType.ADMIN,
+        status=UserStatus.ACTIVE,
+        password_hash=hash_password("WayTero@2026"),
+        failed_login_attempts=0,
+        is_mobile_verified=True,
+        is_email_verified=True,
+    )
+    user_repo.users[(user.mobile_number, user.user_type.value)] = user
+    await role_repo.ensure_default_role_for_user(user)
+
+    await service.logout(user.id, refresh_token=None, logout_all=False)
+
+    assert len(service.work_repo.closed) == 1
+    assert service.work_repo.closed[0][0] == user.id

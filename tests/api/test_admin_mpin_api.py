@@ -11,6 +11,7 @@ from datetime import datetime
 
 POLICY_KEYS = {
     "has_mpin",
+    "has_password",
     "idle_minutes",
     "idle_lock_minutes",
     "idle_default_minutes",
@@ -50,6 +51,17 @@ def test_mpin_set_rejects_two_halves_that_do_not_match(client) -> None:
     )
 
     assert response.status_code == 422
+
+
+def test_mpin_otp_is_sent_to_the_signed_in_admin(client) -> None:
+    """No body: the number comes from the session subject, so this route cannot
+    be pointed at somebody else's mobile."""
+    response = client.post("/api/v1/auth/admin/mpin/otp")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["mobile_number"]
+    assert "otp" not in body
 
 
 def test_mpin_set_returns_the_refreshed_policy_and_never_echoes_the_pin(client) -> None:

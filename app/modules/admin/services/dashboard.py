@@ -19,13 +19,15 @@
 # ============================================================
 
 from decimal import Decimal
-from datetime import datetime, timezone, timedelta
+from datetime import date, datetime, timezone, timedelta
 from typing import Optional, List, Dict, Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
+from app.core.timezone import get_platform_tz
+from app.modules.auth.repositories import StaffWorkDailyRepository
 from app.modules.admin.schemas.dashboard import (
     StaffProfileCreate,
     StaffUserCreate,
@@ -1549,3 +1551,48 @@ class AdminDashboardService:
         )
         await db.commit()
         return r.rowcount > 0
+
+    # ── Staff working hours (Admin Portal §39 — leave / attendance) ──────────
+    @staticmethod
+    async def get_staff_work_hours(
+        db: AsyncSession,
+        *,
+        date_from: date,
+        date_to: date,
+        user_id: Optional[UUID] = None,
+        page: int = 1,
+        page_size: int = 50,
+    ) -> Dict[str, Any]:
+        """Per staff member, per day: when the portal opened, when it ended and
+        how many of those minutes were actually worked.
+
+        The day rows and the period totals come from one repository so the
+        table and the totals footer cannot disagree. Read-only: nothing here
+        flushes or commits.
+        """
+        zone = await get_platform_tz(db)
+        repo = StaffWorkDailyRepository(db)
+        total = await repo.count_days(
+            date_from=date_from, date_to=date_to, user_id=user_id
+        )
+        items = await repo.list_days(
+            tz_name=str(zone),
+            date_from=date_from,
+            date_to=date_to,
+            user_id=user_id,
+            limit=page_size,
+            offset=(page - 1) * page_size,
+        )
+        totals = await repo.summarize_days(
+            date_from=date_from, date_to=date_to, user_id=user_id
+        )
+        totals["active_minutes"] = int(round(totals["active_seconds"] / 60))
+        return {
+            "items": items,
+            "period_totals": totals,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+            "date_from": date_from,
+            "date_to": date_to,
+        }

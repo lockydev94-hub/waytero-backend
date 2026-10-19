@@ -8,11 +8,14 @@ to break in production:
   * MPIN failures must never touch `locked_until` — that field is what
     `User.is_locked` reads, so sharing it would lock the password login and
     leave the admin with no way back in.
-  * Installing the gate requires the password, otherwise a hijacked live
-    session token could set the PIN that locks out the real admin.
+  * Installing the gate requires proof the token holder is really the admin —
+    the account password, or an OTP to the admin's own mobile for an account
+    that has no password. Otherwise a hijacked live session token could set the
+    PIN that locks out the real admin.
   * The policy comes from configuration and is clamped, never trusted.
 """
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -26,6 +29,7 @@ from app.core.exceptions import (
 )
 from app.core.security import hash_password, verify_password
 from app.modules.auth.models.user import User
+from app.modules.auth.schemas import OTPSentResponse
 from app.modules.auth.services import AuthService
 from app.shared.enums.user_types import UserType, UserStatus
 
@@ -139,14 +143,85 @@ async def test_set_mpin_requires_the_password(current_password, monkeypatch):
     assert user.mpin_hash is None
 
 
-async def test_set_mpin_refuses_an_otp_only_account(monkeypatch):
-    # No password to re-enter means no way to prove the token holder is the
-    # admin — the caller must go through the OTP path instead.
+async def test_set_mpin_requires_an_otp_for_an_otp_only_account(monkeypatch):
+    # No password to re-enter does not mean no proof: the holder of a hijacked
+    # live token still has to show the OTP that went to the admin's own mobile.
+    user = _make_user(password=None)
+    service, _ = _service(user, monkeypatch=monkeypatch)
+    verified: list[tuple[str, str, str]] = []
+
+    async def verify_otp(mobile, otp, purpose="LOGIN"):
+        verified.append((mobile, otp, purpose))
+        return True
+
+    service.otp_service = SimpleNamespace(verify_otp=verify_otp)
+
+    with pytest.raises(ValidationException) as exc:
+        await service.set_mpin(user.id, "248157", None)
+
+    assert exc.value.code == "OTP_REQUIRED"
+    assert user.mpin_hash is None
+
+    await service.set_mpin(user.id, "248157", None, otp="654321")
+
+    assert verify_password("248157", user.mpin_hash)
+    # Scoped so a login OTP cannot be reused to install the PIN.
+    assert verified == [(user.mobile_number, "654321", "MPIN_SET")]
+
+
+async def test_set_mpin_rejects_a_wrong_otp(monkeypatch):
     user = _make_user(password=None)
     service, _ = _service(user, monkeypatch=monkeypatch)
 
-    with pytest.raises(BusinessException):
-        await service.set_mpin(user.id, "248157", None)
+    async def verify_otp(mobile, otp, purpose="LOGIN"):
+        raise AuthenticationException(message="Incorrect OTP.", code="OTP_INVALID")
+
+    service.otp_service = SimpleNamespace(verify_otp=verify_otp)
+
+    with pytest.raises(AuthenticationException):
+        await service.set_mpin(user.id, "248157", None, otp="000000")
+
+    assert user.mpin_hash is None
+
+
+async def test_password_account_still_uses_the_password(monkeypatch):
+    """An account that has a password is never offered the OTP route — the
+    stronger factor the admin already knows is the one that counts."""
+    user = _make_user()
+    service, _ = _service(user, monkeypatch=monkeypatch)
+
+    async def verify_otp(*args, **kwargs):
+        raise AssertionError("OTP path must not be reached for a password account")
+
+    service.otp_service = SimpleNamespace(verify_otp=verify_otp)
+
+    await service.set_mpin(user.id, "248157", "Str0ng!Passw0rd", otp="654321")
+
+    assert verify_password("248157", user.mpin_hash)
+
+
+async def test_send_mpin_otp_goes_to_the_callers_own_number(monkeypatch):
+    user = _make_user(password=None)
+    service, _ = _service(user, monkeypatch=monkeypatch)
+    sent: list[tuple[str, str]] = []
+
+    async def send_otp(mobile, purpose="LOGIN"):
+        sent.append((mobile, purpose))
+        return OTPSentResponse(mobile_number=mobile)
+
+    service.otp_service = SimpleNamespace(send_otp=send_otp)
+
+    await service.send_mpin_otp(user.id)
+
+    assert sent == [(user.mobile_number, "MPIN_SET")]
+
+
+async def test_send_mpin_otp_refuses_a_non_dashboard_account(monkeypatch):
+    user = _make_user(user_type=UserType.CUSTOMER)
+    service, _ = _service(user, monkeypatch=monkeypatch)
+
+    with pytest.raises(PermissionDeniedException):
+        await service.send_mpin_otp(user.id)
 
 
 async def test_set_mpin_twice_is_refused_and_keeps_the_original(monkeypatch):

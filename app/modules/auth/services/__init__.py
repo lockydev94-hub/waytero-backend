@@ -6,7 +6,7 @@
 
 import hashlib
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -32,7 +32,7 @@ from app.core.security import (
     needs_rehash,
     verify_password,
 )
-from app.core.timezone import get_platform_tz_name
+from app.core.timezone import get_platform_tz, get_platform_tz_name
 from app.infrastructure.cache.redis_client import RedisCache
 from app.infrastructure.push import (
     FirebaseAuthUnavailableError,
@@ -90,11 +90,14 @@ from app.modules.auth.constants import (
     MPIN_MAX_ATTEMPTS_DEFAULT,
     MPIN_MIN_LENGTH_DEFAULT,
     STAFF_USER_TYPES,
+    HEARTBEAT_MAX_SECONDS,
+    OTP_PURPOSE_MPIN_SET,
 )
 from app.modules.auth.models.user import User
 from app.modules.auth.repositories import (
     RoleRepository,
     SessionRepository,
+    StaffWorkDailyRepository,
     UserRepository,
 )
 from app.modules.auth.schemas import (
@@ -293,7 +296,18 @@ class AuthService:
         self.user_repo = UserRepository(db)
         self.session_repo = SessionRepository(db)
         self.role_repo = RoleRepository(db)
+        self.work_repo = StaffWorkDailyRepository(db)
         self.otp_service = OTPService(cache)
+
+    async def _platform_today(self) -> date:
+        """Today in the platform zone — the bucket every work-day row uses.
+
+        Server-side on purpose: a browser in another zone must not be able to
+        file its working minutes against somebody else's Tuesday, and the
+        daily-logout hour is compared in the same zone.
+        """
+        zone = await get_platform_tz(self.db)
+        return datetime.now(zone).date()
 
     async def _ensure_customer_profile(
         self, user_id, first_name: str = "Customer", last_name: Optional[str] = None
@@ -868,11 +882,67 @@ class AuthService:
             roles=roles,
         )
 
+    async def _close_work_day(self, user_id: UUID) -> None:
+        """Stamp the end of today's work row for a staff account.
+
+        Customers and partners sign out through the same method, so the staff
+        check belongs here rather than in each route.
+        """
+        user = await self.user_repo.get_by_id(user_id)
+        if user is None or user.user_type.value not in STAFF_USER_TYPES:
+            return
+        await self.work_repo.close_day(
+            user_id=user_id, work_date=await self._platform_today()
+        )
+
+    async def record_heartbeat(self, user_id: UUID, delta_seconds: int) -> int:
+        """Add actively-worked seconds to today's row; returns what was kept.
+
+        The portal only counts real input and sends at most once a minute, but
+        the clamp is server-side because anything holding the token can call
+        this: a client claiming 3600 records 60.
+        """
+        await self._staff_user(user_id)
+        recorded = max(1, min(HEARTBEAT_MAX_SECONDS, int(delta_seconds)))
+        await self.work_repo.record_activity(
+            user_id=user_id,
+            work_date=await self._platform_today(),
+            active_seconds=recorded,
+        )
+        return recorded
+
+    async def get_my_work_hours(self, user_id: UUID, days: int = 30) -> dict:
+        """This admin's own recent days.
+
+        The working-hours report is super-admin only; the profile tab still has
+        to show somebody their own attendance, and "your own rows" is the one
+        filter that needs no extra permission.
+        """
+        await self._staff_user(user_id)
+        zone = await get_platform_tz(self.db)
+        today = datetime.now(zone).date()
+        date_from = today - timedelta(days=max(1, min(days, 366)) - 1)
+        items = await self.work_repo.list_days(
+            tz_name=str(zone), date_from=date_from, date_to=today, user_id=user_id
+        )
+        totals = await self.work_repo.summarize_days(
+            date_from=date_from, date_to=today, user_id=user_id
+        )
+        return {
+            "items": items,
+            "period_totals": totals,
+            "date_from": date_from.isoformat(),
+            "date_to": today.isoformat(),
+        }
+
     async def logout(
         self, user_id: UUID, refresh_token: Optional[str], logout_all: bool
     ) -> None:
         if logout_all:
-            await self.session_repo.deactivate_all_user_sessions(user_id)
+            await self.session_repo.deactivate_all_user_sessions(
+                user_id, logout_at=datetime.now(timezone.utc)
+            )
+            await self._close_work_day(user_id)
             logger.info("logout_all_devices", user_id=str(user_id))
             return
 
@@ -881,8 +951,11 @@ class AuthService:
                 _hash_token(refresh_token)
             )
             if session and session.user_id == user_id:
-                await self.session_repo.deactivate_session(session.id)
+                await self.session_repo.deactivate_session(
+                    session.id, logout_at=datetime.now(timezone.utc)
+                )
 
+        await self._close_work_day(user_id)
         logger.info("logout", user_id=str(user_id))
 
     async def change_password(
@@ -1260,6 +1333,8 @@ class AuthService:
             must_set_mpin=(
                 user.user_type.value in STAFF_USER_TYPES and user.mpin_hash is None
             ),
+            user_code=user.user_code,
+            last_login_at=user.last_login_at,
             partner_id=partner_id,
         )
 
@@ -1310,6 +1385,13 @@ class AuthService:
         await self.db.flush()
 
         await self.user_repo.update_last_login(user.id)
+        if user.user_type.value in STAFF_USER_TYPES:
+            # Attendance: this is the row the working-hours report reads. After
+            # the token block because W0 made this path run exactly once per
+            # login — two calls here would double `session_count`.
+            await self.work_repo.open_day(
+                user_id=user.id, work_date=await self._platform_today()
+            )
         logger.info(
             AUTH_EVENT_LOGIN_SUCCESS,
             user_id=str(user.id),
@@ -1461,6 +1543,23 @@ class AuthService:
         user.mpin_failed_attempts = 0
         user.mpin_locked_until = None
 
+    async def _confirm_mpin_otp(self, user: User, otp: Optional[str]) -> None:
+        """OTP re-entry for an account with no password.
+
+        The same ownership proof, reached a different way: installing the
+        unlock PIN is the one action a hijacked live token must not be able to
+        do, and an OTP-only admin has no password to type. The OTP goes to the
+        number on this user's own row, scoped to a purpose no login will accept.
+        """
+        if not otp:
+            raise ValidationException(
+                message="Enter the OTP sent to your registered mobile.",
+                code="OTP_REQUIRED",
+            )
+        await self.otp_service.verify_otp(
+            user.mobile_number, otp, purpose=OTP_PURPOSE_MPIN_SET
+        )
+
     def _require_unlockable(self, user: User) -> None:
         """Guard the PIN paths: set, and not currently in a lockout window."""
         if user.mpin_hash is None:
@@ -1538,6 +1637,7 @@ class AuthService:
         has_mpin = user.mpin_hash is not None
         return SessionConfigResponse(
             has_mpin=has_mpin,
+            has_password=user.password_hash is not None,
             idle_minutes=user.idle_lock_minutes or policy["idle_default_minutes"],
             idle_lock_minutes=user.idle_lock_minutes,
             idle_default_minutes=policy["idle_default_minutes"],
@@ -1554,8 +1654,24 @@ class AuthService:
             access_token_expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
         )
 
+    async def send_mpin_otp(self, user_id: UUID) -> OTPSentResponse:
+        """OTP to this admin's own registered mobile, to prove they own the
+        account before installing an unlock PIN.
+
+        Subject-scoped on purpose: `/auth/send-otp` takes any mobile from the
+        body, and this route must only ever reach the caller's own number.
+        """
+        user = await self._staff_user(user_id)
+        return await self.otp_service.send_otp(
+            user.mobile_number, purpose=OTP_PURPOSE_MPIN_SET
+        )
+
     async def set_mpin(
-        self, user_id: UUID, mpin: str, current_password: Optional[str]
+        self,
+        user_id: UUID,
+        mpin: str,
+        current_password: Optional[str],
+        otp: Optional[str] = None,
     ) -> None:
         user = await self._staff_user(user_id)
         policy = await self._admin_policy()
@@ -1564,7 +1680,14 @@ class AuthService:
                 message="An unlock PIN is already set — change or remove it instead.",
                 code="MPIN_ALREADY_SET",
             )
-        await self._confirm_password(user, current_password)
+        if user.password_hash:
+            await self._confirm_password(user, current_password)
+        else:
+            # An OTP-only admin has no password to re-enter, so the OTP to their
+            # own mobile is the ownership proof. Without one of the two, any
+            # holder of a live token could install the gate that locks the real
+            # admin out.
+            await self._confirm_mpin_otp(user, otp)
         self._validate_mpin_length(mpin, policy["mpin_min_length"])
         user.mpin_hash = hash_password(mpin)
         await self.db.flush()
@@ -1627,8 +1750,8 @@ class AuthService:
             # the only proof available.
             self._require_unlockable(user)
             await self._check_mpin(
-            user, current_mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"]
-        )
+                user, current_mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"]
+            )
         user.mpin_hash = None
         user.mpin_failed_attempts = 0
         user.mpin_locked_until = None

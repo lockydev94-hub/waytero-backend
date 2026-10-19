@@ -47,6 +47,14 @@ class UserRepoStub:
         self.last_login_calls += 1
 
 
+class WorkRepoStub:
+    def __init__(self) -> None:
+        self.opened = []
+
+    async def open_day(self, *, user_id, work_date):
+        self.opened.append((user_id, work_date))
+
+
 def _make_user(user_type: UserType = UserType.ADMIN) -> User:
     return User(
         id=uuid4(),
@@ -79,6 +87,7 @@ def _service(monkeypatch, partner_int_id=None):
     service = AuthService(DbStub(), None)
     service.user_repo = UserRepoStub()
     service.session_repo = SessionRepoStub()
+    service.work_repo = WorkRepoStub()
 
     async def fake_access_context(user_id):
         return (["ADMIN"], ["auth.self.read"])
@@ -91,7 +100,9 @@ def _service(monkeypatch, partner_int_id=None):
     return service, audit_calls
 
 
-async def test_login_writes_one_audit_row_and_one_last_login_update(monkeypatch):
+async def test_login_writes_one_audit_row_one_last_login_and_one_work_day(
+    monkeypatch,
+):
     service, audit_calls = _service(monkeypatch)
 
     await service._create_session_and_tokens(
@@ -100,6 +111,9 @@ async def test_login_writes_one_audit_row_and_one_last_login_update(monkeypatch)
 
     assert audit_calls == [AUTH_EVENT_LOGIN_SUCCESS]
     assert service.user_repo.last_login_calls == 1
+    # Attendance counts a login, so the deleted duplicate block would have
+    # silently doubled `session_count` on every staff day row.
+    assert len(service.work_repo.opened) == 1
 
 
 async def test_stored_refresh_hash_matches_the_returned_refresh_token(monkeypatch):
@@ -126,3 +140,16 @@ async def test_partner_claim_survives_in_the_returned_access_token(monkeypatch):
 
     payload = decode_access_token(response.tokens.access_token)
     assert payload["partner_id"] == 42
+    # Attendance is a dashboard concern: a partner or customer login must not
+    # create a staff day row.
+    assert service.work_repo.opened == []
+
+
+async def test_customer_login_writes_no_work_day(monkeypatch):
+    service, _ = _service(monkeypatch)
+
+    await service._create_session_and_tokens(
+        _make_user(UserType.CUSTOMER), "Chrome", "Windows", "127.0.0.1"
+    )
+
+    assert service.work_repo.opened == []

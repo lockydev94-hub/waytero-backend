@@ -4,11 +4,11 @@
 # Phase: 1 - Authentication Module
 # ============================================================
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import and_, select, update
+from sqlalchemy import and_, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.modules.auth.constants import DEFAULT_ROLE_CODE_BY_USER_TYPE
@@ -193,18 +193,31 @@ class SessionRepository:
     async def count_active_sessions(self, user_id: UUID) -> int:
         return len(await self.get_active_sessions(user_id))
 
-    async def deactivate_session(self, session_id: UUID) -> None:
+    async def deactivate_session(
+        self, session_id: UUID, logout_at: Optional[datetime] = None
+    ) -> None:
+        """Close one session row. `logout_at` is written only when the admin
+        actually signed out — an eviction by the session cap ends the row the
+        same way, but recording it as a logout would misreport working hours."""
+        values: dict = {"is_active": False}
+        if logout_at is not None:
+            values["logout_at"] = logout_at
         await self.db.execute(
-            update(UserSession)
-            .where(UserSession.id == session_id)
-            .values(is_active=False)
+            update(UserSession).where(UserSession.id == session_id).values(**values)
         )
 
-    async def deactivate_all_user_sessions(self, user_id: UUID) -> None:
+    async def deactivate_all_user_sessions(
+        self, user_id: UUID, logout_at: Optional[datetime] = None
+    ) -> None:
+        values: dict = {"is_active": False}
+        if logout_at is not None:
+            values["logout_at"] = logout_at
         await self.db.execute(
             update(UserSession)
-            .where(UserSession.user_id == user_id)
-            .values(is_active=False)
+            .where(
+                and_(UserSession.user_id == user_id, UserSession.is_active.is_(True))
+            )
+            .values(**values)
         )
 
     async def deactivate_oldest_session(self, user_id: UUID) -> None:
@@ -216,6 +229,195 @@ class SessionRepository:
     async def update_last_used(self, session_id: UUID) -> None:
         # sessions table tracks login_at; last_used is handled by is_active state
         pass
+
+
+class StaffWorkDailyRepository:
+    """One accumulating row per staff member per platform-timezone day.
+
+    Attendance cannot be derived from `sessions` (one row per device, and
+    `logout_at` was never written until this round) or from `audit_logs`
+    (BIGINT user_id against UUID users, so login rows land with NULL user_id).
+    This table is the record the leave/working-hours report reads.
+
+    `work_date` is computed by the caller in the platform zone rather than with
+    `AT TIME ZONE` in the INSERT: a typo in the PLATFORM_TIMEZONE row would
+    otherwise fail every admin login instead of merely mis-bucketing a day.
+    """
+
+    def __init__(self, db: AsyncSession):
+        self.db = db
+
+    async def open_day(self, *, user_id: UUID, work_date: date) -> None:
+        """Count a sign-in. A second login on the same day is a new session on
+        the same row, not a new day — and it reopens the row if the admin had
+        signed out and come back."""
+        await self.db.execute(
+            text(
+                """
+                INSERT INTO staff_work_daily
+                    (user_id, work_date, first_login_at, last_seen_at,
+                     session_count, heartbeat_count, created_at, updated_at)
+                VALUES
+                    (:user_id, :work_date, NOW(), NOW(), 1, 0, NOW(), NOW())
+                ON CONFLICT (user_id, work_date) DO UPDATE
+                    SET session_count  = staff_work_daily.session_count + 1,
+                        last_logout_at = NULL,
+                        last_seen_at   = GREATEST(staff_work_daily.last_seen_at, NOW()),
+                        updated_at     = NOW()
+                """
+            ),
+            {"user_id": user_id, "work_date": work_date},
+        )
+        await self.db.flush()
+
+    async def record_activity(
+        self, *, user_id: UUID, work_date: date, active_seconds: int
+    ) -> None:
+        """Add actively-worked seconds to the day row.
+
+        The 86400 ceiling is `ck_swd_active_seconds`; clamping here means a
+        dishonest or buggy client cannot make a day longer than a day.
+        """
+        await self.db.execute(
+            text(
+                """
+                INSERT INTO staff_work_daily
+                    (user_id, work_date, first_login_at, last_seen_at,
+                     active_seconds, session_count, heartbeat_count, created_at, updated_at)
+                VALUES
+                    (:user_id, :work_date, NOW(), NOW(), :active_seconds, 1, 1, NOW(), NOW())
+                ON CONFLICT (user_id, work_date) DO UPDATE
+                    SET active_seconds  = LEAST(86400, staff_work_daily.active_seconds + :active_seconds),
+                        last_seen_at    = GREATEST(staff_work_daily.last_seen_at, NOW()),
+                        heartbeat_count = staff_work_daily.heartbeat_count + 1,
+                        updated_at      = NOW()
+                """
+            ),
+            {"user_id": user_id, "work_date": work_date, "active_seconds": active_seconds},
+        )
+        await self.db.flush()
+
+    async def close_day(self, *, user_id: UUID, work_date: date) -> None:
+        await self.db.execute(
+            text(
+                """
+                UPDATE staff_work_daily
+                   SET last_logout_at = NOW(),
+                       last_seen_at   = GREATEST(last_seen_at, NOW()),
+                       updated_at     = NOW()
+                 WHERE user_id = :user_id AND work_date = :work_date
+                """
+            ),
+            {"user_id": user_id, "work_date": work_date},
+        )
+        await self.db.flush()
+
+    # ── Reading the record back ──────────────────────────────────────────────
+    # One SELECT shared by the super-admin report and an admin's own profile,
+    # so the "when did this day actually end" rule cannot drift between them.
+
+    _DAY_COLUMNS = """
+        swd.user_id,
+        u.user_code,
+        TRIM(BOTH ' ' FROM COALESCE(u.first_name, '') || ' ' || COALESCE(u.last_name, '')) AS full_name,
+        u.user_type,
+        swd.work_date,
+        swd.first_login_at,
+        COALESCE(
+            swd.last_logout_at,
+            LEAST(
+                swd.last_seen_at + interval '60 seconds',
+                ((swd.work_date + 1)::timestamp AT TIME ZONE :tz)
+            )
+        ) AS last_logout_at,
+        swd.last_seen_at,
+        swd.session_count,
+        swd.heartbeat_count,
+        swd.active_seconds,
+        -- Rounded here so the report and the profile tab cannot disagree.
+        ROUND(swd.active_seconds / 60.0)::int AS active_minutes
+    """
+
+    @staticmethod
+    def _day_filters(*, user_id: Optional[UUID], date_from: date, date_to: date) -> tuple[str, dict]:
+        clauses = ["swd.work_date >= :date_from", "swd.work_date <= :date_to"]
+        params: dict = {"date_from": date_from, "date_to": date_to}
+        if user_id is not None:
+            clauses.append("swd.user_id = :user_id")
+            params["user_id"] = user_id
+        return "WHERE " + " AND ".join(clauses), params
+
+    async def list_days(
+        self,
+        *,
+        tz_name: str,
+        date_from: date,
+        date_to: date,
+        user_id: Optional[UUID] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> list[dict]:
+        where_sql, params = self._day_filters(user_id=user_id, date_from=date_from, date_to=date_to)
+        params = {**params, "tz": tz_name}
+        limit_sql = ""
+        if limit is not None:
+            limit_sql = "LIMIT :limit OFFSET :offset"
+            params["limit"] = limit
+            params["offset"] = offset
+        result = await self.db.execute(
+            text(
+                f"""
+                SELECT {self._DAY_COLUMNS}
+                  FROM staff_work_daily swd
+                  JOIN users u ON u.id = swd.user_id
+                 {where_sql}
+                 ORDER BY swd.work_date DESC, full_name, swd.user_id
+                 {limit_sql}
+                """
+            ),
+            params,
+        )
+        return [dict(row) for row in result.mappings().all()]
+
+    async def summarize_days(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        user_id: Optional[UUID] = None,
+    ) -> dict:
+        where_sql, params = self._day_filters(user_id=user_id, date_from=date_from, date_to=date_to)
+        result = await self.db.execute(
+            text(
+                f"""
+                SELECT COUNT(*)::int AS days,
+                       COUNT(DISTINCT swd.user_id)::int AS staff_count,
+                       COALESCE(SUM(swd.active_seconds), 0)::int AS active_seconds
+                  FROM staff_work_daily swd
+                 {where_sql}
+                """
+            ),
+            params,
+        )
+        row = result.mappings().one()
+        return {
+            "days": int(row["days"]),
+            "staff_count": int(row["staff_count"]),
+            "active_seconds": int(row["active_seconds"]),
+        }
+
+    async def count_days(
+        self,
+        *,
+        date_from: date,
+        date_to: date,
+        user_id: Optional[UUID] = None,
+    ) -> int:
+        where_sql, params = self._day_filters(user_id=user_id, date_from=date_from, date_to=date_to)
+        result = await self.db.execute(
+            text(f"SELECT COUNT(*)::int FROM staff_work_daily swd {where_sql}"), params
+        )
+        return int(result.scalar() or 0)
 
 
 class RoleRepository:
