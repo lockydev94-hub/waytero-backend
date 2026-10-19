@@ -17,7 +17,7 @@
 # All routes: async, AsyncSession, SUPER_ADMIN scope
 # ============================================================
 
-from typing import Optional, Any, List
+from typing import Optional, Any, Dict, List
 from datetime import date as _date, datetime as _datetime, timedelta
 from uuid import UUID
 
@@ -4891,3 +4891,22 @@ async def list_staff_work_hours(
         page_size=page_size,
     )
     return StaffWorkHoursResponse(**data)
+
+
+@router.get(
+    "/action-counts",
+    response_model=Dict[str, int],
+    tags=["Admin – Sidebar"],
+    summary="Pending items per Operations queue",
+    description=(
+        "One call for every sidebar badge: how many items in each queue are "
+        "waiting on somebody right now. A queue the caller cannot open still "
+        "returns its count — the badge is a number, not a record — and the "
+        "client hides zero. Cached for 45 seconds because the portal polls "
+        "every 60."
+    ),
+)
+async def action_counts(
+    db: AsyncSession = Depends(get_db),
+) -> Dict[str, int]:
+    return await AdminDashboardService.get_action_counts(db)

@@ -27,11 +27,59 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 
 from app.core.timezone import get_platform_tz
+from app.infrastructure.cache.redis_client import RedisCache, get_redis
 from app.modules.auth.repositories import StaffWorkDailyRepository
 from app.modules.admin.schemas.dashboard import (
     StaffProfileCreate,
     StaffUserCreate,
     StaffUserUpdate,
+)
+
+# Sidebar badges: 45 s is shorter than the portal's 60 s poll, so a queue is
+# never served from a cache that is staler than the refresh the client does.
+ACTION_COUNTS_CACHE_KEY = "admin:action_counts"
+ACTION_COUNTS_TTL_SECONDS = 45
+
+# (nav key, count query). The keys are the sidebar's, so the client can index
+# the response without a mapping table of its own.
+_CLOSED_CAPTURE_STATUSES = "'CLOSED', 'DONE', 'EXPIRED'"
+
+_ACTION_COUNT_QUERIES: tuple[tuple[str, str], ...] = tuple(
+    (
+        ("bookings", "SELECT 'bookings' AS nav_key, COUNT(*) AS c FROM cab_bookings "
+                      "WHERE booking_status = 'PENDING_ASSIGNMENT'"),
+        ("cab-ops", "SELECT 'cab-ops' AS nav_key, COUNT(*) AS c FROM cab_bookings "
+                     "WHERE booking_status = 'PENDING_PARTNER_ACCEPTANCE'"),
+        ("trip-assistance",
+         "SELECT 'trip-assistance' AS nav_key, COUNT(*) AS c FROM cab_bookings "
+         "WHERE booking_status IN ('DRIVER_ASSIGNED', 'STARTED') "
+         "   OR (booking_status = 'COMPLETED' AND payment_mode IS NULL) "
+         "   OR (booking_status = 'COMPLETED' AND cash_pending_at = 'DRIVER')"),
+        ("customer-care",
+         "SELECT 'customer-care' AS nav_key, COUNT(*) AS c FROM customer_care_logs "
+         "WHERE status IN ('OPEN', 'IN_PROGRESS')"),
+        ("chat",
+         "SELECT 'chat' AS nav_key, COUNT(*) AS c FROM chat_conversations "
+         "WHERE status = 'WAITING' OR (status = 'OPEN' AND unread_admin_count > 0)"),
+        ("callback-requests",
+         f"SELECT 'callback-requests' AS nav_key, COUNT(*) AS c FROM callback_requests "
+         f"WHERE status NOT IN ({_CLOSED_CAPTURE_STATUSES})"),
+        ("contact-messages",
+         "SELECT 'contact-messages' AS nav_key, COUNT(*) AS c FROM contact_messages "
+         "WHERE is_read = false"),
+        ("enquiries",
+         f"SELECT 'enquiries' AS nav_key, COUNT(*) AS c FROM enquiries "
+         f"WHERE status NOT IN ({_CLOSED_CAPTURE_STATUSES})"),
+        ("partner-applications",
+         "SELECT 'partner-applications' AS nav_key, COUNT(*) AS c FROM partner_applications "
+         "WHERE status = 'NEW'"),
+        ("guest-feedback",
+         "SELECT 'guest-feedback' AS nav_key, COUNT(*) AS c FROM booking_reviews "
+         "WHERE status = 'PENDING'"),
+        ("account-deletion",
+         "SELECT 'account-deletion' AS nav_key, COUNT(*) AS c "
+         "FROM account_deletion_requests WHERE status = 'PENDING'"),
+    )
 )
 
 
@@ -1596,3 +1644,37 @@ class AdminDashboardService:
             "date_from": date_from,
             "date_to": date_to,
         }
+
+    # ── Sidebar action counts (Admin Portal §5 — Operations badges) ──────────
+    @staticmethod
+    async def get_action_counts(db: AsyncSession) -> Dict[str, int]:
+        """How many items in each queue are waiting on somebody right now.
+
+        One round trip, not eleven: the sidebar polls this every minute for
+        every portal that is open, and most of those queues belong to a role
+        the caller cannot read, so eleven calls would be eleven 403s and eleven
+        chances for one slow table to stall a badge.
+
+        Each fragment is the WHERE clause the matching queue page already uses,
+        so a badge and the list under it cannot disagree. A nav key with no
+        honest pending concept is left out rather than given a number that
+        means something else: hotel switches are an append-only audit (no row
+        ever waits for a switch), and settlements are still writing `status`
+        while every reader filters on `settlement_status`.
+        """
+        cache = RedisCache(await get_redis())
+        try:
+            cached = await cache.get(ACTION_COUNTS_CACHE_KEY)
+        except Exception:  # Redis being down must not blank the sidebar
+            cached = None
+        if isinstance(cached, dict):
+            return {k: int(v) for k, v in cached.items()}
+
+        union_sql = "\nUNION ALL\n".join(sql for _, sql in _ACTION_COUNT_QUERIES)
+        rows = (await db.execute(text(union_sql))).mappings().all()
+        counts = {row["nav_key"]: int(row["c"] or 0) for row in rows}
+        try:
+            await cache.set(ACTION_COUNTS_CACHE_KEY, counts, ACTION_COUNTS_TTL_SECONDS)
+        except Exception:
+            pass
+        return counts
