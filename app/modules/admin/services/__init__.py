@@ -10,6 +10,7 @@
 # ============================================================
 
 from datetime import date, datetime, timezone
+from decimal import Decimal
 from typing import List, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, or_, update as sa_update
@@ -839,6 +840,115 @@ class DefaultPricingService:
             }
 
         return None
+
+
+class CommissionService:
+    """Which commission rule applies to a booking, decided in one place.
+
+    Doc Ref: DB Schema Part 2 §15 — commission_rules; BRD Part 3 §45
+
+    Four sites used to resolve this themselves with the same five lines:
+    `city rule → any rule → 10%`. Two of those lookups were wrong in ways that
+    move money:
+
+      * `commission_type == "PERCENTAGE"` in the WHERE clause meant a city
+        configured with a FLAT CAB rule (Bhubaneswar is, at ₹900) was skipped
+        entirely and charged the platform default instead — the admin's
+        configured rule was silently adjusted to 10%.
+      * the "general" fallback dropped the city filter rather than requiring
+        `city_id IS NULL`, so with rules for two cities a partner in a city
+        with no rule of its own could be billed another city's percentage,
+        whichever row `LIMIT 1` happened to return.
+
+    Precedence is therefore: the partner's own city rule in force on the day →
+    an explicitly platform-wide rule (`city_id IS NULL`) in force on the day →
+    the documented 10% default, tagged as such so the snapshot never claims a
+    rule id it did not use. Two rules in force at once for the same scope is a
+    configuration conflict, and guessing by row order is how a partner gets
+    invoiced a percentage nobody set: it raises instead.
+    """
+
+    DEFAULT_VALUE = Decimal("10")
+
+    @staticmethod
+    async def resolve(
+        db: AsyncSession,
+        *,
+        city_id: Optional[int],
+        service_type: str = "CAB",
+        for_date: Optional[date] = None,
+    ):
+        """Return a `CommissionRuleSpec` for the booking's city and day."""
+        from app.modules.booking.services.settlement_math import CommissionRuleSpec
+        from app.modules.admin.models import CommissionRule
+
+        on_day = for_date or datetime.now(timezone.utc).date()
+        in_force = (
+            CommissionRule.is_active.is_(True),
+            CommissionRule.service_type == service_type,
+            CommissionRule.commission_type.in_(("PERCENTAGE", "FLAT")),
+            or_(
+                CommissionRule.effective_from.is_(None),
+                CommissionRule.effective_from <= on_day,
+            ),
+            or_(
+                CommissionRule.effective_to.is_(None),
+                CommissionRule.effective_to >= on_day,
+            ),
+        )
+
+        def _spec(row, source: str):
+            if row.commission_value is None:
+                raise BusinessException(
+                    f"Commission rule #{row.id} ({source}) has no value "
+                    "configured. Set the percentage or flat amount before "
+                    "closing a trip under it."
+                )
+            return CommissionRuleSpec(
+                commission_type=row.commission_type or "PERCENTAGE",
+                value=row.commission_value,
+                source=source,
+                rule_id=row.id,
+            )
+
+        async def _one_where(extra, source: str):
+            rows = (
+                (
+                    await db.execute(
+                        select(CommissionRule)
+                        .where(*in_force, *extra)
+                        .order_by(CommissionRule.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if len(rows) > 1:
+                raise BusinessException(
+                    f"More than one {service_type} commission rule is in force "
+                    f"for {source} on {on_day} (rules "
+                    f"{', '.join(str(r.id) for r in rows)}). Deactivate or "
+                    "re-date one before closing a trip."
+                )
+            return _spec(rows[0], source) if rows else None
+
+        if city_id:
+            city_rule = await _one_where((CommissionRule.city_id == city_id,), "city")
+            if city_rule:
+                return city_rule
+
+        platform_rule = await _one_where(
+            (CommissionRule.city_id.is_(None),), "platform-wide"
+        )
+        if platform_rule:
+            return platform_rule
+
+        return CommissionRuleSpec(
+            commission_type="PERCENTAGE",
+            value=CommissionService.DEFAULT_VALUE,
+            source="default_10pct",
+            rule_id=None,
+        )
 
 
 # ── Service Type Service (Migration 0019) ─────────────────────────────────────

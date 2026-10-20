@@ -830,9 +830,10 @@ async def get_partner_booking_detail(
         }
 
     # Advance comes from advance_payments, not total_paid_amount — that field is
-    # a running "paid so far" total and is overwritten at final payment.
+    # a running "paid so far" total and is overwritten at final payment. The net
+    # is what still counts against the fare; a refunded part of it does not.
     advance_row = await advance_service.get_active_advance(db, cb.id)
-    advance_paid_val = float(advance_row["amount"]) if advance_row else 0.0
+    advance_paid_val = float(advance_row["net_amount"]) if advance_row else 0.0
     advance_summary_val = advance_service.advance_summary(advance_row)
 
     # Prevent browser from caching booking detail — payment/invoice state must always be fresh
@@ -1500,9 +1501,9 @@ class PartnerTripStartRequest(BaseModel):
 
 
 class PartnerTripCloseRequest(BaseModel):
-    end_km: float
+    end_km: Decimal
     end_datetime: datetime
-    final_amount: float
+    final_amount: Decimal
 
 
 class PartnerCollectPaymentRequest(BaseModel):
@@ -1784,7 +1785,7 @@ async def partner_close_trip(
     current_user=Depends(get_current_user),
 ):
     from app.modules.admin.services import DefaultPricingService
-    from app.modules.admin.models import CommissionRule, SystemConfiguration
+    from app.modules.admin.models import SystemConfiguration
 
     partner_id = await _resolve_partner_id(db, current_user["sub"])
     mb, cb, partner_assigns = await _get_partner_cab_booking(
@@ -1798,10 +1799,12 @@ async def partner_close_trip(
             "Trip must be in STARTED status to close.",
         )
 
-    start_km = float(cb.trip_start_km) if cb.trip_start_km is not None else None
+    start_km = cb.trip_start_km
     if start_km is not None and payload.end_km < start_km:
         raise HTTPException(
-            400, f"End KM ({payload.end_km}) cannot be less than start KM ({start_km})."
+            400,
+            f"End KM ({payload.end_km:.1f}) cannot be less than start KM "
+            f"({start_km:.1f}). Odometer can only increase.",
         )
 
     if cb.trip_started_at:
@@ -1824,6 +1827,7 @@ async def partner_close_trip(
     # app.modules.booking.services.fare so admin/partner cannot drift.
     fare_warning = None
     calculated_fare = None
+    fare_rule = None
     if cb.vehicle_category_id and mb.city_id and cb.trip_type:
         effective = await DefaultPricingService.get_effective_rule(
             db, mb.city_id, cb.vehicle_category_id, cb.trip_type
@@ -1831,18 +1835,17 @@ async def partner_close_trip(
         if effective:
             from app.modules.booking.services.fare import calculate_fare, trip_days_from
 
+            fare_rule = effective
             actual_dist = (
                 (payload.end_km - start_km) if start_km is not None else payload.end_km
             )
-            calculated_fare = float(
-                calculate_fare(
-                    effective,
-                    actual_dist,
-                    start_dt=cb.trip_started_at,
-                    end_dt=payload.end_datetime,
-                    trip_type=cb.trip_type,
-                    trip_days=trip_days_from(cb.pickup_datetime, cb.return_datetime),
-                )
+            calculated_fare = calculate_fare(
+                effective,
+                actual_dist,
+                start_dt=cb.trip_started_at,
+                end_dt=payload.end_datetime,
+                trip_type=cb.trip_type,
+                trip_days=trip_days_from(cb.pickup_datetime, cb.return_datetime),
             )
             if calculated_fare > 0:
                 deviation_pct = (
@@ -1861,58 +1864,38 @@ async def partner_close_trip(
                     )
 
     actual_distance = (
-        Decimal(str(payload.end_km)) - cb.trip_start_km
+        payload.end_km - cb.trip_start_km
         if cb.trip_start_km is not None
-        else Decimal(str(payload.end_km))
+        else payload.end_km
     )
     if actual_distance < 0:
         actual_distance = Decimal("0.00")
 
-    # Commission lookup (same as admin)
-    commission_percent = 10.0
-    commission_source = "default_10pct"
+    # Commission, payout and GST — the same code the admin desk runs. This used
+    # to be a second hand-written copy of that arithmetic, and the two drifted:
+    # a flat-rate city was charged 10% here, and rounding happened on floats.
+    from app.modules.admin.services import CommissionService
+    from app.modules.booking.services.settlement_math import (
+        commission_snapshot,
+        compute_close_economics,
+        money,
+    )
+
+    # The partner closing the trip is the partner the commission is calculated
+    # for, so the rule is looked up in their city — same resolution order the
+    # admin desk runs (city → platform-wide → tagged default).
     p = (
         await db.execute(select(Partner).where(Partner.id == partner_id))
     ).scalar_one_or_none()
-    if p and p.city_id:
-        city_rule = (
-            await db.execute(
-                select(CommissionRule)
-                .where(
-                    CommissionRule.service_type == "CAB",
-                    CommissionRule.commission_type == "PERCENTAGE",
-                    CommissionRule.city_id == p.city_id,
-                    CommissionRule.is_active,
-                )
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if city_rule:
-            commission_percent = float(city_rule.commission_value or 10)
-            commission_source = f"city_rule:{city_rule.id}"
-        else:
-            gen_rule = (
-                await db.execute(
-                    select(CommissionRule)
-                    .where(
-                        CommissionRule.service_type == "CAB",
-                        CommissionRule.commission_type == "PERCENTAGE",
-                        CommissionRule.is_active,
-                    )
-                    .limit(1)
-                )
-            ).scalar_one_or_none()
-            if gen_rule:
-                commission_percent = float(gen_rule.commission_value or 10)
-                commission_source = f"general_rule:{gen_rule.id}"
+    p_city_id = p.city_id if p else None
 
-    final_dec = Decimal(str(payload.final_amount))
-    platform_commission = Decimal(
-        str(round(payload.final_amount * commission_percent / 100, 2))
+    commission_rule = await CommissionService.resolve(
+        db,
+        city_id=p_city_id,
+        service_type="CAB",
+        for_date=payload.end_datetime.date() if payload.end_datetime else None,
     )
-    partner_payout = final_dec - platform_commission
 
-    # GST from system config
     gst_cfg_rows = (
         (
             await db.execute(
@@ -1926,16 +1909,20 @@ async def partner_close_trip(
     )
     gst_cfg = {r.config_key: (r.config_value or "").strip() for r in gst_cfg_rows}
     gst_enabled = gst_cfg.get("GST_ENABLED", "false").lower() == "true"
-    gst_rate_pct = 0.0
-    gst_amount_dec = Decimal("0.00")
-    if gst_enabled:
-        try:
-            gst_rate_pct = float(gst_cfg.get("GST_RATE", "5"))
-        except ValueError:
-            gst_rate_pct = 5.0
-        gst_amount_dec = Decimal(str(round(float(final_dec) * gst_rate_pct / 100, 2)))
 
-    cb.trip_end_km = Decimal(str(payload.end_km))
+    econ = compute_close_economics(
+        final_amount=payload.final_amount,
+        commission=commission_rule,
+        gst_enabled=gst_enabled,
+        gst_rate_percent=gst_cfg.get("GST_RATE", "5"),
+    )
+    final_dec = econ.final_amount
+    platform_commission = econ.platform_commission
+    partner_payout = econ.partner_payout
+    gst_rate_pct = econ.gst_rate_pct
+    gst_amount_dec = econ.gst_amount
+
+    cb.trip_end_km = payload.end_km
     cb.trip_ended_at = payload.end_datetime
     cb.final_amount = final_dec
     cb.actual_distance = actual_distance
@@ -1960,42 +1947,64 @@ async def partner_close_trip(
             driver_id=closed_assign.driver_id,
             on_trip=False,
         )
-    cb.gst_rate = Decimal(str(gst_rate_pct))
+    cb.gst_rate = gst_rate_pct
     cb.gst_amount = gst_amount_dec
     cb.is_tax_invoice = gst_enabled
+    # The rule as applied, frozen on the booking (migration 0086) — identical
+    # payload to the admin close, so a settlement is provable whichever desk
+    # closed the trip.
+    cb.commission_config_snapshot = commission_snapshot(
+        econ,
+        fare_close_check=(
+            None
+            if fare_rule is None
+            else {
+                "rule_id": fare_rule.get("rule_id"),
+                "rule_table": fare_rule.get("rule_table"),
+                "city_id": fare_rule.get("city_id"),
+                "pricing_source": fare_rule.get("source"),
+                "calculated_fare": str(calculated_fare) if calculated_fare else None,
+                "accepted_final_amount": str(final_dec),
+            }
+        ),
+    )
 
     mb.total_amount = final_dec
     mb.booking_status = "COMPLETED"
 
-    from app.modules.admin.coupon_models import CouponUsage
-    from sqlalchemy import func as _func
-
-    coupon_q = await db.execute(
-        select(_func.sum(CouponUsage.discount_applied)).where(
-            CouponUsage.master_booking_id == mb.id
-        )
+    # The booking's own coupon column, not a SUM over the master booking's
+    # coupon_usages — a master can carry a hotel/tour with its own coupon. This
+    # matches the admin close and what settlement re-validates against.
+    coupon_discount = money(cb.coupon_discount)
+    advance_paid = Decimal(
+        str(await advance_service.get_advance_amount(db, cb.id) or 0)
     )
-    coupon_discount = float(coupon_q.scalar() or 0)
-    advance_paid = await advance_service.get_advance_amount(db, cb.id)
-    # Gross-based, so this matches the customer-facing invoice PDF exactly.
+    # Balance is computed on the gross (fare + GST when it is a tax invoice), so
+    # it matches the customer-facing invoice PDF.
     balance_due = advance_service.compute_balance_due(
-        final_amount=payload.final_amount,
+        final_amount=final_dec,
         coupon_discount=coupon_discount,
         advance_paid=advance_paid,
-        gst_amount=float(gst_amount_dec),
+        gst_amount=gst_amount_dec,
         is_tax_invoice=gst_enabled,
     )
 
+    commission_label = (
+        f"{econ.commission.commission_type} {econ.commission.value}"
+        if econ.commission.commission_type == "FLAT"
+        else f"{econ.commission.value}% of fare"
+    )
     await _log_timeline(
         db,
         mb.id,
         "TRIP_CLOSED_BY_PARTNER",
         f"Partner closed trip for {cb.booking_number} on driver's behalf. "
-        f"End KM: {payload.end_km} | Distance: {float(actual_distance):.1f} km | "
-        f"Final: ₹{payload.final_amount:.2f} | Coupon: −₹{coupon_discount:.2f} | "
+        f"End KM: {payload.end_km:.1f} | Distance: {actual_distance:.1f} km | "
+        f"Final: ₹{final_dec:.2f} | Coupon: −₹{coupon_discount:.2f} | "
         f"Advance: −₹{advance_paid:.2f} | Balance due: ₹{balance_due:.2f} | "
-        f"Commission ({commission_percent}%, {commission_source}): ₹{float(platform_commission):.2f} | "
-        f"Partner payout: ₹{float(partner_payout):.2f}"
+        f"Commission ({commission_label}, {econ.commission.source}"
+        f"{f' rule #{econ.commission.rule_id}' if econ.commission.rule_id else ''}): "
+        f"₹{platform_commission:.2f} | Partner payout: ₹{partner_payout:.2f}"
         + (f" | {fare_warning}" if fare_warning else ""),
     )
     # get_db auto-commits on success.
@@ -2059,17 +2068,23 @@ async def partner_close_trip(
         "message": "Trip closed successfully."
         + (f" Warning: {fare_warning}" if fare_warning else ""),
         "cab_status": "COMPLETED",
-        "trip_end_km": payload.end_km,
+        "trip_end_km": float(payload.end_km),
         "actual_distance": float(actual_distance),
         "final_amount": float(final_dec),
-        "calculated_fare": calculated_fare,
+        "calculated_fare": float(calculated_fare) if calculated_fare else None,
         "fare_warning": fare_warning,
-        "coupon_discount": coupon_discount,
-        "advance_paid": advance_paid,
-        "balance_due": balance_due,
+        "coupon_discount": float(coupon_discount),
+        "advance_paid": float(advance_paid),
+        "balance_due": float(balance_due),
         "platform_commission": float(platform_commission),
-        "commission_percent": commission_percent,
+        "commission_type": econ.commission.commission_type,
+        "commission_percent": float(econ.commission_percent),
+        "commission_value": float(econ.commission.value),
+        "commission_source": econ.commission.source,
         "partner_payout": float(partner_payout),
+        "gst_enabled": gst_enabled,
+        "gst_rate": float(gst_rate_pct),
+        "gst_amount": float(gst_amount_dec),
     }
 
 
@@ -2136,8 +2151,7 @@ async def partner_collect_payment(
     db: AsyncSession = Depends(get_db),
     current_user=Depends(get_current_user),
 ):
-    from sqlalchemy import text as _text3, func as _func2
-    from app.modules.admin.coupon_models import CouponUsage
+    from sqlalchemy import text as _text3
 
     partner_id = await _resolve_partner_id(db, current_user["sub"])
     mb, cb, _ = await _get_partner_cab_booking(db, booking_number, partner_id)
@@ -2178,27 +2192,26 @@ async def partner_collect_payment(
     if collector not in {"DRIVER", "PARTNER"}:
         raise HTTPException(400, "payment_collected_by must be DRIVER or PARTNER.")
 
-    final = float(cb.final_amount or cb.estimated_amount or 0)
-    if final <= 0:
+    from app.modules.booking.services.settlement_math import money
+
+    # The closed fare only. `estimated_amount` is a quote, and paying against it
+    # left the booking with no commission, no payout and no snapshot.
+    final = cb.final_amount
+    if not final or final <= 0:
         raise HTTPException(
             400, "Final amount is not set. Close the trip before collecting payment."
         )
 
     commission = cb.platform_commission or Decimal("0.00")
-    payout = cb.partner_payout or Decimal(str(final))
+    payout = cb.partner_payout or money(final)
 
-    coupon_q = await db.execute(
-        select(_func2.sum(CouponUsage.discount_applied)).where(
-            CouponUsage.master_booking_id == mb.id
-        )
-    )
-    coupon_discount = float(coupon_q.scalar() or 0)
-    advance_paid = await advance_service.get_advance_amount(db, cb.id)
+    coupon_discount = money(cb.coupon_discount)
+    advance_paid = money(await advance_service.get_advance_amount(db, cb.id))
     balance_due = advance_service.compute_balance_due(
-        final_amount=final,
+        final_amount=money(final),
         coupon_discount=coupon_discount,
         advance_paid=advance_paid,
-        gst_amount=float(getattr(cb, "gst_amount", 0) or 0),
+        gst_amount=getattr(cb, "gst_amount", 0) or 0,
         is_tax_invoice=bool(getattr(cb, "is_tax_invoice", False)),
     )
 
@@ -2208,7 +2221,7 @@ async def partner_collect_payment(
 
     if mode == "CASH":
         cb.cash_pending_at = "DRIVER"
-        cb.cash_amount_due = Decimal(str(balance_due))
+        cb.cash_amount_due = balance_due
         await _log_timeline(
             db,
             mb.id,
@@ -2240,14 +2253,16 @@ async def partner_collect_payment(
                 f"Customer wallet is '{wallet_row['wallet_status']}' — cannot process payment.",
             )
 
-        avail = float(wallet_row["available_balance"] or 0)
+        avail = money(wallet_row["available_balance"])
         if avail < balance_due:
             raise HTTPException(
                 400,
-                f"Insufficient wallet balance. Required: ₹{balance_due:.2f} | Available: ₹{avail:.2f}.",
+                f"Insufficient wallet balance. Required: ₹{balance_due:.2f} | "
+                f"Available: ₹{avail:.2f} | Shortfall: ₹{money(balance_due - avail):.2f}. "
+                "Customer must recharge their wallet before payment.",
             )
 
-        new_balance = round(avail - balance_due, 2)
+        new_balance = money(avail - balance_due)
         await db.execute(
             _text3(
                 "UPDATE customer_wallets SET available_balance = :bal, updated_at = NOW() WHERE id = :wid"
@@ -2268,7 +2283,9 @@ async def partner_collect_payment(
                 "ref": cb.booking_number,
                 "debit": balance_due,
                 "bal_after": new_balance,
-                "narration": f"CAB trip payment — {cb.booking_number} | Fare ₹{final:.2f} | Deducted ₹{balance_due:.2f}",
+                "narration": f"CAB trip payment — {cb.booking_number} | Fare ₹{final:.2f} | "
+                f"Coupon −₹{coupon_discount:.2f} | Advance −₹{advance_paid:.2f} | "
+                f"Deducted ₹{balance_due:.2f}",
             },
         )
         cb.cash_pending_at = "NONE"
@@ -2284,31 +2301,24 @@ async def partner_collect_payment(
     # What the customer actually handed over: advance + the balance just taken.
     # This used to be set to the full fare, which overstated collections on
     # discounted bookings and destroyed the advance figure other code read back.
-    mb.total_paid_amount = Decimal(str(round(advance_paid + balance_due, 2)))
+    mb.total_paid_amount = money(advance_paid + balance_due)
 
-    # Auto-generate invoice number (race-safe: use sequence, not COUNT)
+    # Auto-generate invoice number from the counter. The MAX-over-invoice_number
+    # version this replaces was racy: two payments read the same maximum and both
+    # wrote the same number, and a rolled-back payment burned the next one. The
+    # counter takes a row lock and is spent inside this transaction, so it
+    # commits or rolls back with the payment itself.
     if not cb.invoice_number:
-        from datetime import date as _date
-        from sqlalchemy import text as _text4
+        from app.modules.booking.services.numbering import next_invoice_number
 
-        _today = _date.today()
-        # Use MAX-based sequence to avoid COUNT race (two concurrent payments could get same count)
-        _max_row = (
-            await db.execute(
-                _text4(
-                    "SELECT MAX(CAST(SPLIT_PART(invoice_number, '-', 4) AS INTEGER)) FROM cab_bookings WHERE invoice_number IS NOT NULL AND invoice_number LIKE 'WT-INV-%'"
-                )
-            )
-        ).scalar()
-        _next_seq = (_max_row or 0) + 1
-        cb.invoice_number = (
-            f"WT-INV-{_today.strftime('%Y%m')}-{str(_next_seq).zfill(5)}"
-        )
+        _new_invoice = await next_invoice_number(db, "CAB")
+        cb.invoice_number = _new_invoice
         await _log_timeline(
             db,
             mb.id,
             "INVOICE_AUTO_GENERATED",
-            f"Invoice {cb.invoice_number} auto-generated at payment collection by partner. Mode: {mode}.",
+            f"Invoice {_new_invoice} auto-generated at payment collection by partner. "
+            f"Mode: {mode} | Collected by: {collector}.",
         )
 
     try:
@@ -2390,10 +2400,10 @@ async def partner_collect_payment(
         "message": "Payment recorded successfully.",
         "payment_mode": mode,
         "payment_collected_by": collector,
-        "final_amount": final,
-        "coupon_discount": coupon_discount,
-        "advance_paid": advance_paid,
-        "balance_due": balance_due,
+        "final_amount": float(final),
+        "coupon_discount": float(coupon_discount),
+        "advance_paid": float(advance_paid),
+        "balance_due": float(balance_due),
         "platform_commission": float(commission),
         "partner_payout": float(payout),
         "cash_pending_at": cb.cash_pending_at,
@@ -2418,13 +2428,24 @@ async def partner_download_invoice(
     from fastapi import Response
     from app.modules.admin.models import SystemConfiguration
     from app.modules.admin.invoice_pdf_service import generate_invoice_pdf
-    from app.modules.admin.coupon_models import CouponUsage
-    from sqlalchemy import func as _func4
+    from app.modules.booking.services.settlement_math import money
     from datetime import timezone as _tz3
 
     partner_id = await _resolve_partner_id(db, current_user["sub"])
     mb, cb, _ = await _get_partner_cab_booking(db, booking_number, partner_id)
 
+    # A voided invoice is a cancelled tax document. It stays downloadable-
+    # nothing; the customer's money moved back through cancellation and the
+    # number must never be re-issued against the same booking. Checked before
+    # the status gate so the partner is told the document was voided rather
+    # than told to complete a trip that will never complete.
+    if cb.invoice_voided_at:
+        raise HTTPException(
+            400,
+            f"Invoice {cb.invoice_number} was voided"
+            + (f" ({cb.invoice_void_reason})" if cb.invoice_void_reason else "")
+            + ". Download is not available for a voided invoice.",
+        )
     if cb.booking_status not in ("COMPLETED", "SETTLEMENT_PENDING", "SETTLED"):
         raise HTTPException(
             400,
@@ -2519,13 +2540,11 @@ async def partner_download_invoice(
                     f"{v.vehicle_brand or ''} {v.vehicle_model or ''}".strip() or None
                 )
 
-    coupon_q = await db.execute(
-        select(_func4.sum(CouponUsage.discount_applied)).where(
-            CouponUsage.master_booking_id == mb.id
-        )
-    )
-    coupon_discount = float(coupon_q.scalar() or 0)
-    advance_paid = await advance_service.get_advance_amount(db, cb.id)
+    # The invoice prints this cab booking's own coupon. SUM over the master's
+    # coupon_usages put a hotel or tour coupon on the cab invoice and made the
+    # PDF disagree with the balance the partner just collected.
+    coupon_discount = money(cb.coupon_discount)
+    advance_paid = money(await advance_service.get_advance_amount(db, cb.id))
 
     pdf_bytes = generate_invoice_pdf(
         invoice_number=cb.invoice_number,

@@ -73,12 +73,12 @@ COLLECTABLE_STATUSES = {
 
 def compute_balance_due(
     *,
-    final_amount: float,
-    coupon_discount: float = 0.0,
-    advance_paid: float = 0.0,
-    gst_amount: float = 0.0,
+    final_amount: Any,
+    coupon_discount: Any = 0,
+    advance_paid: Any = 0,
+    gst_amount: Any = 0,
     is_tax_invoice: bool = False,
-) -> float:
+) -> Decimal:
     """
     What the customer still owes at trip end.
 
@@ -87,13 +87,19 @@ def compute_balance_due(
     (invoice_pdf_service). Trip-close and collect-payment previously worked net
     of GST, so on a GST booking the stored cash figure and the printed invoice
     disagreed. Both now go through here.
+
+    Returns a Decimal quantised to the paisa. It used to take and return
+    floats, which meant every caller rounded a binary approximation and a
+    collection of ₹4999.995 could land on ₹5000.00 in one site and ₹4999.99
+    in another. Accepting float or str input keeps the older callers working
+    while the arithmetic itself stays exact.
     """
-    gross = round(
-        float(final_amount or 0) + (float(gst_amount or 0) if is_tax_invoice else 0.0),
-        2,
-    )
+    from app.modules.booking.services.settlement_math import money
+
+    gross = money(final_amount) + (money(gst_amount) if is_tax_invoice else Decimal("0.00"))
     return max(
-        0.0, round(gross - float(coupon_discount or 0) - float(advance_paid or 0), 2)
+        Decimal("0.00"),
+        gross - money(coupon_discount) - money(advance_paid),
     )
 
 
@@ -111,6 +117,15 @@ async def get_active_advance(
     Replaces the old `float(mb.total_paid_amount or 0)` reads, which carried no
     mode, no receiver and no receipt — and were destroyed the moment final
     payment overwrote that field.
+
+    `amount` stays the receipt figure — what was handed over, printed on the
+    receipt and quoted in a dispute. `net_amount` is what the platform is still
+    holding after refunds. A partially refunded advance keeps its ACTIVE row
+    (`admin/payment_api.refund_advance` accumulates `refunded_amount` and only
+    flips to REFUNDED at the full amount), so every balance, invoice and
+    settlement read has to use the net. Before that column was exposed here,
+    the customer's invoice netted refunds and the admin/partner balance did not,
+    so the same booking showed two different amounts due.
     """
     row = (
         (
@@ -120,7 +135,9 @@ async def get_active_advance(
             SELECT id, cab_booking_id, master_booking_id, booking_number,
                    receipt_number, amount, payment_mode, received_by,
                    partner_id, driver_id, reference_note, status,
-                   collected_by_user_id, collected_by_role, collected_at
+                   collected_by_user_id, collected_by_role, collected_at,
+                   COALESCE(refunded_amount, 0) AS refunded_amount,
+                   amount - COALESCE(refunded_amount, 0) AS net_amount
             FROM advance_payments
             WHERE cab_booking_id = :cbid AND status = 'ACTIVE'
         """
@@ -134,20 +151,26 @@ async def get_active_advance(
     return dict(row) if row else None
 
 
-async def get_advance_amount(db: AsyncSession, cab_booking_id: int) -> float:
-    """Convenience for the many call sites that only need the number."""
+async def get_advance_amount(db: AsyncSession, cab_booking_id: int) -> Decimal:
+    """What the platform still holds as advance — net of any refund."""
     adv = await get_active_advance(db, cab_booking_id)
-    return float(adv["amount"]) if adv else 0.0
+    return Decimal(str(adv["net_amount"])) if adv else Decimal("0.00")
 
 
 def advance_summary(adv: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Serialise an advance row for an API response."""
     if not adv:
         return None
+    refunded = Decimal(str(adv["refunded_amount"] or 0))
     return {
         "id": adv["id"],
         "receipt_number": adv["receipt_number"],
         "amount": float(adv["amount"]),
+        # A partially refunded advance is still ACTIVE, so the desk needs both
+        # the receipt figure and what is actually still held — the second is the
+        # number the balance due was computed from.
+        "refunded_amount": float(refunded),
+        "net_amount": float(Decimal(str(adv["amount"])) - refunded),
         "payment_mode": adv["payment_mode"],
         "received_by": adv["received_by"],
         "reference_note": adv["reference_note"],

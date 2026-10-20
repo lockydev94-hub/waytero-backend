@@ -498,26 +498,17 @@ async def next_receipt_number(db: AsyncSession) -> str:
 
 
 async def next_invoice_number(db: AsyncSession) -> str:
-    """Sequential tax-invoice id: WT-HINV-<year><6-digit seq>."""
-    year = datetime.now(timezone.utc).year
-    prefix = f"WT-HINV-{year}"
-    last = (
-        await db.execute(
-            text(
-                "SELECT invoice_number FROM hotel_reservations "
-                "WHERE invoice_number LIKE :p ORDER BY id DESC LIMIT 1"
-            ),
-            {"p": f"{prefix}%"},
-        )
-    ).scalar_one_or_none()
+    """Sequential tax-invoice id: WT-HINV-<year><6-digit seq>.
 
-    seq = 1
-    if last:
-        try:
-            seq = int(str(last)[len(prefix) :]) + 1
-        except ValueError:
-            seq = 1
-    return f"{prefix}{seq:06d}"
+    The counter lives in ``invoice_sequences`` (migration 0086) and is taken
+    with FOR UPDATE, so two concurrent check-outs cannot issue the same
+    invoice number the way reading ``ORDER BY id DESC LIMIT 1`` allowed. The
+    sequence runs globally rather than restarting each January; the year is
+    still in the number, it just no longer resets.
+    """
+    from app.modules.booking.services.numbering import next_invoice_number as _next
+
+    return await _next(db, "HOTEL")
 
 
 # ════════════════════════════════════════════════════════════════

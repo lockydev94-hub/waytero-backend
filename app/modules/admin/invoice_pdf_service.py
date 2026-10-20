@@ -38,6 +38,7 @@ from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
+from app.modules.booking.services.settlement_math import ZERO, money
 from reportlab.platypus import (
     BaseDocTemplate,
     Frame,
@@ -237,6 +238,17 @@ def generate_invoice_pdf(
     """
     Build and return a premium A4 PDF invoice as raw bytes.
     """
+    # Normalise the money once. Callers hand these over as Decimal straight from
+    # the column or as float from a converted response, and `Decimal - float`
+    # raises while `float - float` rounds half-to-even — neither is acceptable on
+    # a document the customer keeps. money() is the same quantisation the close
+    # and collect endpoints used, so the PDF cannot disagree with the ledger.
+    estimated_amount = money(estimated_amount) if estimated_amount else None
+    final_amount = money(final_amount)
+    coupon_discount = money(coupon_discount)
+    advance_paid = money(advance_paid)
+    gst_rate = money(gst_rate)
+    gst_amount = money(gst_amount)
 
     buf = io.BytesIO()
     W, H = A4  # 595.28 x 841.89 pts
@@ -393,8 +405,12 @@ def generate_invoice_pdf(
     story.append(Spacer(1, 4 * mm))
 
     # ── 3. BILLED TO / BOOKING INFO row ──────────────────────────────────────
-    _gross_total = round(final_amount + (gst_amount if is_tax_invoice else 0.0), 2)
-    balance_due = max(0.0, round(_gross_total - coupon_discount - advance_paid, 2))
+    # money() rather than round(): the PDF recomputes the same balance the
+    # close/collect endpoints wrote, and float rounding is half-to-even on a
+    # binary approximation, so the two could print a paishe apart on the same
+    # booking. Half-up quantisation keeps the document and the ledger agreeing.
+    _gross_total = final_amount + (gst_amount if is_tax_invoice else ZERO)
+    balance_due = max(ZERO, _gross_total - coupon_discount - advance_paid)
 
     billed_block = [
         _p("BILLED TO", S["section_h"]),
@@ -617,7 +633,7 @@ def generate_invoice_pdf(
     fare_rows.append(["", ""])
 
     # Grand total row — includes GST when applicable
-    total_payable = round(final_amount + (gst_amount if is_tax_invoice else 0.0), 2)
+    total_payable = final_amount + (gst_amount if is_tax_invoice else ZERO)
     fare_rows.append(
         [
             Paragraph("TOTAL PAYABLE", _ps("gtl", 10, BRAND_DARK, bold=True)),

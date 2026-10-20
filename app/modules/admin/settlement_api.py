@@ -262,7 +262,10 @@ def _compute_position(
     is_tax_invoice: bool = False,
 ) -> dict:
     """The full settlement arithmetic for one booking. Pure — no DB, no writes."""
-    advance_amount = float(advance["amount"]) if advance else 0.0
+    # Net of any refund, not the receipt figure: a partially refunded advance is
+    # still an ACTIVE row, and settling against the gross would pay the partner
+    # back money the customer already got back.
+    advance_amount = float(advance["net_amount"]) if advance else 0.0
     advance_receiver = advance["received_by"] if advance else None
 
     balance_due = advance_service.compute_balance_due(

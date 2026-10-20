@@ -1613,13 +1613,13 @@ async def customer_cab_download_invoice(
     Doc Ref: BRD Part 3 §45 (settlement), §48 (tax invoice)"""
     from datetime import datetime as _datetime_cab_inv
     from datetime import timezone as _tz_cab_inv
-    from sqlalchemy import func as _func_cab_inv
 
     from app.modules.admin.invoice_pdf_service import generate_invoice_pdf
     from app.modules.admin.models import SystemConfiguration
-    from app.modules.admin.coupon_models import CouponUsage
     from app.modules.auth.models.user import User
-    from app.modules.booking.models import AdvancePayment, CabBooking, MasterBooking
+    from app.modules.booking import services as advance_service
+    from app.modules.booking.models import CabBooking, MasterBooking
+    from app.modules.booking.services.settlement_math import money
     from app.modules.driver.models import Driver
     from app.modules.master.models import City
     from app.modules.partner.models import Partner
@@ -1639,6 +1639,15 @@ async def customer_cab_download_invoice(
     if not cb:
         raise HTTPException(404, "Cab booking not found / not yours.")
 
+    # Void before the status gate: the trip was cancelled and its tax document
+    # died with it. Naming the void is the truth; "complete the trip" never will
+    # be. The internal reason text stays off the customer-facing message.
+    if cb.invoice_voided_at:
+        raise HTTPException(
+            400,
+            f"Invoice {cb.invoice_number} was voided when this trip was "
+            "cancelled. It is not available for download.",
+        )
     if cb.booking_status not in ("COMPLETED", "SETTLEMENT_PENDING", "SETTLED"):
         raise HTTPException(
             400,
@@ -1732,27 +1741,11 @@ async def customer_cab_download_invoice(
                     or None
                 )
 
-    coupon_q = await db.execute(
-        select(_func_cab_inv.sum(CouponUsage.discount_applied)).where(
-            CouponUsage.master_booking_id == mb.id
-        )
-    )
-    coupon_discount = float(coupon_q.scalar() or 0)
-    adv_q = await db.execute(
-        select(
-            _func_cab_inv.coalesce(
-                _func_cab_inv.sum(
-                    AdvancePayment.amount
-                    - _func_cab_inv.coalesce(AdvancePayment.refunded_amount, 0)
-                ),
-                0,
-            )
-        ).where(
-            AdvancePayment.cab_booking_id == cb.id,
-            AdvancePayment.status == "ACTIVE",
-        )
-    )
-    advance_paid = float(adv_q.scalar() or 0)
+    # This cab booking's own coupon and advance. The master-level coupon SUM put
+    # another service's discount on this invoice; the advance is net of refunds,
+    # which is what the balance the partner collected was computed from.
+    coupon_discount = money(cb.coupon_discount)
+    advance_paid = money(await advance_service.get_advance_amount(db, cb.id))
 
     # ORM attributes are typed as Column[...] under mypy — alias to Any so the
     # pdf builder's arguments keep their real signatures.

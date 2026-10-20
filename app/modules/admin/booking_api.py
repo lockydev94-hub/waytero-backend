@@ -244,6 +244,11 @@ class AdvanceOut(BaseModel):
     id: int
     receipt_number: str
     amount: float
+    # A partially refunded advance stays ACTIVE, so the receipt figure and the
+    # amount still held against the fare are different numbers. The desk needs
+    # both — the second is what the balance due was computed from.
+    refunded_amount: float = 0.0
+    net_amount: float
     payment_mode: str
     received_by: str
     reference_note: Optional[str] = None
@@ -2839,8 +2844,7 @@ async def admin_download_cab_invoice(
     """
     from app.modules.admin.models import SystemConfiguration
     from app.modules.admin.invoice_pdf_service import generate_invoice_pdf
-    from app.modules.admin.coupon_models import CouponUsage
-    from sqlalchemy import func as _func_cab_inv
+    from app.modules.booking.services.settlement_math import money
     from datetime import timezone as _tz_cab_inv
 
     mb = await _get_master_booking(db, booking_id)
@@ -2850,6 +2854,15 @@ async def admin_download_cab_invoice(
             404, f"Cab booking {cab_id} not found on master {booking_id}."
         )
 
+    # Void first: a cancelled booking's tax document is named as voided, which
+    # tells the desk more than "complete the trip" ever will.
+    if cb.invoice_voided_at:
+        raise HTTPException(
+            400,
+            f"Invoice {cb.invoice_number} was voided"
+            + (f" ({cb.invoice_void_reason})" if cb.invoice_void_reason else "")
+            + ". Download is not available for a voided invoice.",
+        )
     if cb.booking_status not in ("COMPLETED", "SETTLEMENT_PENDING", "SETTLED"):
         raise HTTPException(
             400,
@@ -2943,14 +2956,9 @@ async def admin_download_cab_invoice(
                     f"{v.vehicle_brand or ''} {v.vehicle_model or ''}".strip() or None
                 )
 
-    # ── Coupon + advance ────────────────────────────────────────────
-    coupon_q = await db.execute(
-        select(_func_cab_inv.sum(CouponUsage.discount_applied)).where(
-            CouponUsage.master_booking_id == mb.id
-        )
-    )
-    coupon_discount = float(coupon_q.scalar() or 0)
-    advance_paid = await advance_service.get_advance_amount(db, cb.id)
+    # ── Coupon + advance — this cab booking's own figures ───────────────────
+    coupon_discount = money(cb.coupon_discount)
+    advance_paid = money(await advance_service.get_advance_amount(db, cb.id))
 
     pdf_bytes = generate_invoice_pdf(
         invoice_number=cb.invoice_number,

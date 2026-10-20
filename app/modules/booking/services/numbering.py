@@ -1,22 +1,52 @@
 # ============================================================
-# WAYTERO — BOOKING NUMBER GENERATOR
+# WAYTERO — BOOKING AND INVOICE NUMBER GENERATORS
 # File: app/modules/booking/services/numbering.py
 # Doc Ref: BRD Part 3 §20 — sequence-based booking numbering
+#          BRD Part 3 §45 — invoice created when payment is recorded
 #
-# MAX-based sequence per day (same pattern as
-# app.modules.booking.services._next_receipt_number). Reads from the
-# master_bookings and cab_bookings tables, returns the next available
-# number for today in the format ``MT-YYYYMMDD-NNNNN`` and
-# ``CB-YYYYMMDD-NNNNN``. The five-digit suffix is per-day, so a
-# concurrent insert that lands before this query completes still gets
-# a unique number — the table's UNIQUE constraint catches the
-# collision and the calling code retries.
+# Booking numbers are read off the table they belong to (`MAX(...) + 1` per
+# day, same pattern as
+# app.modules.booking.services._next_receipt_number): a skipped number is
+# harmless there, the column is UNIQUE, and the caller retries.
+#
+# Invoice numbers are the opposite. They are legal documents, so a number must
+# not be handed to two payments and must not depend on how many rows happen to
+# be visible at the moment of reading — the four `MAX(SPLIT_PART(...))+1` and
+# `COUNT(*)+1` generators this file replaces could do exactly that, because two
+# concurrent collections read the same maximum before either row existed. A
+# counter row taken `FOR UPDATE` is the one shape in Postgres where the second
+# transaction waits for the first to finish, and the increment lives in the
+# caller's transaction: a collection that rolls back leaves no number spent.
 # ============================================================
 
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
+
+
+@dataclass(frozen=True)
+class InvoiceKind:
+    """How one document kind writes its number.
+
+    The three fields reproduce the formats already printed on customer
+    documents; nothing is re-styled here, because an invoice number that
+    changes shape mid-year is a hole in the books.
+    """
+
+    prefix: str
+    stamp: str
+    infix: str
+    digits: int
+
+
+INVOICE_KINDS: dict[str, InvoiceKind] = {
+    # WT-INV-202610-00042
+    "CAB": InvoiceKind(prefix="WT-INV-", stamp="%Y%m", infix="-", digits=5),
+    # WT-HINV-2026000042 — the year and the sequence run together
+    "HOTEL": InvoiceKind(prefix="WT-HINV-", stamp="%Y", infix="", digits=6),
+}
 
 
 def _today_utc_compact() -> str:
@@ -67,3 +97,53 @@ async def next_cab_booking_number(db: AsyncSession) -> str:
     return await _next_seq(
         db, "cab_bookings", "booking_number", "CB", _today_utc_compact()
     )
+
+
+async def next_invoice_number(db: AsyncSession, kind: str) -> str:
+    """Take the next invoice number for ``kind`` off its own counter row.
+
+    `kind` is a key of `INVOICE_KINDS` — `CAB` or `HOTEL` — and the counter rows
+    were seeded by migration 0086 from the highest number each table already
+    held, so the first counter-issued invoice cannot collide with one the old
+    generators wrote.
+
+    An unconfigured `kind` is refused rather than started at 1: a document whose
+    table already holds `WT-TINV-…-0007` numbers would issue a duplicate the
+    moment an on-demand counter began at one. A new kind is added to
+    `INVOICE_KINDS` and seeded with the same read-the-old-maximum step 0086
+    used, once, inside a migration.
+    """
+    spec = INVOICE_KINDS.get(kind)
+    if spec is None:
+        raise ValueError(
+            f"No invoice number format is configured for kind {kind!r} "
+            f"(known: {', '.join(sorted(INVOICE_KINDS))})"
+        )
+
+    # The row is locked, not merely read: two collections in the same second are
+    # stopped here, and the second one gets the number after the first.
+    seq = (
+        await db.execute(
+            text(
+                "SELECT last_seq FROM invoice_sequences WHERE kind = :kind FOR UPDATE"
+            ),
+            {"kind": kind},
+        )
+    ).scalar_one_or_none()
+    if seq is None:
+        raise ValueError(
+            f"invoice_sequences has no row for kind {kind!r}; migration 0086 "
+            "seeds one per configured kind"
+        )
+    next_seq = int(seq) + 1
+    await db.execute(
+        text(
+            "UPDATE invoice_sequences SET last_seq = :n, updated_at = NOW() "
+            "WHERE kind = :kind"
+        ),
+        {"n": next_seq, "kind": kind},
+    )
+    await db.flush()
+
+    stamp = datetime.now(timezone.utc).strftime(spec.stamp)
+    return f"{spec.prefix}{stamp}{spec.infix}{str(next_seq).zfill(spec.digits)}"

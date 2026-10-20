@@ -1009,7 +1009,8 @@ async def apply_cab_cancellation(
             text(
                 """
                 SELECT id, master_booking_id, booking_status, final_amount,
-                       estimated_amount, pickup_datetime
+                       estimated_amount, pickup_datetime, booking_number,
+                       invoice_number, invoice_voided_at
                 FROM cab_bookings
                 WHERE id = :id
                 """
@@ -1063,7 +1064,7 @@ async def apply_cab_cancellation(
             amount=quote.refund_amount,
             reference=reference,
             narration=(
-                f"Auto-refund on cab cancellation {cb_row[0]}. "
+                f"Auto-refund on cab cancellation {cb_row[6] or cb_row[0]}. "
                 f"Reason: {cancellation_reason[:80]}"
             ),
         )
@@ -1093,6 +1094,18 @@ async def apply_cab_cancellation(
         )
 
     # 3. Update cab_bookings + master_bookings + booking_cancellations + timeline.
+    # Whether this cancellation is the one that kills an issued invoice — the
+    # same condition the UPDATE's CASEs use, read off the pre-update row so the
+    # timeline and the returned payload describe what actually changed.
+    invoice_voided_now = cb_row[7] is not None and cb_row[8] is None
+    # An invoice that was already issued dies with the booking. Postgres
+    # evaluates every SET expression against the OLD row, so the two CASEs read
+    # the same pre-update invoice_voided_at: the void is written once, an
+    # existing void is never overwritten, and a booking that never reached an
+    # invoice stays clean (the migration 0086 check forbids a void timestamp
+    # without a reason and vice versa). The invoice_number itself is kept — a
+    # voided tax document still has to be nameable in the audit trail.
+    void_reason = f"Booking cancelled ({cancelled_source}): {cancellation_reason}".strip()
     await db.execute(
         text(
             """
@@ -1100,6 +1113,14 @@ async def apply_cab_cancellation(
                SET booking_status        = 'CANCELLED',
                    cancelled_by_user_id  = :uid,
                    cancelled_source      = :src,
+                   invoice_voided_at     = CASE
+                        WHEN invoice_number IS NOT NULL
+                             AND invoice_voided_at IS NULL
+                        THEN NOW() ELSE invoice_voided_at END,
+                   invoice_void_reason   = CASE
+                        WHEN invoice_number IS NOT NULL
+                             AND invoice_voided_at IS NULL
+                        THEN :void_reason ELSE invoice_void_reason END,
                    updated_at            = NOW()
              WHERE id = :id
             """
@@ -1107,6 +1128,7 @@ async def apply_cab_cancellation(
         {
             "uid": str(cancelled_by_user_id),
             "src": cancelled_source,
+            "void_reason": void_reason[:255],
             "id": cab_booking_id,
         },
     )
@@ -1283,11 +1305,17 @@ async def apply_cab_cancellation(
         {
             "m": master_booking_id,
             "desc": (
-                f"Cab {cb_row[0]} cancelled. Source: {cancelled_source}. "
+                f"Cab {cb_row[6] or cb_row[0]} cancelled. Source: {cancelled_source}. "
                 f"Role: {cancelled_by_role}. "
                 f"Charge ₹{quote.charge}, refund ₹{quote.refund_amount} "
                 f"(tier: {quote.tier_label}). "
                 f"Reason: {cancellation_reason[:200]}"
+                + (
+                    f" | Invoice {cb_row[7]} voided — a cancelled booking's tax "
+                    "document cannot be re-issued."
+                    if invoice_voided_now
+                    else ""
+                )
             ),
         },
     )
@@ -1303,6 +1331,8 @@ async def apply_cab_cancellation(
         "new_wallet_balance": new_balance,
         "cancelled_source": cancelled_source,
         "cancelled_by_role": cancelled_by_role,
+        "invoice_number": cb_row[7],
+        "invoice_voided": invoice_voided_now,
     }
 
 
