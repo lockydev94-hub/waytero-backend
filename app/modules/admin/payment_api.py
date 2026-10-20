@@ -758,6 +758,31 @@ async def initiate_refund(
             },
         )
 
+    # Step 4b: The ledger. An admin refunding an advance is money leaving the
+    # platform, so it has to be reflected on the payments `payments` line that
+    # carries this receipt — pulled down by `refund_amount` (status follows to
+    # PARTIAL_REFUNDED / REFUNDED) and documented in `refunds` — rather than
+    # living only on the receipt slip. The master's payment state is then
+    # re-derived from the ledger, not typed in here.
+    from app.modules.booking.services import payments as payments_service
+
+    live_pid = await payments_service.live_advance_payment_id(
+        db, payload.advance_payment_id
+    )
+    if live_pid is not None:
+        await payments_service.mark_payment_refunded(
+            db, payment_id=live_pid, refund_amount=refund_amount
+        )
+        await payments_service.record_refund_document(
+            db,
+            payment_id=live_pid,
+            refund_amount=refund_amount,
+            reason=payload.reason,
+            status="COMPLETED",
+            requested_at=now,
+        )
+    await payments_service.derive_master_payment_status(db, adv_row["mb_id"])
+
     # Step 5: Update total_refund_amount on master booking
     existing_refund = float(adv_row["total_refund_amount"] or 0)
     new_refund_total = existing_refund + refund_amount

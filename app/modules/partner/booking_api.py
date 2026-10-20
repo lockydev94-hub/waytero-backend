@@ -1994,6 +1994,15 @@ async def partner_close_trip(
         if econ.commission.commission_type == "FLAT"
         else f"{econ.commission.value}% of fare"
     )
+    # The fare moved from a quote to the closed figure, so the master's payment
+    # state is re-derived from the ledger against the new amount. Flush first:
+    # the close writes went in through the ORM and `autoflush=False` would hide
+    # them from the derive's raw-SQL read of `cb.final_amount`.
+    from app.modules.booking.services import payments as payments_service
+
+    await db.flush()
+    await payments_service.derive_master_payment_status(db, mb.id)
+    await db.refresh(mb)
     await _log_timeline(
         db,
         mb.id,
@@ -2297,11 +2306,25 @@ async def partner_collect_payment(
             f"Commission: ₹{float(commission):.2f} | Partner payout: ₹{float(payout):.2f}.",
         )
 
-    mb.payment_status = "PAID"
-    # What the customer actually handed over: advance + the balance just taken.
-    # This used to be set to the full fare, which overstated collections on
-    # discounted bookings and destroyed the advance figure other code read back.
-    mb.total_paid_amount = money(advance_paid + balance_due)
+    # The balance just handed over becomes a ledger line, and the master's
+    # payment state is re-derived from that ledger (advance held + this balance,
+    # less anything refunded) — not assumed here. A trip an advance already
+    # covered in full moves no money now, so it records no balance line, but its
+    # state is still derived rather than hard-coded 'PAID'. These two columns are
+    # deliberately NOT set on the ORM object: the derive writes them with raw SQL
+    # and an ORM assignment flushed at commit would clobber the derived value.
+    from app.modules.booking.services import payments as payments_service
+
+    await payments_service.record_final_payment(
+        db,
+        master_booking_id=mb.id,
+        cab_booking_id=cb.id,
+        amount=balance_due,
+        payment_mode=mode,
+        received_by=collector,
+        collected_by_role="PARTNER",
+    )
+    await payments_service.derive_master_payment_status(db, mb.id)
 
     # Auto-generate invoice number from the counter. The MAX-over-invoice_number
     # version this replaces was racy: two payments read the same maximum and both

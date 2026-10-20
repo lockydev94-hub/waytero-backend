@@ -686,6 +686,96 @@ class AdvancePayment(Base):
         return f"<AdvancePayment {self.receipt_number} {self.amount} {self.received_by} {self.status}>"
 
 
+class Payment(Base):
+    """
+    One money event: the customer handed over this much, for this booking.
+    Doc Ref: DB Schema Part 7 §3 (payments), §4 (types), §5 (statuses),
+    §22 ("every payment belongs to one MTB", "multiple payments allowed
+    per booking"); Round 15 plan C4b.
+
+    The receipt (`advance_payments`) is the custody document — the numbered
+    slip, who physically holds the cash, its own void columns. This row is the
+    ledger line: what the money was for (`payment_type`), whether it is still
+    held (`refunded_amount`, `voided_at`) and what the reports count. They are
+    joined 1:1 through `advance_payment_id`, and the partial unique indexes
+    `ux_payments_live_advance` / `ux_payments_live_balance` are what make that
+    relationship a fact of the database rather than of the code that remembers
+    to keep it.
+
+    `payment_status` follows the money, never the paperwork: an advance the
+    customer got back in full is REFUNDED even though the slip said ACTIVE until
+    it was refunded, and the CHECK constraints refuse a status that
+    contradicts `refunded_amount`.
+    """
+
+    __tablename__ = "payments"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    uuid = Column(
+        UUID(as_uuid=True),
+        nullable=False,
+        unique=True,
+        default=uuid.uuid4,
+    )
+    payment_number = Column(String(100), unique=True, nullable=False)
+    master_booking_id = Column(
+        BigInteger, ForeignKey("master_bookings.id"), nullable=False
+    )
+    customer_id = Column(BigInteger, ForeignKey("customers.id"), nullable=False)
+    cab_booking_id = Column(BigInteger, ForeignKey("cab_bookings.id"), nullable=True)
+    advance_payment_id = Column(
+        BigInteger, ForeignKey("advance_payments.id"), nullable=True
+    )
+    payment_type = Column(
+        String(50), nullable=True
+    )  # ADVANCE | BALANCE_PAYMENT | FULL_PAYMENT | WALLET_RECHARGE
+    payment_method = Column(String(50), nullable=True)  # CASH | ONLINE | UPI | WALLET
+    payment_status = Column(
+        String(50), nullable=False, default="SUCCESS"
+    )  # DB Schema Part 7 §5
+    amount = Column(Numeric(14, 2), nullable=False)
+    refunded_amount = Column(
+        Numeric(14, 2), nullable=False, default=Decimal("0.00")
+    )
+    received_by = Column(
+        String(20), nullable=True
+    )  # ADMIN | PARTNER | DRIVER — whose hand took it
+    collected_by_user_id = Column(UUID(as_uuid=True), nullable=True)
+    collected_by_role = Column(String(30), nullable=True)
+    gateway_amount = Column(Numeric(14, 2), nullable=True)
+    gateway_reference = Column(String(255), nullable=True)
+    gateway_transaction_id = Column(String(255), nullable=True)
+    payment_datetime = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=True,
+    )
+    voided_at = Column(DateTime(timezone=True), nullable=True)
+    void_reason = Column(String(255), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        CheckConstraint("amount > 0", name="ck_payments_amount_positive"),
+        CheckConstraint(
+            "refunded_amount >= 0 AND refunded_amount <= amount",
+            name="ck_payments_refunded_range",
+        ),
+        Index("idx_payment_booking", "master_booking_id"),
+        Index("idx_payment_status", "payment_status"),
+        Index("idx_payment_customer", "customer_id"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<Payment {self.payment_number} {self.payment_type} "
+            f"{self.amount} {self.payment_status}>"
+        )
+
+
 class BookingContact(Base):
     """Traveller contact details."""
 

@@ -2784,6 +2784,14 @@ async def update_final_amount(
     # Update master booking total_amount to reflect final
     mb.total_amount = cb.final_amount
 
+    # The amount owed just moved, so the master's payment state is re-derived
+    # from the ledger against it — flush first so the raw-SQL read of
+    # `cb.final_amount` (autoflush=False) sees the new value.
+    from app.modules.booking.services import payments as payments_service
+
+    await db.flush()
+    await payments_service.derive_master_payment_status(db, booking_id)
+
     reason_text = f" Reason: {payload.reason}" if payload.reason else ""
     await _log_timeline(
         db,

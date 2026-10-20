@@ -849,6 +849,16 @@ async def admin_close_trip(
         if econ.commission.commission_type == "FLAT"
         else f"{econ.commission.value}% of fare"
     )
+    # The fare just changed from a quote to the closed figure, so what the
+    # booking owes changed with it — re-derive the master's payment state from
+    # the ledger against the new amount. The flush first is required: these close
+    # writes went in through the ORM and `autoflush=False` would hide them from
+    # the derive's raw-SQL read of `cb.final_amount`.
+    from app.modules.booking.services import payments as payments_service
+
+    await db.flush()
+    await payments_service.derive_master_payment_status(db, mb.id)
+    await db.refresh(mb)
     await _log_timeline(
         db,
         mb.id,
@@ -1226,22 +1236,25 @@ async def admin_collect_payment(
             f"Commission: ₹{float(commission):.2f} | Partner payout: ₹{float(payout):.2f}.",
         )
 
-    # ── Update master booking payment status (explicit SQL — avoids ORM flush issues)
-    # total_paid_amount is what the customer has actually handed over: the advance
-    # plus the balance just collected. It used to be set to the full fare, which
-    # both overstated collections on discounted bookings and destroyed the advance
-    # figure that the settlement and invoice code read back out of it.
-    await db.execute(
-        text(
-            """
-            UPDATE master_bookings
-            SET payment_status    = 'PAID',
-                total_paid_amount = :amount
-            WHERE id = :mb_id
-        """
-        ),
-        {"amount": money(advance_paid + balance_due), "mb_id": mb.id},
+    # ── The balance just collected becomes a ledger line, and the master's
+    # payment state is re-derived from that ledger (advance held + this balance,
+    # less anything refunded) rather than hard-coded 'PAID'. A trip an advance
+    # already covered in full moves no money now, so it records no balance line,
+    # but its state is still derived. total_paid_amount is no longer set to the
+    # fare here — that overstated collections on discounted bookings and
+    # destroyed the advance figure the settlement/invoice code reads back. ─────
+    from app.modules.booking.services import payments as payments_service
+
+    await payments_service.record_final_payment(
+        db,
+        master_booking_id=mb.id,
+        cab_booking_id=cb.id,
+        amount=balance_due,
+        payment_mode=mode,
+        received_by=collector,
+        collected_by_role="ADMIN",
     )
+    await payments_service.derive_master_payment_status(db, mb.id)
     await db.refresh(mb)
 
     # ── Auto-generate invoice number at payment time ───────────────────────

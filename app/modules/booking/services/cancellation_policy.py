@@ -1092,6 +1092,29 @@ async def apply_cab_cancellation(
             ),
             {"id": cab_booking_id, "amt": quote.refund_amount},
         )
+        # The receipt slip is only half the story — the payments ledger line that
+        # carries this advance has to be pulled down by the same refund, and the
+        # rupees that actually left (credited to the customer wallet above) get a
+        # `refunds` document pointing at it. The master's payment_status is written
+        # further down with the cancellation's own REFUNDED/PARTIAL semantics, so
+        # the derive is deliberately not run here.
+        from app.modules.booking.services import payments as payments_service
+
+        live_pid = await payments_service.live_advance_payment_for_cab(
+            db, cab_booking_id
+        )
+        if live_pid is not None:
+            await payments_service.mark_payment_refunded(
+                db, payment_id=live_pid, refund_amount=quote.refund_amount
+            )
+            await payments_service.record_refund_document(
+                db,
+                payment_id=live_pid,
+                refund_amount=quote.refund_amount,
+                reason=f"Cab cancellation: {cancellation_reason}".strip(),
+                status="COMPLETED",
+                requested_at=now,
+            )
 
     # 3. Update cab_bookings + master_bookings + booking_cancellations + timeline.
     # Whether this cancellation is the one that kills an issued invoice — the

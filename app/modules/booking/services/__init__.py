@@ -451,6 +451,30 @@ async def create_advance(
         # get_db rolls the session back on the way out.
         raise DuplicateResourceException("Advance payment", "booking")
 
+    # `payments` is imported lazily for the same reason `settlement_math` is:
+    # it is a sibling of this package, and importing it at the top would make
+    # the package depend on its own submodule.
+    from app.modules.booking.services import payments as payments_service
+
+    # The ledger line for the same money (DB Schema Part 7 §3). The receipt
+    # above is the slip — who is holding the cash, its own number, its own void
+    # columns; this row is what the books count, and it is written from the
+    # receipt's own returned values so the two cannot disagree. `payments` is
+    # also what the master's payment state is derived from, so an advance that
+    # never reached this table would leave a booking looking unpaid.
+    await payments_service.record_advance_payment(
+        db,
+        master_booking_id=cb["master_booking_id"],
+        cab_booking_id=cab_booking_id,
+        advance_payment_id=row["id"],
+        amount=row["amount"],
+        payment_mode=row["payment_mode"],
+        received_by=row["received_by"],
+        collected_by_user_id=user_id,
+        collected_by_role=source_role,
+        receipt_number=row["receipt_number"],
+    )
+
     balance = compute_balance_due(final_amount=fare, advance_paid=float(amount))
     await _log_timeline(
         db,
@@ -538,6 +562,18 @@ async def void_advance(
         f"(received by {adv['received_by']} via {adv['payment_mode']}) voided. "
         f"Reason: {reason.strip()}",
         user_id,
+    )
+
+    # The ledger row for that receipt dies with it — marked, not deleted, and
+    # the master's payment state recomputed from what is left holding.
+    from app.modules.booking.services import payments as payments_service
+
+    await payments_service.void_advance_payment(
+        db,
+        master_booking_id=cb["master_booking_id"],
+        advance_payment_id=adv["id"],
+        reason=f"Advance receipt {adv['receipt_number']} voided: "
+        f"{reason.strip()}",
     )
 
     return {

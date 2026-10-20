@@ -99,6 +99,40 @@ async def next_cab_booking_number(db: AsyncSession) -> str:
     )
 
 
+async def _take_counter_seq(db: AsyncSession, kind: str) -> int:
+    """Advance and return the counter row for one document kind.
+
+    The row is locked, not merely read: two collections in the same second are
+    stopped here, and the second one gets the number after the first. The
+    increment lives in the caller's transaction, so a collection that rolls back
+    leaves no number spent — and no hole, which a legal document can live with
+    but a counter cannot be trusted to prevent.
+    """
+    seq = (
+        await db.execute(
+            text(
+                "SELECT last_seq FROM invoice_sequences WHERE kind = :kind FOR UPDATE"
+            ),
+            {"kind": kind},
+        )
+    ).scalar_one_or_none()
+    if seq is None:
+        raise ValueError(
+            f"invoice_sequences has no row for kind {kind!r}; migrations 0086 "
+            "and 0088 seed one per configured kind"
+        )
+    next_seq = int(seq) + 1
+    await db.execute(
+        text(
+            "UPDATE invoice_sequences SET last_seq = :n, updated_at = NOW() "
+            "WHERE kind = :kind"
+        ),
+        {"n": next_seq, "kind": kind},
+    )
+    await db.flush()
+    return next_seq
+
+
 async def next_invoice_number(db: AsyncSession, kind: str) -> str:
     """Take the next invoice number for ``kind`` off its own counter row.
 
@@ -120,30 +154,23 @@ async def next_invoice_number(db: AsyncSession, kind: str) -> str:
             f"(known: {', '.join(sorted(INVOICE_KINDS))})"
         )
 
-    # The row is locked, not merely read: two collections in the same second are
-    # stopped here, and the second one gets the number after the first.
-    seq = (
-        await db.execute(
-            text(
-                "SELECT last_seq FROM invoice_sequences WHERE kind = :kind FOR UPDATE"
-            ),
-            {"kind": kind},
-        )
-    ).scalar_one_or_none()
-    if seq is None:
-        raise ValueError(
-            f"invoice_sequences has no row for kind {kind!r}; migration 0086 "
-            "seeds one per configured kind"
-        )
-    next_seq = int(seq) + 1
-    await db.execute(
-        text(
-            "UPDATE invoice_sequences SET last_seq = :n, updated_at = NOW() "
-            "WHERE kind = :kind"
-        ),
-        {"n": next_seq, "kind": kind},
-    )
-    await db.flush()
-
+    next_seq = await _take_counter_seq(db, kind)
     stamp = datetime.now(timezone.utc).strftime(spec.stamp)
     return f"{spec.prefix}{stamp}{spec.infix}{str(next_seq).zfill(spec.digits)}"
+
+
+# WT-PAY-202610-00042. A payment number is not an invoice number — one names
+# money received, the other names the tax document for a trip — so it draws on
+# its own counter row ('PAYMENT', seeded by migration 0088) in the same table
+# while keeping the shape of the invoice numbers customers already recognise.
+PAYMENT_KIND = InvoiceKind(prefix="WT-PAY-", stamp="%Y%m", infix="-", digits=5)
+
+
+async def next_payment_number(db: AsyncSession) -> str:
+    """Take the next payment number off the `PAYMENT` counter."""
+    next_seq = await _take_counter_seq(db, "PAYMENT")
+    stamp = datetime.now(timezone.utc).strftime(PAYMENT_KIND.stamp)
+    return (
+        f"{PAYMENT_KIND.prefix}{stamp}{PAYMENT_KIND.infix}"
+        f"{str(next_seq).zfill(PAYMENT_KIND.digits)}"
+    )
