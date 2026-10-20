@@ -169,6 +169,7 @@ DECLARED: dict[str, Kind] = {
 
     "POST /admin/customer-care": "scoped",
     "POST /admin/customer-care/cab-booking": "scoped",
+    "POST /admin/customer-care/cab-booking/quote": "scoped",
     "POST /admin/customer-care/hotel-booking": "scoped",
     "POST /admin/customer-care/hotel-booking/quote": "scoped",
     "POST /admin/customer-care/register-customer": "scoped",

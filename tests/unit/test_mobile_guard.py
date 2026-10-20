@@ -16,7 +16,12 @@ from __future__ import annotations
 import pytest
 
 from app.core.exceptions import BusinessException
-from app.shared.utilities.mobile import has_real_mobile, require_real_mobile
+from app.shared.utilities.mobile import (
+    has_real_mobile,
+    mobile_match_sql,
+    normalise_mobile,
+    require_real_mobile,
+)
 
 
 class _StubDB:
@@ -99,3 +104,75 @@ async def test_missing_user_row_does_not_claim_mobile_required() -> None:
     can only mean the row is gone. The caller's own customer lookup reports
     that, rather than this guard mislabelling it as a missing phone number."""
     await require_real_mobile(_StubDB(None), "11111111-1111-1111-1111-111111111111")
+
+
+# ── normalise_mobile — what the desk types ────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "typed",
+    [
+        "9876543210",
+        " 9876543210 ",
+        "+919876543210",
+        "+91 98765 43210",
+        "91-98765-43210",
+        "98765 43210",
+        "09876543210",
+    ],
+)
+def test_every_way_a_caller_gives_their_number_reaches_the_same_ten_digits(
+    typed: str,
+) -> None:
+    assert normalise_mobile(typed) == "9876543210"
+
+
+@pytest.mark.parametrize(
+    "typed",
+    [
+        None,
+        "",
+        "987654321",  # one digit short
+        "98765432101",  # one digit over, and not a country code we recognise
+        "1234567890",  # ten digits that are not an Indian mobile prefix
+        "fb_b51116e43a",  # the Firebase placeholder is not a number
+        "+91 98765 432",
+        "098765432101",  # trunk prefix on an already-too-long number
+    ],
+)
+def test_a_number_that_is_not_a_mobile_is_refused_rather_than_searched(
+    typed,
+) -> None:
+    """None is the answer that lets the desk say "that is not a number".
+
+    Returning the input unchanged, or a truncated ten digits, would send a
+    malformed search to the database and come back as "no such customer" — the
+    wrong conclusion to draw about the wrong question.
+    """
+    assert normalise_mobile(typed) is None
+
+
+# ── mobile_match_sql — how a stored row is compared ───────────────────────────
+
+
+def test_the_stored_value_is_matched_on_its_last_ten_digits() -> None:
+    sql = mobile_match_sql("u.mobile_number", "digits")
+
+    assert "right(regexp_replace(u.mobile_number, '[^0-9]', '', 'g'), 10) = :digits" in sql
+    # The letter guard is load-bearing: a hex `fb_` placeholder can spell ten
+    # digits in mobile shape, and a search for a real customer must never land
+    # on somebody else's account.
+    assert "u.mobile_number !~ '[A-Za-z]'" in sql
+
+
+def test_the_value_being_searched_for_is_never_in_the_sql() -> None:
+    """The column name is the query author's; the number is always a bind param.
+
+    `mobile_match_sql` builds SQL text that goes into a `text(...)` query, so a
+    caller passing a value through it instead of a param would be an injection
+    with the customer's own phone number as the payload.
+    """
+    sql = mobile_match_sql("mobile_number", "digits")
+
+    assert "9876543210" not in sql
+    assert sql.count(":digits") == 1

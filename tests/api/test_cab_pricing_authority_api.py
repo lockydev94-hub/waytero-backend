@@ -3,10 +3,12 @@
 Two claims get proved here, and neither is a UI claim:
 
 1. Nothing a caller sends can move a cab total. The desk's payload no longer has
-   a distance or an amount field at all, and the corridor trips the website books
-   are measured by the server (published `cab_routes` distance, then Google), so
-   the number that used to come from the browser is now only a fallback for a hire
-   with no destination to measure — and that fallback is labelled on the row.
+   a distance or an amount field at all, the city that prices the trip is the
+   branch's own rather than one the agent names, and the corridor trips the
+   website books are measured by the server (published `cab_routes` distance, then
+   Google), so the number that used to come from the browser is now only a fallback
+   for a hire with no destination to measure — and that fallback is labelled on the
+   row.
 2. A fare sheet is read as of the day the trip happens. `effective_from` /
    `effective_to` have existed since the earliest migration and were never
    consulted, so a superseded rate kept pricing bookings and a next-month trip was
@@ -22,7 +24,7 @@ this file is either matched to a configured corridor or refused before measuring
 from __future__ import annotations
 
 import asyncio
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from typing import Any, Callable
 
@@ -31,11 +33,13 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from app.core.branch_scope import BranchScope
 from app.core.config import settings
 from app.core.exceptions import BusinessException, ValidationException
 from app.modules.admin.customer_care_api import (
     CabBookingCreateByAdmin,
     CabBookingQuoteRequest,
+    _desk_pricing_city,
 )
 from app.modules.admin.services import DefaultPricingService
 from app.modules.booking.services.trip_pricing import fare_columns, quote_cab_trip
@@ -249,6 +253,82 @@ def test_the_quote_lines_add_up_to_the_quote_total(client_super_admin):
     assert added_up == Decimal(q["total"]), (added_up, q)
     # Money leaves as Decimal-strings, so a JSON float cannot round a fare.
     assert isinstance(q["total"], str)
+
+
+def _desk_body(city_id: int | None) -> CabBookingQuoteRequest:
+    return CabBookingQuoteRequest(
+        city_id=city_id,
+        vehicle_category_id=1,
+        trip_type="OUTSTATION",
+        pickup_location="Cuttack Barabati Stadium",
+        drop_location="Puri Grand Road",
+        pickup_datetime=datetime(2026, 11, 5, 10, 0),
+    )
+
+
+class _NoQueryDb:
+    """A session that fails the test if the code looks anything up."""
+
+    async def execute(self, *args: Any, **kwargs: Any) -> Any:  # noqa: ANN401
+        raise AssertionError("nothing should be queried to answer this")
+
+
+def _branch_scope(city_id: int) -> BranchScope:
+    return BranchScope(
+        actor_id="00000000-0000-0000-0000-000000000000",
+        user_type="CCO",
+        is_super=False,
+        branch_id=2,
+        branch_name="Cuttack",
+        is_headquarters=False,
+        cities=frozenset({city_id}),
+        include_unassigned=False,
+    )
+
+
+def test_a_branch_desk_prices_on_its_own_city_however_it_names_one():
+    """`city_id` is the other forgeable field on this payload.
+
+    A fare sheet belongs to a city, so a Cuttack agent who could name
+    Bhubaneswar would price a Cuttack trip on another office's rates — the same
+    defect as a hand-typed distance, one field over. The branch's city comes from
+    its own scope, and answering it queries nothing: a city the branch has no
+    standing to book in is not even looked up to see whether it exists.
+    """
+    cuttack = _branch_scope(3)
+    for named in (5, 999999, None):
+        assert (
+            asyncio.run(_desk_pricing_city(_desk_body(named), _NoQueryDb(), cuttack))
+            == 3
+        ), named
+
+
+def test_the_head_office_has_to_name_a_city_it_can_price_in():
+    """The same field is a real choice for a super admin, and so has to be checked.
+
+    Refusing before the fare sheet is read is what keeps "no price" from arriving
+    as the misleading *no fare is configured for that cab category* — an empty
+    city field is the agent's mistake, not a missing rate.
+    """
+    hq = BranchScope(
+        actor_id="00000000-0000-0000-0000-000000000000",
+        user_type="SUPER_ADMIN",
+        is_super=True,
+        branch_id=None,
+        branch_name=None,
+        is_headquarters=False,
+        cities=frozenset(),
+        include_unassigned=True,
+    )
+    with pytest.raises(ValidationException, match="Choose the city"):
+        asyncio.run(_desk_pricing_city(_desk_body(None), _NoQueryDb(), hq))
+
+    # A city that is not there fails against the database, so this one needs a
+    # session — the rolled-back transaction adds no master data.
+    with pytest.raises(ValidationException, match="not an active city"):
+        _with_session(
+            lambda session: _desk_pricing_city(_desk_body(999999), session, hq)
+        )
 
 
 # ── 2. Distance authority, at the service boundary ────────────────────────

@@ -41,6 +41,11 @@ from app.modules.booking.models import (
     BookingTimeline,
 )
 
+# One definition of "is this the same phone number", shared with the booking
+# guards: the desk matches what an agent types, the booking path checks what is
+# on file, and both have to mean the same ten digits.
+from app.shared.utilities.mobile import mobile_match_sql, normalise_mobile
+
 # Hotel pricing engine — reused so an admin-created hotel booking is priced by
 # exactly the same rate/tax/commission rules as a customer-side booking.
 from app.modules.hotel.models import Hotel
@@ -569,6 +574,21 @@ async def lookup_customer(
 ):
     await _ensure_care_log_table(db)
 
+    # The agent types what the customer said, so `+91 98765 43210` has to reach
+    # the same row as `9876543210`. An exact string compare answered "not found"
+    # for one of them — and the desk's next move after that is to register a
+    # second account for a customer who already books here, splitting their
+    # history across two profiles.
+    digits = normalise_mobile(mobile)
+    if digits is None:
+        # Not "found=False". A number that cannot be a mobile has no answer to
+        # give about who owns it, and telling the agent nobody has it sends them
+        # to register a customer who exists.
+        raise ValidationException(
+            "That is not a 10-digit mobile number, so there is nothing to look "
+            "up. Check the number the customer gave you."
+        )
+
     branch_clause, branch_params = _customer_in_branch_sql(scope)
     r = await db.execute(
         text(
@@ -584,12 +604,13 @@ async def lookup_customer(
             (SELECT COUNT(*) FROM customer_care_logs WHERE customer_id = c.id) AS total_issues
         FROM users u
         JOIN customers c ON c.user_id = u.id
-        WHERE u.mobile_number = :mobile AND u.user_type = 'CUSTOMER'
+        WHERE u.user_type = 'CUSTOMER'
+          AND {mobile_match_sql("u.mobile_number", "digits")}
           AND ({branch_clause})
         LIMIT 1
     """
         ),
-        {"mobile": mobile, **branch_params},
+        {"digits": digits, **branch_params},
     )
 
     row = r.mappings().one_or_none()
@@ -667,13 +688,31 @@ async def register_customer_by_admin(
     else:
         effective_city_id = None
 
-    # Check duplicate
+    # `users.mobile_number` is unique on the string, which is a weaker claim than
+    # "one person, one account": `9876543210` and `+919876543210` both insert
+    # cleanly. Matching on the digits is what makes "already registered" true,
+    # and storing the digits is what lets `/lookup` find the row back.
+    digits = normalise_mobile(payload.mobile_number)
+    if digits is None:
+        raise ValidationException(
+            "That is not a 10-digit mobile number. Re-enter the customer's "
+            "number — a profile needs a number a driver can actually call."
+        )
     dup = await db.execute(
-        text("SELECT id FROM users WHERE mobile_number = :mob"),
-        {"mob": payload.mobile_number},
+        text(
+            f"SELECT id FROM users WHERE {mobile_match_sql('mobile_number', 'digits')} LIMIT 1"
+        ),
+        {"digits": digits},
     )
     if dup.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="Mobile number already registered")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This mobile is already registered. Look the customer up in "
+                "Customer Care and book on that profile instead of creating a "
+                "second one."
+            ),
+        )
 
     # Create user
     new_uid = _uuid.uuid4()
@@ -702,7 +741,7 @@ async def register_customer_by_admin(
             "user_code": user_code,
             "first_name": payload.first_name,
             "last_name": payload.last_name,
-            "mobile": payload.mobile_number,
+            "mobile": digits,
             "email": payload.email,
             "created_by": str(current_user["sub"]),
         },
@@ -1191,6 +1230,87 @@ async def _desk_pricing_city(payload, db: AsyncSession, scope: BranchScope) -> i
     return payload.city_id
 
 
+def _km_text(value: Decimal | float) -> str:
+    """Kilometres the way a person reads them: 30, not 30.0 and not 3E+1.
+
+    The fare engine hands back `billable_km` as a float and the distance
+    resolver as a Decimal, so one formatter is what keeps "Distance charge
+    (30 km)" from becoming "(30.0 km)" in a mail the customer keeps. Fixed-point
+    then trimmed, because `Decimal.normalize()` turns 30 into `3E+1`.
+    """
+    rendered = f"{Decimal(str(value)).quantize(Decimal('0.1')):f}"
+    return rendered.rstrip("0").rstrip(".")
+
+
+def _cab_confirmation_context(
+    quote,
+    *,
+    booking_number: str,
+    trip_type: str,
+    pickup_location: str,
+    drop_location: str,
+    pickup_datetime: datetime,
+    coupon_code: Optional[str],
+    coupon_discount: Decimal,
+) -> dict:
+    """What the customer is emailed after the desk books for them.
+
+    The customer agreed to a price over the telephone; this email is the only
+    thing they keep. Every figure in it is the server's own quote — the same
+    arithmetic that produced the amount stored on the booking — so the message
+    cannot disagree with the row. Nothing here is written by hand: no route is
+    named that was not given, no savings is claimed that the coupon engine did
+    not compute, and there is no secret in the payload (no MPIN, no token).
+
+    Kept apart from the endpoint because the sum of the lines and the total the
+    customer is told they pay are money claims worth testing directly.
+    """
+    b = quote.breakdown
+    payable = quote.total - coupon_discount
+
+    lines = [
+        ("Trip type", trip_type or ""),
+        ("Pickup", pickup_location or ""),
+        ("Drop", drop_location or ""),
+        ("Pickup time", pickup_datetime.strftime("%d %b %Y, %I:%M %p")),
+        ("Distance", f"{_km_text(quote.distance.km)} km"),
+    ]
+    money_lines = [
+        ("Base fare", b["base_fare"]),
+        # The kilometre figure in the label is what was *billed*, not what was
+        # driven: a ONE_WAY shorter than the sheet's minimum_km is billed at the
+        # minimum, and printing the driven distance there is the arithmetic that
+        # does not add up.
+        (f"Distance charge ({_km_text(b['billable_km'])} km)", b["distance_charge"]),
+        ("Driver allowance", b["driver_allowance"]),
+        ("Night charge", b["night_charge_applied"]),
+        ("Toll", b["toll"]),
+        ("Waiting", b["waiting"]),
+    ]
+    lines += [
+        (label, f"₹{amount.quantize(Decimal('0.01'))}")
+        for label, amount in money_lines
+        if amount
+    ]
+    if coupon_code:
+        lines.append(
+            (f"Coupon {coupon_code}", f"−₹{coupon_discount.quantize(Decimal('0.01'))}")
+        )
+
+    return {
+        "service": "Cab",
+        "booking_number": booking_number,
+        "message": (
+            f"Your cab booking {booking_number} is confirmed. A partner is being "
+            "assigned — driver details will be shared before pickup."
+        ),
+        "details": lines,
+        "amount": payable,
+        "amount_label": "Estimated fare",
+        "amount_note": "The final fare is billed on the trip actually driven.",
+    }
+
+
 @router.post("/cab-booking/quote", response_model=CabQuoteOut, tags=["Customer Care"])
 async def quote_cab_booking_by_admin(
     payload: CabBookingQuoteRequest,
@@ -1474,6 +1594,39 @@ async def create_cab_booking_by_admin(
         created_by=created_by_uuid,
     )
     db.add(tl)
+
+    # ── Email: the booking the agent just described on the phone ──────────
+    # Only the customer's own address on their own profile, and only what they
+    # already agreed to hear: the booking number, the route and the fare lines.
+    #
+    # The email engine never raises (failures land in `email_logs` for an admin
+    # to resend), and the wrapped call keeps that promise even if importing or
+    # rendering breaks: a booking the customer already agreed to must not fail
+    # because SMTP is down.
+    try:
+        from app.infrastructure.email import send_event_email
+
+        if customer.get("email"):
+            await send_event_email(
+                db,
+                event_type="booking_confirmed",
+                to_email=customer["email"],
+                to_name=customer.get("full_name") or None,
+                context=_cab_confirmation_context(
+                    quote,
+                    booking_number=cb_number,
+                    trip_type=payload.trip_type,
+                    pickup_location=payload.pickup_location,
+                    drop_location=payload.drop_location,
+                    pickup_datetime=payload.pickup_datetime,
+                    coupon_code=coupon_code_used,
+                    coupon_discount=coupon_discount,
+                ),
+                related_type="CAB_BOOKING",
+                related_id=cb.id,
+            )
+    except Exception:  # pragma: no cover — email must never break a booking
+        pass
 
     # get_db auto-commits on success.
 
