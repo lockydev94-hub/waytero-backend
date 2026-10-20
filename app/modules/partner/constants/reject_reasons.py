@@ -11,10 +11,13 @@
 #
 # Two extra "system" codes are reserved for non-partner actions and
 # are NOT exposed in the partner portal UI:
-#   TIMEOUT          — Celery sweeper reverted the assignment because
-#                      the partner never accepted / rejected.
-#   ADMIN_REASSIGN   — Admin reassigned the cab to a different partner
-#                      before this one responded.
+#   TIMEOUT               — Celery sweeper reverted the assignment because
+#                           the partner never accepted / rejected.
+#   ADMIN_REASSIGN        — Admin reassigned the cab to a different partner
+#                           before this one responded.
+#   ACCEPTED_BY_ANOTHER   — a fan-out round asked several partners at once and
+#                           one of them took the trip; the others' offers were
+#                           closed without any refusal on their part.
 # ============================================================
 
 REJECT_REASONS: list[dict[str, str]] = [
@@ -42,8 +45,10 @@ REJECT_REASON_CODES: set[str] = {r["code"] for r in REJECT_REASONS}
 
 SYSTEM_REJECT_REASON_TIMEOUT = "TIMEOUT"
 SYSTEM_REJECT_REASON_ADMIN_REASSIGN = "ADMIN_REASSIGN"
+SYSTEM_REJECT_REASON_ACCEPTED_BY_ANOTHER = "ACCEPTED_BY_ANOTHER"
 
 SYSTEM_REJECT_REASON_CODES: set[str] = {
     SYSTEM_REJECT_REASON_TIMEOUT,
     SYSTEM_REJECT_REASON_ADMIN_REASSIGN,
+    SYSTEM_REJECT_REASON_ACCEPTED_BY_ANOTHER,
 }

@@ -26,6 +26,51 @@ from app.core.config import settings
 
 logger = get_logger(__name__)
 
+# How often the in-process acceptance watcher looks for offers that expired.
+# The Celery beat schedule runs the same pass every 60 s; this loop exists so
+# auto-assign also works on a machine that is not running a Celery worker, and
+# 30 s keeps a partner's 3-minute window honest without hammering the database.
+_ACCEPTANCE_SWEEP_SECONDS = 30.0
+
+
+async def _acceptance_expiry_loop() -> None:
+    """Expire unanswered partner offers while the API process is up.
+
+    Runs the sweeper's own async core, in this event loop, so no second loop is
+    created (the Celery entry-point needs `run_worker_async` precisely because
+    it has no loop of its own). Two guards matter:
+
+      * the pass only touches bookings when `auto_assign_enabled` is on, so a
+        disabled chain costs one small SELECT per interval and nothing else,
+      * the sweep selects `FOR UPDATE SKIP LOCKED`, so running here while a
+        Celery worker also runs cannot double-revert a booking.
+
+    Failures are logged and the loop continues: an offer not expired on this
+    tick is expired on the next one, and the API must not die over a background
+    janitor.
+    """
+    from app.core.database import AsyncSessionLocal
+    from app.modules.booking.services.auto_assign import settings as auto_assign_settings
+    from app.workers.timeout_sweeper import _expire_pending_acceptances_async
+
+    while True:
+        try:
+            async with AsyncSessionLocal() as db:
+                enabled = (await auto_assign_settings(db)).enabled
+            if enabled:
+                reverted = await _expire_pending_acceptances_async()
+                if reverted:
+                    logger.info(
+                        "acceptance_expiry_pass",
+                        reverted=reverted,
+                        source="lifespan",
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — background loop must survive
+            logger.error("acceptance_expiry_failed", error=str(exc))
+        await asyncio.sleep(_ACCEPTANCE_SWEEP_SECONDS)
+
 
 class DatabaseUnavailableError(RuntimeError):
     """Raised at startup when PostgreSQL cannot be reached — aborts boot."""
@@ -515,10 +560,27 @@ async def lifespan(app: FastAPI):
         redis=app.state.redis_available,
     )
 
+    # ---- Acceptance expiry watcher (auto-assign timeout chain) ----
+    # A fan-out round is only honest if an unanswered offer actually ends. The
+    # Celery beat schedule runs the same sweep every minute; this in-process
+    # loop is what makes the chain work on a machine with no worker running
+    # (the owner's dev box), and it does nothing to bookings until
+    # auto_assign_enabled is switched on.
+    app.state.acceptance_expiry_task = asyncio.create_task(_acceptance_expiry_loop())
+
     yield  # Application runs here
 
     # ---- SHUTDOWN ----
     logger.info("waytero_shutdown", message="Shutting down WayTero backend...")
+
+    task = getattr(app.state, "acceptance_expiry_task", None)
+    if task is not None:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        logger.info("acceptance_expiry_stopped")
 
     if app.state.redis is not None:
         await app.state.redis.aclose()

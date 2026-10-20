@@ -171,6 +171,11 @@ async def cancel_if_coupon_exhausted(db: AsyncSession, cb: CabBooking) -> bool:
         if (
             assignment["rejection_reason_code"] == "ADMIN_REASSIGN"
             or assignment["close_reason"] == "ADMIN_REASSIGN"
+            # A fan-out round asked several partners at once; the rows closed
+            # because one of them took the trip are not refusals, and counting
+            # them as one would cancel a booking that is being fulfilled.
+            or assignment["rejection_reason_code"] == "ACCEPTED_BY_ANOTHER"
+            or assignment["close_reason"] == "ACCEPTED_BY_ANOTHER"
             or assignment["partner_id"] not in cohort
         ):
             continue

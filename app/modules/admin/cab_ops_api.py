@@ -24,6 +24,7 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -82,6 +83,12 @@ class CabOpsQueueItem(BaseModel):
     pending_partner_id: Optional[int]
     pending_partner_name: Optional[str]
     pending_partner_code: Optional[str]
+    # A fan-out round names several partners and `pending_partner_id` — one
+    # column — cannot hold them, so the queue reads the open offer rows.
+    open_offers: int = 0
+    offered_partner_names: Optional[str] = None
+    # Why nobody is being asked (AUTO_ASSIGN_EXHAUSTED) once the chain stops.
+    needs_attention: Optional[str] = None
     acceptance_deadline: Optional[str]
     seconds_to_deadline: Optional[int]
     customer_name: Optional[str]
@@ -182,7 +189,16 @@ async def list_cab_ops_queue(
         filters.append("mb.city_id = :city_id")
         params["city_id"] = city_id
     if partner_id is not None:
-        filters.append("cb.pending_partner_id = :partner_id")
+        # "Who is this sitting with" is the pointer for a hand-picked partner
+        # and the open offer rows for a fan-out round; match either.
+        filters.append(
+            "(cb.pending_partner_id = :partner_id OR EXISTS ("
+            "   SELECT 1 FROM cab_booking_assignments oo "
+            "    WHERE oo.cab_booking_id = cb.id "
+            "      AND oo.partner_id = :partner_id "
+            "      AND oo.closed_at IS NULL AND oo.accepted_at IS NULL "
+            "      AND oo.rejected_at IS NULL))"
+        )
         params["partner_id"] = partner_id
 
     # The branch lives on the master booking, and this queue is a page behind a
@@ -211,9 +227,23 @@ async def list_cab_ops_queue(
             cb.estimated_amount,
             cb.booking_status  AS cab_status,
             cb.pending_partner_id,
+            cb.needs_attention,
             cb.acceptance_deadline,
             p.business_name    AS pending_partner_name,
             p.partner_code     AS pending_partner_code,
+            (SELECT COUNT(*)
+               FROM cab_booking_assignments oa
+              WHERE oa.cab_booking_id = cb.id
+                AND oa.closed_at IS NULL
+                AND oa.accepted_at IS NULL
+                AND oa.rejected_at IS NULL) AS open_offers,
+            (SELECT string_agg(p2.business_name, ', ' ORDER BY p2.business_name)
+               FROM cab_booking_assignments oa2
+               JOIN partners p2 ON p2.id = oa2.partner_id
+              WHERE oa2.cab_booking_id = cb.id
+                AND oa2.closed_at IS NULL
+                AND oa2.accepted_at IS NULL
+                AND oa2.rejected_at IS NULL) AS offered_partner_names,
             TRIM(CONCAT(c.first_name, ' ', COALESCE(c.last_name, ''))) AS customer_name,
             u.mobile_number    AS customer_mobile,
             mb.city_id,
@@ -229,7 +259,9 @@ async def list_cab_ops_queue(
         LEFT JOIN partners   p  ON p.id  = cb.pending_partner_id
         LEFT JOIN vehicle_categories vc ON vc.id = cb.vehicle_category_id
         WHERE {where_clause}
-        ORDER BY cb.acceptance_deadline ASC NULLS LAST, cb.created_at ASC
+        ORDER BY (cb.needs_attention IS NOT NULL) DESC,
+                 cb.acceptance_deadline ASC NULLS LAST,
+                 cb.created_at ASC
         LIMIT :limit
         """
     )
@@ -267,6 +299,9 @@ async def list_cab_ops_queue(
                 ),
                 pending_partner_name=r["pending_partner_name"],
                 pending_partner_code=r["pending_partner_code"],
+                open_offers=int(r["open_offers"] or 0),
+                offered_partner_names=r["offered_partner_names"],
+                needs_attention=r["needs_attention"],
                 acceptance_deadline=deadline.isoformat() if deadline else None,
                 seconds_to_deadline=seconds,
                 customer_name=r["customer_name"],
@@ -604,6 +639,22 @@ async def reassign_cab_booking(
     now = datetime.now(timezone.utc)
     actor_id = current_user.get("sub")
 
+    # The offer is the set of open, unanswered assignment rows: one for a
+    # partner an admin picked by hand, several for a fan-out round. Closing that
+    # set is what tells the partners it is over — leaving a row open would keep
+    # an Accept button live on a booking that has gone back to the queue, and
+    # would make the auto-assign chain believe somebody is still being asked.
+    from app.modules.booking.services.auto_assign import close_open_offers
+    from app.modules.partner.constants import SYSTEM_REJECT_REASON_ADMIN_REASSIGN
+
+    displaced_partner_ids = await close_open_offers(
+        db,
+        cab_booking_id,
+        reason=SYSTEM_REJECT_REASON_ADMIN_REASSIGN,
+        now=now,
+        note=payload.remarks or "Admin force-reassign from cab-ops console",
+    )
+
     await db.execute(
         text(
             """
@@ -612,6 +663,7 @@ async def reassign_cab_booking(
                 pending_partner_id = NULL,
                 acceptance_deadline = NULL,
                 partner_responded_at = :now,
+                needs_attention = NULL,
                 updated_at = :now
             WHERE id = :id
             """
@@ -633,26 +685,49 @@ async def reassign_cab_booking(
         ),
         {
             "mb_id": int(cab["master_booking_id"]),
-            "note": (payload.remarks or "Manual reassign from cab-ops console"),
+            "note": (
+                f"{payload.remarks or 'Manual reassign from cab-ops console'} — "
+                f"{len(displaced_partner_ids)} outstanding partner offer(s) "
+                "closed; cab returned to the assignment queue."
+            ),
             "actor_id": actor_id,
             "now": now,
         },
     )
 
-    await db.execute(
-        text(
-            """
-            UPDATE cab_booking_assignments
-            SET rejection_reason_code = COALESCE(rejection_reason_code, 'ADMIN_FORCE_REASSIGN'),
-                rejection_remarks = COALESCE(rejection_remarks, :note)
-            WHERE cab_booking_id = :id
-            """
-        ),
-        {
-            "id": cab_booking_id,
-            "note": payload.remarks or "Admin force-reassign",
-        },
-    )
+    # Tell the partners that were being asked, so their Accept/Reject popup
+    # goes away instead of sitting on a booking that is back in the queue.
+    # Best effort: the cab has already moved, and a dead WebSocket must not
+    # fail the admin's lever.
+    if displaced_partner_ids:
+        try:
+            from app.modules.notification.realtime import manager as _rt
+
+            recipient_user_ids = (
+                await db.execute(
+                    text("SELECT user_id FROM partners WHERE id = ANY(:ids)"),
+                    {"ids": displaced_partner_ids},
+                )
+            ).scalars().all()
+            for user_id in recipient_user_ids:
+                if user_id is None:
+                    continue
+                await _rt.send_to_user(
+                    user_id,
+                    {
+                        "event": "BOOKING_PARTNER_RESPONDED",
+                        "data": {
+                            "cab_booking_number": cab["booking_number"],
+                            "master_booking_id": int(cab["master_booking_id"]),
+                            "decision": "ADMIN_REASSIGNED",
+                            "cab_status": "PENDING_ASSIGNMENT",
+                        },
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001 — never fail the write on a push
+            logging.getLogger("waytero.cab_ops").warning(
+                "cab_ops.force_reassign.notify_failed err=%s", exc
+            )
 
     return success_response(
         f"Cab booking {cab['booking_number']} returned to PENDING_ASSIGNMENT",
@@ -660,6 +735,7 @@ async def reassign_cab_booking(
             "cab_booking_id": cab_booking_id,
             "booking_number": cab["booking_number"],
             "new_status": "PENDING_ASSIGNMENT",
+            "offers_closed_for_partner_ids": displaced_partner_ids,
         },
     )
 

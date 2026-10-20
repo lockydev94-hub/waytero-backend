@@ -5,11 +5,18 @@
 #
 # Pins the contract for migration 0039:
 #   - admin assign_partner → PENDING_PARTNER_ACCEPTANCE + deadline set
-#   - partner_accept_booking → ASSIGNED + accepted_at stamped
-#   - partner_reject_booking → PENDING_ASSIGNMENT + rejected_at stamped
-#   - timeout_sweeper reverts cab when deadline passes
+#   - the row a partner may answer is the open, unanswered one — an
+#     auto-assign round (migration 0086) puts several partners in that state at
+#     the same instant, so "who is pending" cannot be read off one column
 #   - previously-assigned-but-no-longer-pending partner gets 410 Gone
-#   - admin reassigns while pending → previous row closed ADMIN_REASSIGN
+#   - admin reassigns while pending → EVERY open row closed ADMIN_REASSIGN
+#   - the reason-code vocabulary: TIMEOUT / ADMIN_REASSIGN /
+#     ACCEPTED_BY_ANOTHER are written by the system, never by a partner
+#
+# The status transitions themselves (accept → ASSIGNED, reject or timeout →
+# the next round or back to PENDING_ASSIGNMENT, exhaustion) are proved against
+# a real database in tests/integration/test_cab_auto_assign_flow.py. What is
+# left here is what a stub can answer honestly: the helpers and the codes.
 # ============================================================
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ import pytest
 from app.modules.partner.constants import (
     REJECT_REASONS,
     REJECT_REASON_CODES,
+    SYSTEM_REJECT_REASON_ACCEPTED_BY_ANOTHER,
     SYSTEM_REJECT_REASON_ADMIN_REASSIGN,
     SYSTEM_REJECT_REASON_TIMEOUT,
 )
@@ -163,10 +171,12 @@ def test_reject_reasons_catalogue_is_partner_facing() -> None:
 
 
 def test_system_reject_codes_are_not_partner_facing() -> None:
-    """TIMEOUT and ADMIN_REASSIGN are written by sweeper / admin actions
-    only — they must not appear in the partner-facing catalogue."""
+    """TIMEOUT, ADMIN_REASSIGN and ACCEPTED_BY_ANOTHER are written by the
+    sweeper, the admin and a faster partner — never by a partner answering a
+    popup, so they must not appear in the partner-facing catalogue."""
     assert SYSTEM_REJECT_REASON_TIMEOUT not in REJECT_REASON_CODES
     assert SYSTEM_REJECT_REASON_ADMIN_REASSIGN not in REJECT_REASON_CODES
+    assert SYSTEM_REJECT_REASON_ACCEPTED_BY_ANOTHER not in REJECT_REASON_CODES
 
 
 # ── _get_int_config / assign_partner integration ──────────────────────────────
@@ -300,94 +310,105 @@ async def test_partner_cannot_accept_after_admin_reassigned_away() -> None:
     assert "reassigned" in exc_info.value.detail.lower()
 
 
-# ── Partner accept / reject happy paths (model-level) ────────────────────────
+# ── Who may answer: the open, unanswered row ──────────────────────────────────
+#
+# Both endpoints decide "is this partner still being asked?" with
+# `_current_offer_row`. Migration 0086 turns that into a real question: a
+# fan-out round has several live rows at one instant, and the rows a faster
+# partner, the sweeper or an admin has ended must stop being answerable. What an
+# answer then does to the booking — the next round, the timeout chain, the
+# exhaustion mark — is proved against a real database in
+# tests/integration/test_cab_auto_assign_flow.py, not by re-running the same
+# assignments on a stub here.
 
 
-@pytest.mark.asyncio
-async def test_partner_accept_flips_status_to_assigned() -> None:
-    """Pure-data path: when status is PENDING_PARTNER_ACCEPTANCE and the
-    deadline is still in the future, accepting stamps accepted_at and
-    moves the cab to ASSIGNED — clearing pending_partner_id so the
-    legacy _get_partner_cab_booking guard lets the partner continue."""
+def _offered_rows(*partner_ids: int, assigned_at: datetime) -> list[SimpleNamespace]:
+    """One live offer row per partner, exactly as a round writes them."""
+    rows = []
+    for pid in partner_ids:
+        row = _assignment(partner_id=pid)
+        row.id = 9000 + pid
+        row.assigned_at = assigned_at
+        rows.append(row)
+    return rows
+
+
+def test_a_fan_out_round_leaves_every_offered_partner_able_to_answer() -> None:
+    """Three partners were asked together, so three partners hold an answerable
+    offer — the state one `pending_partner_id` column cannot describe."""
+    from app.modules.partner.booking_api import _current_offer_row
+
+    asked = datetime.now(timezone.utc)
     cb = _cab(status="PENDING_PARTNER_ACCEPTANCE")
-    cb.pending_partner_id = 100
-    cb.acceptance_deadline = datetime.now(timezone.utc) + timedelta(minutes=5)
-    cb.assignments = [_assignment(partner_id=100)]
+    cb.assignments = _offered_rows(100, 101, 102, assigned_at=asked)
 
-    # Mirror what partner_accept_booking does on the happy path.
-    latest = cb.assignments[0]
+    answered = [_current_offer_row(cb, pid) for pid in (100, 101, 102)]
+    assert [row.partner_id for row in answered] == [100, 101, 102]
+    # A partner who was not in the round has nothing to answer.
+    assert _current_offer_row(cb, 103) is None
+
+
+@pytest.mark.parametrize(
+    "how_it_ended",
+    ["accepted", "declined", "timed_out", "lost", "reassigned"],
+)
+def test_a_row_that_has_been_ended_is_no_longer_answerable(how_it_ended: str) -> None:
+    """An offer row that carries an answer, a refusal, a timeout or a close is
+    finished: the partner gets 410 Gone, not a live Accept button."""
+    from app.modules.partner.booking_api import _current_offer_row
+
     now = datetime.now(timezone.utc)
-    latest.accepted_at = now
-    cb.booking_status = "ASSIGNED"
-    cb.partner_responded_at = now
-    cb.acceptance_deadline = None
-    cb.pending_partner_id = None
+    (row,) = _offered_rows(100, assigned_at=now)
+    if how_it_ended == "accepted":
+        row.accepted_at = now
+    elif how_it_ended == "declined":
+        row.rejected_at = now
+        row.rejection_reason_code = "VEHICLE_UNAVAILABLE"
+    elif how_it_ended == "timed_out":
+        row.rejected_at = now
+        row.rejection_reason_code = SYSTEM_REJECT_REASON_TIMEOUT
+        row.closed_at = now
+        row.close_reason = SYSTEM_REJECT_REASON_TIMEOUT
+    elif how_it_ended == "lost":
+        # Another partner took the trip first — not a refusal by this one.
+        row.rejected_at = now
+        row.rejection_reason_code = SYSTEM_REJECT_REASON_ACCEPTED_BY_ANOTHER
+        row.closed_at = now
+        row.close_reason = SYSTEM_REJECT_REASON_ACCEPTED_BY_ANOTHER
+    else:
+        row.rejected_at = now
+        row.rejection_reason_code = SYSTEM_REJECT_REASON_ADMIN_REASSIGN
+        row.closed_at = now
+        row.close_reason = SYSTEM_REJECT_REASON_ADMIN_REASSIGN
 
-    assert cb.booking_status == "ASSIGNED"
-    assert latest.accepted_at is not None
-    assert cb.pending_partner_id is None
-    assert cb.acceptance_deadline is None
-
-
-@pytest.mark.asyncio
-async def test_partner_reject_returns_to_pending_assignment() -> None:
-    """Pure-data path: rejecting sets rejected_at + reason on the row,
-    moves the cab back to PENDING_ASSIGNMENT, and clears the deadline
-    so the sweeper won't try to expire it again."""
     cb = _cab(status="PENDING_PARTNER_ACCEPTANCE")
-    cb.pending_partner_id = 100
-    cb.acceptance_deadline = datetime.now(timezone.utc) + timedelta(minutes=5)
-    cb.assignments = [_assignment(partner_id=100)]
+    cb.assignments = [row]
+    assert _current_offer_row(cb, 100) is None
 
-    latest = cb.assignments[0]
-    now = datetime.now(timezone.utc)
-    latest.rejected_at = now
-    latest.rejection_reason_code = "VEHICLE_UNAVAILABLE"
-    latest.rejection_notes = "Sedan in workshop"
 
-    cb.booking_status = "PENDING_ASSIGNMENT"
-    cb.partner_responded_at = now
-    cb.acceptance_deadline = None
-    cb.pending_partner_id = None
+def test_a_partner_asked_again_answers_the_live_row_not_the_closed_one() -> None:
+    """A re-ask keeps the closed row for the audit trail and adds a new open
+    one, so the open row has to win."""
+    from app.modules.partner.booking_api import _current_offer_row
 
-    assert cb.booking_status == "PENDING_ASSIGNMENT"
-    assert latest.rejected_at is not None
-    assert latest.rejection_reason_code == "VEHICLE_UNAVAILABLE"
-    assert cb.pending_partner_id is None
-    assert cb.acceptance_deadline is None
+    earlier = datetime.now(timezone.utc) - timedelta(minutes=20)
+    later = datetime.now(timezone.utc)
+    stale = _offered_rows(100, assigned_at=earlier)[0]
+    live = _offered_rows(100, assigned_at=later)[0]
+    live.id = stale.id + 1
+    stale.rejected_at = earlier
+    stale.rejection_reason_code = SYSTEM_REJECT_REASON_ADMIN_REASSIGN
+    stale.closed_at = earlier
+    stale.close_reason = SYSTEM_REJECT_REASON_ADMIN_REASSIGN
+
+    cb = _cab(status="PENDING_PARTNER_ACCEPTANCE")
+    cb.assignments = [stale, live]
+
+    chosen = _current_offer_row(cb, 100)
+    assert chosen is live
 
 
 # ── Sweeper ───────────────────────────────────────────────────────────────────
-
-
-@pytest.mark.asyncio
-async def test_sweeper_reverts_expired_pending_acceptance() -> None:
-    """Pure-data path: simulate what _expire_pending_acceptances_async
-    does to each expired cab — status flips to PENDING_ASSIGNMENT and
-    the latest assignment is stamped TIMEOUT."""
-    cb = _cab(status="PENDING_PARTNER_ACCEPTANCE")
-    cb.pending_partner_id = 100
-    cb.acceptance_deadline = datetime.now(timezone.utc) - timedelta(seconds=10)
-    cb.assignments = [_assignment(partner_id=100)]
-
-    # Inline the sweeper's per-cab logic (the test is exercising the
-    # contract, not the Celery plumbing).
-    now = datetime.now(timezone.utc)
-    latest = sorted(cb.assignments, key=lambda a: a.assigned_at, reverse=True)[0]
-    latest.rejected_at = now
-    latest.rejection_reason_code = SYSTEM_REJECT_REASON_TIMEOUT
-    latest.rejection_notes = (
-        f"Auto-rejected by sweeper after deadline {cb.acceptance_deadline.isoformat()}"
-    )
-    cb.booking_status = "PENDING_ASSIGNMENT"
-    cb.partner_responded_at = now
-    cb.acceptance_deadline = None
-    cb.pending_partner_id = None
-
-    assert cb.booking_status == "PENDING_ASSIGNMENT"
-    assert latest.rejection_reason_code == SYSTEM_REJECT_REASON_TIMEOUT
-    assert cb.pending_partner_id is None
-    assert cb.acceptance_deadline is None
 
 
 def test_sweeper_task_is_registered_in_celery_beat() -> None:

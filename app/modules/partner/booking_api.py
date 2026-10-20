@@ -19,7 +19,7 @@ from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
-from sqlalchemy import select, func, and_, desc, text
+from sqlalchemy import select, func, and_, or_, desc, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -51,6 +51,34 @@ router = APIRouter()
 _PARTNER_TERMINAL_STATUSES = frozenset(
     {"COMPLETED", "SETTLEMENT_PENDING", "CANCELLED", "REFUNDED"}
 )
+
+
+async def _partner_owned_cab_ids(db: AsyncSession, partner_id: int) -> list[int]:
+    """Cab bookings this partner should still see in their list and counts.
+
+    While the trip is live, "mine" means an OPEN assignment row. That is what
+    makes a fan-out round honest — all three partners asked are being asked — and
+    what hides the bookings that are no longer the partner's: refused, timed out,
+    closed because another partner took the trip, or reassigned away. Once the
+    booking reached a terminal state the row is closed by definition, so every
+    partner who worked it keeps it for invoices, settlement and audit.
+    """
+    rows = (
+        await db.execute(
+            select(CabBookingAssignment.cab_booking_id)
+            .join(CabBooking, CabBooking.id == CabBookingAssignment.cab_booking_id)
+            .where(
+                CabBookingAssignment.partner_id == partner_id,
+                or_(
+                    CabBookingAssignment.closed_at.is_(None),
+                    CabBooking.booking_status.in_(_PARTNER_TERMINAL_STATUSES),
+                ),
+            )
+            .distinct()
+        )
+    ).scalars().all()
+    return list(rows)
+
 
 # ════════════════════════════════════════════════════════════════
 # HELPERS
@@ -311,39 +339,14 @@ async def get_partner_booking_counts(
     - in_progress: DRIVER_ASSIGNED + STARTED
     - total_active: all non-terminal bookings
 
-    Note: the partner only sees cabs whose *latest* assignment is theirs,
-    so a previously-assigned-and-reassigned-away cab does not inflate
-    these counts.
+    Note: the partner only sees cabs they still hold an open offer or
+    assignment for (or a finished trip they worked), so a cab that was
+    reassigned away — or lost to another partner in a fan-out round — does
+    not inflate these counts.
     """
     partner_id = await _resolve_partner_id(db, current_user["sub"])
 
-    # Subquery: cab_booking_ids whose latest assignment belongs to this partner.
-    # Mirrors the filter used in list_partner_bookings so counts and lists
-    # always agree.
-    latest_assignment_subq = (
-        select(
-            CabBookingAssignment.cab_booking_id,
-            func.max(CabBookingAssignment.assigned_at).label("max_assigned_at"),
-        )
-        .group_by(CabBookingAssignment.cab_booking_id)
-        .subquery()
-    )
-    latest_self_q = (
-        select(CabBookingAssignment.cab_booking_id)
-        .join(
-            latest_assignment_subq,
-            (
-                CabBookingAssignment.cab_booking_id
-                == latest_assignment_subq.c.cab_booking_id
-            )
-            & (
-                CabBookingAssignment.assigned_at
-                == latest_assignment_subq.c.max_assigned_at
-            ),
-        )
-        .where(CabBookingAssignment.partner_id == partner_id)
-    )
-    owned_ids = (await db.execute(latest_self_q)).scalars().all()
+    owned_ids = await _partner_owned_cab_ids(db, partner_id)
 
     if not owned_ids:
         return {
@@ -406,39 +409,17 @@ async def list_partner_bookings(
     db: AsyncSession = Depends(get_db),
 ):
     """
-    Return all cab bookings where this partner is the assigned partner
-    on the *latest* assignment row. Cab reassigned *away* from this
-    partner are not returned.
-    Enriched with customer info, vehicle category, and latest driver assignment.
+    Return the cab bookings this partner still holds an open offer or
+    assignment for (plus finished trips they worked). Cabs reassigned away,
+    refused, timed out or lost to another partner in a fan-out round are not
+    returned. Enriched with customer info, vehicle category, and latest driver
+    assignment.
     """
     partner_id = await _resolve_partner_id(db, current_user["sub"])
 
-    # Find cab_booking_ids where the LATEST assignment row is this partner.
-    # A booking reassigned away from this partner should not appear.
-    latest_assignment_subq = (
-        select(
-            CabBookingAssignment.cab_booking_id,
-            func.max(CabBookingAssignment.assigned_at).label("max_assigned_at"),
-        )
-        .group_by(CabBookingAssignment.cab_booking_id)
-        .subquery()
-    )
-    assign_q = (
-        select(CabBookingAssignment.cab_booking_id)
-        .join(
-            latest_assignment_subq,
-            (
-                CabBookingAssignment.cab_booking_id
-                == latest_assignment_subq.c.cab_booking_id
-            )
-            & (
-                CabBookingAssignment.assigned_at
-                == latest_assignment_subq.c.max_assigned_at
-            ),
-        )
-        .where(CabBookingAssignment.partner_id == partner_id)
-    )
-    assigned_cab_ids = (await db.execute(assign_q)).scalars().all()
+    # Same ownership rule as /me/bookings/counts, so the badge and the list
+    # always agree.
+    assigned_cab_ids = await _partner_owned_cab_ids(db, partner_id)
 
     if not assigned_cab_ids:
         return BookingListResponse(total=0, page=page, limit=limit, pages=1, items=[])
@@ -1036,16 +1017,11 @@ async def partner_accept_booking(
             "Please refresh — admin will reassign.",
         )
 
-    latest = max(cb.assignments, key=lambda a: (a.assigned_at, a.id), default=None)
-    if (
-        cb.pending_partner_id != partner_id
-        or latest is None
-        or latest.partner_id != partner_id
-        or latest.closed_at is not None
-        or latest.accepted_at is not None
-        or latest.rejected_at is not None
-        or latest.rejection_reason_code is not None
-    ):
+    # This partner's own live offer. An auto-assign round puts several partners'
+    # rows open at the same time and leaves pending_partner_id NULL, so the rows
+    # — not the single pointer column — are what says who is being asked.
+    latest = _current_offer_row(cb, partner_id)
+    if latest is None:
         raise HTTPException(410, "This offer is no longer current. Please refresh.")
 
     from app.modules.booking.services.coupon_dispatch import (
@@ -1059,11 +1035,35 @@ async def partner_accept_booking(
     cb.acceptance_deadline = None
     cb.pending_partner_id = None
 
+    # The other partners in the round never answered — they were simply beaten
+    # to the trip. Closing their rows is what drops their popups; the reason
+    # code says so and is deliberately not recorded as a refusal.
+    from app.modules.booking.services.auto_assign import close_open_offers
+    from app.modules.partner.constants import (
+        SYSTEM_REJECT_REASON_ACCEPTED_BY_ANOTHER,
+    )
+
+    answered_elsewhere = await close_open_offers(
+        db,
+        cb.id,
+        reason=SYSTEM_REJECT_REASON_ACCEPTED_BY_ANOTHER,
+        now=now,
+        exclude_partner_id=partner_id,
+        note=f"Partner {partner_id} accepted the trip first.",
+    )
+    other_partner_ids = [int(pid) for pid in answered_elsewhere]
+
     await _log_timeline(
         db,
         cb.master_booking_id,
         "PARTNER_ACCEPTED",
-        f"Partner accepted cab {cb.booking_number}. Awaiting driver assignment.",
+        f"Partner accepted cab {cb.booking_number}. Awaiting driver assignment."
+        + (
+            f" {len(answered_elsewhere)} simultaneous offer(s) closed as accepted "
+            "by another partner."
+            if answered_elsewhere
+            else ""
+        ),
     )
     # Notification dispatch may commit internally. Finish the lifecycle first.
     await db.commit()
@@ -1085,6 +1085,33 @@ async def partner_accept_booking(
                 },
             },
         )
+        # The partners that lost this trip in a fan-out round still have a
+        # popup open on their screen — tell each of them it is over.
+        if other_partner_ids:
+            from app.modules.partner.models import Partner as _Partner
+
+            nudged = (
+                await db.execute(
+                    select(_Partner.id, _Partner.user_id).where(
+                        _Partner.id.in_(other_partner_ids)
+                    )
+                )
+            ).all()
+            for _pid, partner_user in nudged:
+                if partner_user is None:
+                    continue
+                await _rt.send_to_user(
+                    partner_user,
+                    {
+                        "event": "BOOKING_PARTNER_RESPONDED",
+                        "data": {
+                            "cab_booking_number": cb.booking_number,
+                            "master_booking_id": cb.master_booking_id,
+                            "decision": "ACCEPTED_BY_ANOTHER",
+                            "cab_status": "ASSIGNED",
+                        },
+                    },
+                )
         # Admin-side refresh nudge — admin tabs subscribed to the
         # booking channel pick this up and refetch.
         await _rt.broadcast(
@@ -1178,17 +1205,13 @@ async def partner_reject_booking(
     if payload.reason_code == "OTHER" and not notes:
         raise HTTPException(400, "notes is required when reason_code is OTHER.")
 
-    latest = max(cb.assignments, key=lambda a: (a.assigned_at, a.id), default=None)
     now = datetime.now(timezone.utc)
-    if (
-        cb.pending_partner_id != partner_id
-        or latest is None
-        or latest.partner_id != partner_id
-        or latest.closed_at is not None
-        or latest.accepted_at is not None
-        or latest.rejected_at is not None
-        or latest.rejection_reason_code is not None
-    ):
+    # This partner's own live offer row(s). In a fan-out round several partners
+    # hold an offer at once and pending_partner_id is NULL, so the rows decide
+    # who may answer — a partner whose offer was already closed or answered
+    # elsewhere gets 410 and stops seeing the buttons.
+    latest = _current_offer_row(cb, partner_id)
+    if latest is None:
         raise HTTPException(410, "This offer is no longer current. Please refresh.")
     if cb.acceptance_deadline is None or cb.acceptance_deadline <= now:
         # An expired offer is a timeout, never evidence of a human refusal.
@@ -1200,11 +1223,26 @@ async def partner_reject_booking(
     latest.rejection_notes = notes or None
     latest.closed_at = now
     latest.close_reason = "PARTNER_REJECTED"
+    # The chain below reads the assignment table with SQL; the refusal has to be
+    # visible to it or the round would look still-open.
+    await db.flush()
 
-    cb.booking_status = "PENDING_ASSIGNMENT"
-    cb.partner_responded_at = now
-    cb.acceptance_deadline = None
-    cb.pending_partner_id = None
+    # Who gets asked next is the chain's decision, not this endpoint's:
+    # other live offers in the round keep the booking pending, auto-assign
+    # publishes the next group, and with the switch off the cab simply goes
+    # back to the admin queue like it always did.
+    from app.modules.booking.services.auto_assign import advance_after_offers_closed
+
+    outcome, _offered = await advance_after_offers_closed(
+        db,
+        cb,
+        city_id=mb.city_id,
+        now=now,
+        reason_for_next_round=(
+            f"partner {partner_id} declined ({payload.reason_code})"
+        ),
+    )
+    await db.refresh(cb)
     cancelled = await cancel_if_coupon_exhausted(db, cb)
 
     label = payload.reason_code
@@ -1271,9 +1309,17 @@ async def partner_reject_booking(
         "message": (
             "Booking cancelled; all eligible coupon partners declined or timed out"
             if cancelled
-            else "Booking rejected; returned to PENDING_ASSIGNMENT"
+            else (
+                "Booking rejected; the trip is still being offered to partners"
+                if cb.booking_status == "PENDING_PARTNER_ACCEPTANCE"
+                else "Booking rejected; returned to PENDING_ASSIGNMENT"
+            )
         ),
         "cab_status": cb.booking_status,
+        # What the offer chain decided after this refusal: WAITING means other
+        # partners in the round are still being asked, NEXT_ROUND means a new
+        # group was asked, FOR_HUMAN / EXHAUSTED mean the queue is the admin's.
+        "chain_outcome": outcome,
         "rejected_at": now.isoformat(),
         "reason_code": payload.reason_code,
     }
@@ -1464,6 +1510,28 @@ class PartnerCollectPaymentRequest(BaseModel):
     payment_collected_by: str  # DRIVER | PARTNER
 
 
+def _current_offer_row(cb, partner_id: int):
+    """The offer row this partner is still allowed to answer, or None.
+
+    An auto-assign round asks several partners at the same time and leaves
+    `pending_partner_id` NULL — a single column cannot name a group — so the
+    open, unanswered assignment rows are what says who is being asked. A partner
+    whose row was already answered, refused, timed out or closed because another
+    partner took the trip has nothing to answer and must get 410 Gone so the FE
+    stops showing the Accept/Reject buttons.
+    """
+    mine = [
+        a
+        for a in cb.assignments
+        if a.partner_id == partner_id
+        and a.closed_at is None
+        and a.accepted_at is None
+        and a.rejected_at is None
+        and a.rejection_reason_code is None
+    ]
+    return max(mine, key=lambda a: (a.assigned_at, a.id), default=None)
+
+
 async def _get_partner_cab_booking(
     db: AsyncSession,
     booking_number: str,
@@ -1504,9 +1572,10 @@ async def _get_partner_cab_booking(
         if not active_partner_assigns:
             raise HTTPException(
                 410,
-                "This booking is no longer with you — it was handed over to "
-                "another partner after a vehicle breakdown. You may view it "
-                "for audit but cannot start, close or modify it.",
+                "This booking is no longer with you — another partner accepted "
+                "it, it was reassigned, or it was handed over after a vehicle "
+                "breakdown. You may view it for audit but cannot start, close "
+                "or modify it.",
             )
 
     # Guard against stale assignments from a prior admin reassignment:

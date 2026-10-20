@@ -652,36 +652,39 @@ async def _get_int_config(db: AsyncSession, key: str, default: int) -> int:
 
 async def _close_pending_partner_assignment(
     db: AsyncSession, cb: CabBooking, reason_code: str, description_suffix: str
-) -> Optional[CabBookingAssignment]:
+) -> list[CabBookingAssignment]:
     """
-    When admin reassigns or the sweeper times out, the row currently
+    When admin reassigns or the sweeper times out, every row currently
     sitting in PENDING_PARTNER_ACCEPTANCE needs to be closed so the
-    audit trail shows why it ended. Returns the row that was closed
-    (or None if there was no pending row).
+    audit trail shows why it ended. Returns the rows that were closed
+    (empty if there was nothing pending).
+
+    Plural on purpose: a fan-out round (auto_assign) has several partners
+    holding an offer at the same time, and closing only the first one would
+    leave the other partners' popups live on a booking that already moved on.
     """
     if cb.booking_status != "PENDING_PARTNER_ACCEPTANCE":
-        return None
-    if not cb.assignments:
-        return None
-    # Use the active (closed_at IS NULL) row so a closed handover row is
-    # never mistaken for the pending one.
-    pending_row = next(
-        (
-            a
-            for a in cb.assignments
-            if a.closed_at is None and a.accepted_at is None and a.rejected_at is None
-        ),
-        None,
-    )
-    if pending_row is None:
-        return None
+        return []
+    # Use the active (closed_at IS NULL) rows so a closed handover row is
+    # never mistaken for a pending one.
+    pending_rows = [
+        a
+        for a in cb.assignments
+        if a.closed_at is None
+        and a.accepted_at is None
+        and a.rejected_at is None
+        and a.rejection_reason_code is None
+    ]
+    if not pending_rows:
+        return []
     now = datetime.now(timezone.utc)
-    pending_row.rejected_at = now
-    pending_row.rejection_reason_code = reason_code
-    pending_row.closed_at = now
-    pending_row.close_reason = (
-        "ADMIN_REASSIGN" if reason_code == "ADMIN_REASSIGN" else "TIMEOUT"
-    )
+    for pending_row in pending_rows:
+        pending_row.rejected_at = now
+        pending_row.rejection_reason_code = reason_code
+        pending_row.closed_at = now
+        pending_row.close_reason = (
+            "ADMIN_REASSIGN" if reason_code == "ADMIN_REASSIGN" else "TIMEOUT"
+        )
     cb.partner_responded_at = now
     cb.acceptance_deadline = None
     cb.pending_partner_id = None
@@ -693,7 +696,7 @@ async def _close_pending_partner_assignment(
             "PARTNER_ASSIGNMENT_CLOSED",
             description_suffix,
         )
-    return pending_row
+    return pending_rows
 
 
 async def _build_cab_out(cb: CabBooking, db: AsyncSession) -> CabBookingOut:
@@ -1925,20 +1928,22 @@ async def assign_partner(
         db, payload.partner_id, cb.vehicle_category_id
     )
 
-    # If the cab is already sitting with a partner in the acceptance window,
-    # close that row first so it doesn't linger as an open accepted_at.
+    # If the cab is already sitting with partners in the acceptance window,
+    # close those rows first so they don't linger as open unanswered offers.
+    displaced_partner_ids: list[int] = []
     if cb.booking_status == "PENDING_PARTNER_ACCEPTANCE":
         from app.modules.partner.constants import SYSTEM_REJECT_REASON_ADMIN_REASSIGN
 
-        await _close_pending_partner_assignment(
+        closed_rows = await _close_pending_partner_assignment(
             db,
             cb,
             reason_code=SYSTEM_REJECT_REASON_ADMIN_REASSIGN,
             description_suffix=(
-                f"Admin reassigned cab {cb.booking_number} before partner "
-                f"responded; previous assignment auto-closed."
+                f"Admin reassigned cab {cb.booking_number} before the partner "
+                f"responded; outstanding offers auto-closed."
             ),
         )
+        displaced_partner_ids = [int(r.partner_id) for r in closed_rows]
 
     timeout_minutes = await _get_int_config(
         db, "PARTNER_ACCEPTANCE_TIMEOUT_MINUTES", 10
@@ -1960,6 +1965,9 @@ async def assign_partner(
     cb.acceptance_deadline = deadline
     cb.pending_partner_id = payload.partner_id
     cb.partner_responded_at = None
+    # A human picked the partner — the queue chip that said "auto-assign ran out
+    # of rounds" is answered and must not keep burning on the admin screen.
+    cb.needs_attention = None
 
     await _log_timeline(
         db,
@@ -1991,6 +1999,35 @@ async def assign_partner(
             ),
             deadline_iso=deadline.isoformat(),
         )
+
+        # Any partner that held an offer the admin just replaced must have
+        # their popup dropped, otherwise they keep a live Accept button on a
+        # booking that is no longer theirs.
+        if displaced_partner_ids and payload.partner_id not in displaced_partner_ids:
+            from app.modules.notification.realtime import manager as _rt
+
+            nudged = (
+                await db.execute(
+                    select(Partner.id, Partner.user_id).where(
+                        Partner.id.in_(displaced_partner_ids)
+                    )
+                )
+            ).all()
+            for _old_partner_id, old_user in nudged:
+                if old_user is None:
+                    continue
+                await _rt.send_to_user(
+                    old_user,
+                    {
+                        "event": "BOOKING_PARTNER_RESPONDED",
+                        "data": {
+                            "cab_booking_number": cb.booking_number,
+                            "master_booking_id": booking_id,
+                            "decision": "ADMIN_REASSIGNED",
+                            "cab_status": "PENDING_PARTNER_ACCEPTANCE",
+                        },
+                    },
+                )
     except Exception as _notif_exc:  # pragma: no cover - never block the API
         import logging as _log
 
@@ -2204,19 +2241,23 @@ async def reassign_partner(
         db, payload.partner_id, cb.vehicle_category_id
     )
 
-    # Close any pending row first so the audit trail is consistent.
+    # Close any pending rows first so the audit trail is consistent.
+    # Captured here because cb.pending_partner_id is overwritten below and the
+    # "who do we tell to drop the popup" list has to be read while it exists.
+    displaced_partner_ids: list[int] = []
     if cb.booking_status == "PENDING_PARTNER_ACCEPTANCE":
         from app.modules.partner.constants import SYSTEM_REJECT_REASON_ADMIN_REASSIGN
 
-        await _close_pending_partner_assignment(
+        closed_rows = await _close_pending_partner_assignment(
             db,
             cb,
             reason_code=SYSTEM_REJECT_REASON_ADMIN_REASSIGN,
             description_suffix=(
-                f"Admin reassigned cab {cb.booking_number} before partner "
-                f"responded; previous assignment auto-closed."
+                f"Admin reassigned cab {cb.booking_number} before the partner "
+                f"responded; outstanding offers auto-closed."
             ),
         )
+        displaced_partner_ids = [int(r.partner_id) for r in closed_rows]
 
     timeout_minutes = await _get_int_config(
         db, "PARTNER_ACCEPTANCE_TIMEOUT_MINUTES", 10
@@ -2237,6 +2278,7 @@ async def reassign_partner(
     cb.acceptance_deadline = deadline
     cb.pending_partner_id = payload.partner_id
     cb.partner_responded_at = None
+    cb.needs_attention = None
 
     reason_text = f" Reason: {payload.reason}" if payload.reason else ""
     await _log_timeline(
@@ -2262,19 +2304,19 @@ async def reassign_partner(
         from app.modules.partner.models import Partner as _Partner
         from sqlalchemy import select as _sa_select
 
-        # 1. Notify the old partner (the row that was just closed).
-        if (
-            cb.pending_partner_id is not None
-            and cb.pending_partner_id != payload.partner_id
-        ):
-            old_user = (
+        # 1. Notify every partner whose offer was just closed (a fan-out round
+        #    can have several), so their Accept/Reject popup drops.
+        if displaced_partner_ids:
+            old_users = (
                 await db.execute(
-                    _sa_select(_Partner.user_id).where(
-                        _Partner.id == cb.pending_partner_id
+                    _sa_select(_Partner.id, _Partner.user_id).where(
+                        _Partner.id.in_(displaced_partner_ids)
                     )
                 )
-            ).scalar_one_or_none()
-            if old_user is not None:
+            ).all()
+            for _old_partner_id, old_user in old_users:
+                if old_user is None or _old_partner_id == payload.partner_id:
+                    continue
                 await _rt.send_to_user(
                     old_user,
                     {
@@ -2387,7 +2429,22 @@ async def admin_accept_booking(
             "BOOKING_ACCEPTED",
             f"Cab {cb.booking_number} accepted by admin. Ready for partner assignment.",
         )
+        # Acceptance is the moment the trip becomes WayTero's problem to staff.
+        # With auto-assign switched on the first ranked group of partners is
+        # asked straight away; with it off this is a no-op and the admin picks a
+        # partner from the queue as before.
+        from app.modules.booking.services.auto_assign import (
+            begin_chain,
+            notify_offered_partners,
+        )
+
+        offered = await begin_chain(db, cb, city_id=mb.city_id)
         await db.commit()
+        if offered:
+            # The chain wrote the cab with SQL; reload so the status this
+            # endpoint reports is the status the booking is actually in.
+            await db.refresh(cb)
+            await notify_offered_partners(db, cb, offered)
         # ── Email: booking confirmation to the customer ──
         await _send_booking_email(
             db,

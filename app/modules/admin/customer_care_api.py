@@ -1710,6 +1710,19 @@ async def create_cab_booking_by_admin(
     )
     db.add(tl)
 
+    # The customer has agreed to the trip on the phone; with auto-assign
+    # switched on the partners are asked now instead of waiting for someone to
+    # open the assign screen, and with it off this is a no-op.
+    from app.modules.booking.services.auto_assign import (
+        begin_chain,
+        notify_offered_partners,
+    )
+
+    # The booking and its rows are still pending in this session (autoflush is
+    # off) and the chain reads/writes them with SQL.
+    await db.flush()
+    offered_partners = await begin_chain(db, cb, city_id=mb.city_id)
+
     # ── Email: the booking the agent just described on the phone ──────────
     # Only the customer's own address on their own profile, and only what they
     # already agreed to hear: the booking number, the route and the fare lines.
@@ -1743,7 +1756,11 @@ async def create_cab_booking_by_admin(
     except Exception:  # pragma: no cover — email must never break a booking
         pass
 
-    # get_db auto-commits on success.
+    # get_db auto-commits on success, and the popups go out after the rows that
+    # the partners' Accept buttons act on are actually in the database.
+    await db.commit()
+    if offered_partners:
+        await notify_offered_partners(db, cb, offered_partners)
 
     return CabBookingCreateOut(
         success=True,
@@ -1758,7 +1775,15 @@ async def create_cab_booking_by_admin(
         coupon_discount=coupon_discount,
         payable_amount=estimated_amount - coupon_discount,
         notes=quote.notes,
-        message="Cab booking created successfully",
+        message=(
+            "Cab booking created successfully"
+            + (
+                f" — offered to {len(offered_partners)} partner(s), awaiting "
+                "acceptance"
+                if offered_partners
+                else ""
+            )
+        ),
     )
 
 
