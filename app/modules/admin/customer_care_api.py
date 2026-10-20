@@ -242,6 +242,61 @@ class CabBookingCreateOut(BaseModel):
     message: str
 
 
+class CabBookingEditByAdmin(BaseModel):
+    """Change a booking that already exists to the customer's new requirement.
+
+    The same fields a create takes, minus the customer (a booking is whose it is
+    and does not move) and minus the coupon: the redemption is already recorded,
+    with the funding split that goes with it, and re-valuing it here would be
+    adjusting booked money. And as at create, there is no distance and no amount —
+    the amended fare is the fare engine's answer for the amended trip.
+    """
+
+    city_id: Optional[int] = None
+    destination_city_id: Optional[int] = None
+    trip_type: str = Field(
+        ..., description="LOCAL | AIRPORT | OUTSTATION | ONE_WAY | ROUND_TRIP"
+    )
+    vehicle_category_id: int = Field(..., gt=0)
+    pickup_location: str = Field(..., max_length=500)
+    pickup_latitude: Optional[float] = None
+    pickup_longitude: Optional[float] = None
+    drop_location: str = Field(..., max_length=500)
+    drop_latitude: Optional[float] = None
+    drop_longitude: Optional[float] = None
+    pickup_datetime: datetime
+    return_datetime: Optional[datetime] = None
+    waiting_minutes: Optional[int] = Field(None, ge=0, le=1440)
+    # Why the trip changed. Free text from the agent, written to the audit trail
+    # next to the figures — the numbers say what the fare became, this says why.
+    reason: Optional[str] = Field(None, max_length=500)
+
+
+class CabBookingEditOut(BaseModel):
+    """The amended booking, in the same Decimal form it was quoted in.
+
+    `old_amount` is here because the agent's next sentence to the customer is
+    usually "so it was ₹X and now it is ₹Y", and `re_offered` because closing the
+    outstanding offers is a decision the desk has to be able to see.
+    """
+
+    success: bool
+    master_booking_id: int
+    booking_number: str
+    cab_booking_id: int
+    cab_booking_number: str
+    distance_km: Decimal
+    distance_source: str
+    billable_km: Decimal
+    old_amount: Decimal
+    estimated_amount: Decimal
+    coupon_discount: Decimal
+    payable_amount: Decimal
+    re_offered: bool
+    notes: List[str] = Field(default_factory=list)
+    message: str
+
+
 # ── Hotel booking (by admin) ─────────────────────────────────
 
 
@@ -1311,6 +1366,66 @@ def _cab_confirmation_context(
     }
 
 
+def _timeline_actor(current_user: dict) -> Optional[_uuid.UUID]:
+    """Who acted, as the timeline's `created_by`.
+
+    A malformed subject in the token must not fail an amendment that has already
+    happened to the customer's booking, so the row goes in unattributed rather
+    than raising — the same tolerance the create path allows itself."""
+    try:
+        return _uuid.UUID(current_user["sub"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _cab_amendment_note(cb, payload, quote, re_offered: bool) -> str:
+    """The audit sentence an amendment leaves behind.
+
+    The question months later is "what did we agree with this customer and who
+    changed it", so the sentence carries the fare on both sides of the edit and
+    only the fields that actually moved. Every figure is the server's re-measured
+    one; the agent's own words appear only as the reason they gave.
+    """
+    old_total = Decimal(str(cb["estimated_amount"] or 0))
+    parts = [
+        "Cab booking amended by admin via Customer Care — "
+        f"₹{old_total.quantize(Decimal('0.01'))} → "
+        f"₹{quote.total.quantize(Decimal('0.01'))} for "
+        f"{_km_text(quote.distance.km)} km ({quote.distance.source})"
+    ]
+    if str(cb["trip_type"] or "").upper() != payload.trip_type.upper():
+        parts.append(f"trip type {cb['trip_type']} → {payload.trip_type}")
+    if int(cb["vehicle_category_id"]) != payload.vehicle_category_id:
+        parts.append(
+            f"vehicle category {cb['vehicle_category_id']} → "
+            f"{payload.vehicle_category_id}"
+        )
+    if str(cb["pickup_location"] or "") != payload.pickup_location:
+        parts.append(f"pickup {cb['pickup_location']} → {payload.pickup_location}")
+    if str(cb["drop_location"] or "") != payload.drop_location:
+        parts.append(f"drop {cb['drop_location']} → {payload.drop_location}")
+    if not cb["pickup_time_unchanged"]:
+        # Only the new time is named. The stored one comes back as an instant and
+        # the requested one as wall-clock, and putting both in one sentence would
+        # read as a five-and-a-half hour delay that nobody asked for.
+        parts.append(
+            f"pickup moved to {payload.pickup_datetime:%d %b %Y %H:%M}"
+        )
+    if not cb["return_time_unchanged"]:
+        parts.append(
+            "return removed"
+            if payload.return_datetime is None
+            else f"return moved to {payload.return_datetime:%d %b %Y %H:%M}"
+        )
+    if re_offered:
+        parts.append(
+            "outstanding partner offers closed — the trip needs assignment again"
+        )
+    if payload.reason:
+        parts.append(f"reason: {payload.reason}")
+    return "; ".join(parts)
+
+
 @router.post("/cab-booking/quote", response_model=CabQuoteOut, tags=["Customer Care"])
 async def quote_cab_booking_by_admin(
     payload: CabBookingQuoteRequest,
@@ -1644,6 +1759,394 @@ async def create_cab_booking_by_admin(
         payable_amount=estimated_amount - coupon_discount,
         notes=quote.notes,
         message="Cab booking created successfully",
+    )
+
+
+@router.put(
+    "/cab-booking/{cab_booking_id}",
+    response_model=CabBookingEditOut,
+    tags=["Customer Care"],
+)
+async def edit_cab_booking_by_admin(
+    cab_booking_id: int,
+    payload: CabBookingEditByAdmin,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+    scope: BranchScope = Depends(get_branch_scope),
+):
+    """Change a booked cab trip to the customer's new requirement, and reprice it.
+
+    The call the desk actually takes — "make it 11 instead of 9", "drop my wife at
+    the airport then come back", "put me in an Innova instead". The old route for
+    this (`/reschedule` on the booking screen) moves the pickup time and leaves the
+    fare exactly as it was, so a trip that grew from 12 km to 60 km kept its
+    original price and the partner was billed for the shorter job.
+
+    Nothing here is typed money. The amended trip is measured and priced by the
+    same `quote_cab_trip` call a new booking goes through, the lines and the rule
+    sheet are rewritten on the row, and the old total goes into the audit trail
+    next to the new one so a dispute has both figures and the acting user.
+
+    Three things stop an edit, and each says what to do instead: the trip has
+    started or ended (close or cancel it, do not amend it), money has been taken
+    against it (reconcile the payment first), or the coupon on it would owe a
+    different discount on the new fare (a booked redemption cannot be re-valued
+    here). Once a partner has accepted, the offer is a commitment about this trip,
+    so an edit that changes the fare or the kind of trip closes the open offers and
+    puts the booking back for assignment rather than letting a partner deliver a
+    job nobody quoted them.
+    """
+    from app.modules.booking.services.trip_pricing import fare_columns, quote_cab_trip
+
+    cb = (
+        (
+            await db.execute(
+                text(
+                    "SELECT cb.id, cb.master_booking_id, cb.booking_number, "
+                    "       cb.booking_status, cb.trip_type, "
+                    "       cb.vehicle_category_id, cb.pickup_location, "
+                    "       cb.drop_location, cb.pickup_datetime, "
+                    "       cb.return_datetime, cb.estimated_amount, "
+                    "       cb.coupon_id, cb.coupon_code, cb.coupon_discount, "
+                    "       cb.invoice_number, cb.final_amount, "
+                    "       cb.pending_partner_id, "
+                    # Which of the two times moved is decided by the database, on
+                    # the same timestamptz column the UPDATE writes: in Python a
+                    # naive request time and a stored instant can never compare
+                    # equal, and the audit note would claim the pickup changed on
+                    # every amendment.
+                    "       (cb.pickup_datetime IS NOT DISTINCT FROM :new_pickup) "
+                    "         AS pickup_time_unchanged, "
+                    "       (cb.return_datetime IS NOT DISTINCT FROM :new_return) "
+                    "         AS return_time_unchanged "
+                    "FROM cab_bookings cb WHERE cb.id = :id"
+                ),
+                {
+                    "id": cab_booking_id,
+                    "new_pickup": payload.pickup_datetime,
+                    "new_return": payload.return_datetime,
+                },
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if cb is None:
+        raise ResourceNotFoundException("Cab booking not found")
+
+    # The branch that owns the master booking owns the amendment, checked before
+    # anything about the booking's state is reported — another office's booking
+    # reads as absent rather than as interesting.
+    await require_row_scope(
+        db,
+        scope,
+        table="master_bookings",
+        id_column="id",
+        id_value=cb["master_booking_id"],
+        city_column="city_id",
+        allow_unassigned=False,
+        label="Cab booking",
+    )
+
+    status = str(cb["booking_status"] or "").upper()
+    if status not in {"PENDING_ASSIGNMENT", "PENDING_PARTNER_ACCEPTANCE"}:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This booking is {status or 'in an unknown state'}, so the trip "
+                "cannot be amended here. Once a partner has accepted, changes go "
+                "through cancel / re-assign; after the trip has run, through "
+                "close-trip and add-charges."
+            ),
+        )
+
+    if cb["final_amount"] is not None or cb["invoice_number"] is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This booking already has a closed fare or an invoice against it, "
+                "so the money is settled — amend it with add-charges / the "
+                "invoice void flow instead of rewriting the fare."
+            ),
+        )
+
+    advance = (
+        (
+            await db.execute(
+                text(
+                    "SELECT amount FROM advance_payments "
+                    "WHERE cab_booking_id = :id AND status = 'ACTIVE' "
+                    "ORDER BY id LIMIT 1"
+                ),
+                {"id": cab_booking_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if advance is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"₹{Decimal(str(advance['amount'])).quantize(Decimal('0.01'))} has "
+                "been collected against this booking. Refund or void the advance "
+                "first, then amend the trip — otherwise the balance the driver "
+                "collects at trip end is computed on a fare the customer was "
+                "never quoted."
+            ),
+        )
+
+    mb = (
+        (
+            await db.execute(
+                text(
+                    "SELECT id, booking_number, city_id, customer_id, payment_status "
+                    "FROM master_bookings WHERE id = :id"
+                ),
+                {"id": cb["master_booking_id"]},
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+    # A branch amends in its own city; a super admin may move the trip, which is
+    # also what re-files the booking under the new office.
+    effective_city_id = await _desk_pricing_city(payload, db, scope)
+
+    quote = await quote_cab_trip(
+        db,
+        pickup_location=payload.pickup_location,
+        drop_location=payload.drop_location,
+        origin_city_id=effective_city_id,
+        vehicle_category_id=payload.vehicle_category_id,
+        trip_type=payload.trip_type,
+        pickup_datetime=payload.pickup_datetime,
+        return_datetime=payload.return_datetime,
+        destination_city_id=payload.destination_city_id,
+        waiting_minutes=payload.waiting_minutes,
+    )
+    old_amount = Decimal(str(cb["estimated_amount"] or 0))
+    coupon_discount = Decimal(str(cb["coupon_discount"] or 0))
+
+    # A redemption stands or the amendment is refused — never re-valued. The
+    # discount, the usage row and the partner/platform funding split were written
+    # for the fare the customer agreed to, and `here not have adjust any
+    # commission amount` is the owner's rule, not a convenience.
+    if cb["coupon_id"] is not None:
+        from app.modules.admin.coupon_api import ValidateRequest, validate_coupon
+
+        mobile = (
+            await db.execute(
+                text(
+                    "SELECT u.mobile_number FROM customers c "
+                    "JOIN users u ON u.id = c.user_id WHERE c.id = :cid"
+                ),
+                {"cid": mb["customer_id"]},
+            )
+        ).scalar()
+
+        revalidation = await validate_coupon(
+            ValidateRequest(
+                coupon_code=cb["coupon_code"],
+                service_type="CAB",
+                vehicle_category_id=payload.vehicle_category_id,
+                city_id=effective_city_id,
+                booking_amount=quote.total,
+                customer_id=mb["customer_id"],
+                customer_mobile=mobile,
+                pickup_datetime=payload.pickup_datetime,
+                return_datetime=payload.return_datetime,
+            ),
+            db,
+            reserve=False,
+        )
+        if not revalidation.valid:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Coupon {cb['coupon_code']} no longer applies to the amended "
+                    f"trip: {revalidation.message}. Cancel and re-book to change "
+                    "the coupon, or amend a trip that still qualifies."
+                ),
+            )
+        would_be = Decimal(str(revalidation.discount_amount or 0))
+        if would_be != coupon_discount:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Coupon {cb['coupon_code']} would owe ₹"
+                    f"{would_be.quantize(Decimal('0.01'))} on the new fare, not the "
+                    f"₹{coupon_discount.quantize(Decimal('0.01'))} already redeemed. "
+                    "A booked coupon cannot be re-valued here — cancel the booking "
+                    "and re-book with the code."
+                ),
+            )
+
+    # The offers a partner has not accepted yet are about the OLD trip. If this
+    # edit changes what the job is, they are closed and the booking goes back for
+    # assignment so nobody accepts a fare they were never offered.
+    material_change = (
+        quote.total != old_amount
+        or str(cb["trip_type"] or "").upper() != payload.trip_type.upper()
+        or int(cb["vehicle_category_id"]) != payload.vehicle_category_id
+        or (mb["city_id"] is not None and int(mb["city_id"]) != int(effective_city_id))
+    )
+    re_offered = False
+    new_status = status
+    if material_change and status == "PENDING_PARTNER_ACCEPTANCE":
+        await db.execute(
+            text(
+                "UPDATE cab_booking_assignments "
+                "SET closed_at = NOW(), close_reason = 'ADMIN_REASSIGN', "
+                "    rejected_at = NOW(), rejection_reason_code = 'ADMIN_REASSIGN', "
+                "    acceptance_deadline = NULL "
+                "WHERE cab_booking_id = :id AND closed_at IS NULL "
+                "  AND accepted_at IS NULL"
+            ),
+            {"id": cab_booking_id},
+        )
+        new_status = "PENDING_ASSIGNMENT"
+        re_offered = True
+
+    fare_cols = fare_columns(quote)
+    await db.execute(
+        text(
+            """
+        UPDATE cab_bookings SET
+            trip_type = :trip_type,
+            vehicle_category_id = :vcid,
+            pickup_location = :pickup_loc, pickup_latitude = :pickup_lat,
+            pickup_longitude = :pickup_lng,
+            drop_location = :drop_loc, drop_latitude = :drop_lat,
+            drop_longitude = :drop_lng,
+            pickup_datetime = :pickup_dt, return_datetime = :return_dt,
+            estimated_distance = :distance_km, estimated_amount = :total,
+            booking_status = :new_status,
+            updated_at = NOW(),
+            pricing_city_id = :pricing_city_id,
+            distance_source = :distance_source,
+            billing_distance_km = :billing_distance_km,
+            base_fare_amount = :base_fare_amount,
+            distance_charge_amount = :distance_charge_amount,
+            driver_allowance_amount = :driver_allowance_amount,
+            night_charge_amount = :night_charge_amount,
+            toll_amount = :toll_amount,
+            waiting_charge_amount = :waiting_charge_amount,
+            rate_snapshot = CAST(:rate_snapshot AS JSONB)
+        WHERE id = :id
+    """
+        ),
+        {
+            "id": cab_booking_id,
+            "trip_type": payload.trip_type,
+            "vcid": payload.vehicle_category_id,
+            "pickup_loc": payload.pickup_location,
+            "pickup_lat": payload.pickup_latitude,
+            "pickup_lng": payload.pickup_longitude,
+            "drop_loc": payload.drop_location,
+            "drop_lat": payload.drop_latitude,
+            "drop_lng": payload.drop_longitude,
+            "pickup_dt": payload.pickup_datetime,
+            "return_dt": payload.return_datetime,
+            "distance_km": quote.distance.km,
+            "total": quote.total,
+            "new_status": new_status,
+            **fare_cols,
+            "rate_snapshot": json.dumps(fare_cols["rate_snapshot"], default=str),
+        },
+    )
+    if re_offered:
+        # The offer this booking was sitting on is gone with the other ones.
+        await db.execute(
+            text(
+                "UPDATE cab_bookings SET pending_partner_id = NULL, "
+                "       acceptance_deadline = NULL WHERE id = :id"
+            ),
+            {"id": cab_booking_id},
+        )
+
+    # The master booking and the service link carry the fare the customer is
+    # billed, so they move with it — the same three writes a create makes.
+    await db.execute(
+        text(
+            "UPDATE master_bookings SET total_amount = :amount, "
+            "       journey_start_date = :jdate, city_id = :city_id, "
+            "       updated_at = NOW() "
+            "WHERE id = :mb_id"
+        ),
+        {
+            "amount": quote.total,
+            "jdate": payload.pickup_datetime.date(),
+            "city_id": effective_city_id,
+            "mb_id": mb["id"],
+        },
+    )
+    # `service_reference_id` is a polymorphic id — a hotel reservation and a cab
+    # booking can share a number — so the row is found through its master booking.
+    await db.execute(
+        text(
+            "UPDATE booking_services SET service_amount = :amount, "
+            "       service_status = :new_status "
+            "WHERE master_booking_id = :mb_id AND service_type = 'CAB' "
+            "  AND service_reference_id = :cb_id"
+        ),
+        {
+            "amount": quote.total,
+            "new_status": new_status,
+            "mb_id": mb["id"],
+            "cb_id": cab_booking_id,
+        },
+    )
+
+    await db.execute(
+        text(
+            "INSERT INTO booking_timelines "
+            "       (master_booking_id, event_type, event_description, "
+            "        event_timestamp, created_by) "
+            "VALUES (:mb_id, 'BOOKING_MODIFIED', :detail, NOW(), :by)"
+        ),
+        {
+            "mb_id": mb["id"],
+            "by": _timeline_actor(current_user),
+            "detail": _cab_amendment_note(cb, payload, quote, re_offered),
+        },
+    )
+
+    from app.modules.notification.services.booking_notifications import (
+        notify_booking_updated,
+    )
+
+    await notify_booking_updated(
+        db,
+        service_type="CAB",
+        master_booking_id=mb["id"],
+        service_id=cab_booking_id,
+        booking_number=cb["booking_number"],
+        service_status=new_status,
+        action="AMENDED",
+        payment_status=mb["payment_status"],
+        partner_ids=[cb["pending_partner_id"]] if cb["pending_partner_id"] else None,
+    )
+
+    # get_db auto-commits on success.
+
+    return CabBookingEditOut(
+        success=True,
+        master_booking_id=mb["id"],
+        booking_number=mb["booking_number"],
+        cab_booking_id=cab_booking_id,
+        cab_booking_number=cb["booking_number"],
+        distance_km=quote.distance.km,
+        distance_source=quote.distance.source,
+        billable_km=Decimal(str(quote.breakdown["billable_km"])),
+        old_amount=old_amount,
+        estimated_amount=quote.total,
+        coupon_discount=coupon_discount,
+        payable_amount=quote.total - coupon_discount,
+        re_offered=re_offered,
+        notes=quote.notes,
+        message="Cab booking amended successfully",
     )
 
 

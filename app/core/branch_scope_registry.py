@@ -186,6 +186,7 @@ DECLARED: dict[str, Kind] = {
     "POST /admin/trip-assist/start-trip": "scoped",
     "POST /admin/trip-assist/update-invoice-url": "scoped",
 
+    "PUT /admin/customer-care/cab-booking/{cab_booking_id}": "scoped",
     "PUT /admin/customer-care/hotel-booking/{reservation_id}": "scoped",
 
     # ── platform-wide on purpose — nothing to filter ──────────────────────────
