@@ -18,7 +18,6 @@ UNDECLARED_SCREENS = [
     "/api/v1/admin/hotels",
     "/api/v1/admin/partners",
     "/api/v1/admin/vehicles",
-    "/api/v1/admin/settlements",
     "/api/v1/admin/audit-logs",
     "/api/v1/admin/dashboard/expiring-documents",
 ]
@@ -82,6 +81,15 @@ def test_a_route_that_touches_every_branch_says_so(client_hq_admin) -> None:
     response = client_hq_admin.get(
         "/api/v1/admin/staff-work-hours?date_from=2026-01-01&date_to=2026-01-31"
     )
+    assert response.status_code == 403
+    assert response.json()["code"] == "BRANCH_SCOPE_PLATFORM_ONLY"
+
+
+def test_settlement_is_reviewed_as_master_admin_only(client_hq_admin) -> None:
+    """Settlements became a reviewed screen in the round that gave them a
+    statement ledger. No settlement query filters by branch, so a branch account
+    is refused by name rather than told the screen has not been reviewed."""
+    response = client_hq_admin.get("/api/v1/admin/settlements")
     assert response.status_code == 403
     assert response.json()["code"] == "BRANCH_SCOPE_PLATFORM_ONLY"
 

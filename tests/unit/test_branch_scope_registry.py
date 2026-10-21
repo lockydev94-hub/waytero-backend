@@ -112,7 +112,6 @@ def test_screens_not_reviewed_this_round_stay_undeclared() -> None:
         "GET /admin/hotels",
         "GET /admin/partners",
         "GET /admin/vehicles",
-        "GET /admin/settlements",
         "GET /admin/wallets/customers",
         "GET /admin/reports/bookings",
         "GET /admin/settings/api-integrations",
@@ -122,6 +121,20 @@ def test_screens_not_reviewed_this_round_stay_undeclared() -> None:
     ):
         assert key in live, key
         assert key not in DECLARED, key
+
+
+def test_settlement_is_reviewed_as_master_admin_only() -> None:
+    """The settlement module was declared in the round that gave it a statement
+    ledger. It is not on the punch list any more, and it is not open to a branch
+    account either: no settlement query filters by branch."""
+    for key in (
+        "GET /admin/settlements",
+        "GET /admin/settlements/statements",
+        "POST /admin/settlements/settle",
+        "POST /admin/settlements/statements/generate",
+        "PATCH /admin/settlements/statements/{settlement_id}/status",
+    ):
+        assert DECLARED.get(key) == "super_only", key
 
 
 def test_every_auth_admin_route_is_classified() -> None:
