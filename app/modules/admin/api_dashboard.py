@@ -1719,7 +1719,9 @@ async def mark_settlement_paid(
     ),
     db: AsyncSession = Depends(get_db),
 ):
-    ok = await AdminDashboardService.update_settlement_status(db, settlement_id, "PAID")
+    ok = await AdminDashboardService.update_settlement_status(
+        db, settlement_id, "PAID", actor_id=current_user.get("sub")
+    )
     if not ok:
         raise HTTPException(status_code=404, detail="Settlement not found")
     return AdminActionResponse(message="Settlement marked as PAID")
@@ -1739,7 +1741,7 @@ async def mark_settlement_processing(
     db: AsyncSession = Depends(get_db),
 ):
     ok = await AdminDashboardService.update_settlement_status(
-        db, settlement_id, "PROCESSING"
+        db, settlement_id, "PROCESSING", actor_id=current_user.get("sub")
     )
     if not ok:
         raise HTTPException(status_code=404, detail="Settlement not found")

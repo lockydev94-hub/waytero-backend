@@ -37,7 +37,7 @@
 # Doc Ref: BRD Part 6 §129, §137-143, §147
 # ============================================================
 
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 import math
@@ -2613,3 +2613,202 @@ async def list_handover_reconciliation(
             }
         )
     return {"items": items, "total": len(items)}
+
+
+# ════════════════════════════════════════════════════════════════
+# PERIOD SETTLEMENT STATEMENTS
+# Doc Ref: BRD Part 6 §147–149, DB Schema Part 7 §22, migration 0086.
+#
+# The per-booking settle above moves the money. A statement is the document
+# finance pays against: every cab booking that reached SETTLED for one partner
+# inside one period, summed from each booking's frozen close figures. Generation
+# and every status move are master-admin operations — settlement reaches across
+# every branch. See services/settlement_statements.py.
+# ════════════════════════════════════════════════════════════════
+
+
+class GenerateStatementRequest(BaseModel):
+    partner_id: int
+    start_date: date
+    end_date: date
+    settlement_type: str = "CAB"
+
+
+class StatementStatusRequest(BaseModel):
+    status: str
+    reason: Optional[str] = None
+
+
+@router.post("/statements/generate", tags=["Settlement Statements"])
+async def generate_settlement_statement(
+    payload: GenerateStatementRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_roles("SUPER_ADMIN")),
+):
+    """Aggregate a partner's settled, not-yet-statemented cab bookings into one
+    statement. The period unique index refuses a second statement for the same
+    partner and period."""
+    from app.modules.admin.services import settlement_statements as statements
+
+    return await statements.generate_statement(
+        db,
+        partner_id=payload.partner_id,
+        start_date=payload.start_date,
+        end_date=payload.end_date,
+        settlement_type=payload.settlement_type,
+        actor_id=current_user.get("sub"),
+    )
+
+
+@router.get("/statements", tags=["Settlement Statements"])
+async def list_settlement_statements(
+    status: Optional[str] = Query(None, description="Settlement status filter"),
+    partner_id: Optional[int] = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(
+        require_roles("SUPER_ADMIN", "FINANCE_MANAGER", "ADMIN")
+    ),
+):
+    where = []
+    params: dict = {"limit": page_size, "offset": (page - 1) * page_size}
+    if status:
+        where.append("s.settlement_status = :status")
+        params["status"] = status.strip().upper()
+    if partner_id:
+        where.append("s.partner_id = :pid")
+        params["pid"] = partner_id
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    total = (
+        await db.execute(text(f"SELECT COUNT(*) FROM settlements s {where_sql}"), params)
+    ).scalar() or 0
+    rows = (
+        (
+            await db.execute(
+                text(
+                    f"""
+                    SELECT s.id, s.settlement_number, s.partner_id,
+                           p.business_name AS partner_name,
+                           s.settlement_type, s.start_date, s.end_date,
+                           s.gross_amount, s.commission_amount, s.gst_amount,
+                           s.net_payable_amount, s.settlement_status,
+                           s.settled_at, s.created_at,
+                           (SELECT COUNT(*) FROM settlement_items si
+                             WHERE si.settlement_id = s.id) AS booking_count
+                      FROM settlements s
+                      LEFT JOIN partners p ON p.id = s.partner_id
+                      {where_sql}
+                     ORDER BY s.created_at DESC, s.id DESC
+                     LIMIT :limit OFFSET :offset
+                    """
+                ),
+                params,
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return {
+        "items": [
+            {
+                **dict(row),
+                "start_date": row["start_date"].isoformat() if row["start_date"] else None,
+                "end_date": row["end_date"].isoformat() if row["end_date"] else None,
+                "settled_at": row["settled_at"].isoformat() if row["settled_at"] else None,
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "gross_amount": float(row["gross_amount"] or 0),
+                "commission_amount": float(row["commission_amount"] or 0),
+                "gst_amount": float(row["gst_amount"] or 0),
+                "net_payable_amount": float(row["net_payable_amount"] or 0),
+            }
+            for row in rows
+        ],
+        "total": int(total),
+        "page": page,
+        "page_size": page_size,
+    }
+
+
+@router.get("/statements/{settlement_id}", tags=["Settlement Statements"])
+async def get_settlement_statement(
+    settlement_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(
+        require_roles("SUPER_ADMIN", "FINANCE_MANAGER", "ADMIN")
+    ),
+):
+    from app.modules.admin.services import settlement_statements as statements
+
+    header = (
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT s.*, p.business_name AS partner_name,
+                           p.partner_code
+                      FROM settlements s
+                      LEFT JOIN partners p ON p.id = s.partner_id
+                     WHERE s.id = :id
+                    """
+                ),
+                {"id": settlement_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if header is None:
+        raise HTTPException(404, "Settlement statement not found")
+    items = (
+        (
+            await db.execute(
+                text(
+                    """
+                    SELECT si.id, si.booking_id, si.booking_type,
+                           cb.booking_number, si.gross_amount,
+                           si.commission_amount, si.net_amount,
+                           si.billing_distance_km, si.coupon_discount,
+                           si.commission_snapshot
+                      FROM settlement_items si
+                      LEFT JOIN cab_bookings cb
+                             ON si.booking_type = 'CAB' AND cb.id = si.booking_id
+                     WHERE si.settlement_id = :id
+                     ORDER BY si.id
+                    """
+                ),
+                {"id": settlement_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    detail = dict(header)
+    for key in ("start_date", "end_date"):
+        detail[key] = detail[key].isoformat() if detail[key] else None
+    for key in ("settled_at", "created_at"):
+        detail[key] = detail[key].isoformat() if detail[key] else None
+    detail["next_statuses"] = statements.allowed_next(detail["settlement_status"])
+    detail["items"] = [dict(row) for row in items]
+    return detail
+
+
+@router.patch("/statements/{settlement_id}/status", tags=["Settlement Statements"])
+async def move_settlement_statement(
+    settlement_id: int,
+    payload: StatementStatusRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(require_roles("SUPER_ADMIN")),
+):
+    """One place to approve, reject, pay, fail, retry or close a statement —
+    the documented flow is enforced, not assumed."""
+    from app.modules.admin.services import settlement_statements as statements
+
+    return await statements.transition_statement(
+        db,
+        settlement_id=settlement_id,
+        to_status=payload.status,
+        actor_id=current_user.get("sub"),
+        reason=payload.reason,
+    )

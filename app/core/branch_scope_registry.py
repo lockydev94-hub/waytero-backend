@@ -223,6 +223,36 @@ DECLARED: dict[str, Kind] = {
     "GET /admin/staff-work-hours": "super_only",
 
     "POST /admin/bookings/backfill-hotel-payment-sync": "super_only",
+
+    # ── settlement: money across every branch, master admin only ──────────────
+    # Per-booking settle, the period statement and its lifecycle reach partners
+    # in every branch, and no settlement query filters by branch yet. Claiming
+    # "scoped" would be a lie; "global" would hand a branch manager another
+    # branch's payouts. Until branch-filtered settlement SQL exists, the master
+    # admin performs settlement (the owner's rule: the super admin settles).
+    "GET /admin/reports/settlements": "super_only",
+
+    "GET /admin/settlements": "super_only",
+    "GET /admin/settlements/booking": "super_only",
+    "GET /admin/settlements/coupon-disbursements": "super_only",
+    "GET /admin/settlements/handover-reconciliation": "super_only",
+    "GET /admin/settlements/hotel/booking": "super_only",
+    "GET /admin/settlements/hotel/list": "super_only",
+    "GET /admin/settlements/list": "super_only",
+    "GET /admin/settlements/statements": "super_only",
+    "GET /admin/settlements/statements/{settlement_id}": "super_only",
+    "GET /admin/settlements/tour/booking": "super_only",
+    "GET /admin/settlements/tour/list": "super_only",
+
+    "PATCH /admin/settlements/statements/{settlement_id}/status": "super_only",
+    "PATCH /admin/settlements/{settlement_id}/mark-paid": "super_only",
+    "PATCH /admin/settlements/{settlement_id}/mark-processing": "super_only",
+
+    "POST /admin/settlements/disburse-coupon": "super_only",
+    "POST /admin/settlements/hotel/settle": "super_only",
+    "POST /admin/settlements/settle": "super_only",
+    "POST /admin/settlements/statements/generate": "super_only",
+    "POST /admin/settlements/tour/settle": "super_only",
 }
 
 

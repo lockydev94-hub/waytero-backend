@@ -974,17 +974,27 @@ class AdminDashboardService:
 
     @staticmethod
     async def update_settlement_status(
-        db: AsyncSession, settlement_id: int, status: str
+        db: AsyncSession,
+        settlement_id: int,
+        status: str,
+        actor_id: Optional[str] = None,
     ) -> bool:
-        extra = ", paid_at = NOW()" if status == "PAID" else ""
-        r = await db.execute(
-            text(
-                f"UPDATE settlements SET status = :status{extra}, updated_at = NOW() WHERE id = :id"
-            ),
-            {"status": status, "id": settlement_id},
+        """Move a statement along the documented settlement flow.
+
+        This used to write `SET status`, `paid_at` and `updated_at` — three
+        columns `settlements` does not have (`settlement_status` and `settled_at`
+        are the real ones, and there is no `updated_at`), so every call failed at
+        the database. It also committed inside a service although `get_db`
+        auto-commits. The transition rules now live in one place,
+        `settlement_statements.transition_statement`, so the two dashboard
+        endpoints and the new status route cannot disagree about them.
+        """
+        from app.modules.admin.services import settlement_statements as statements
+
+        await statements.transition_statement(
+            db, settlement_id=settlement_id, to_status=status, actor_id=actor_id
         )
-        await db.commit()
-        return r.rowcount > 0
+        return True
 
     # ── §22 Notifications Broadcast ──────────────────────────────────────────
     @staticmethod
