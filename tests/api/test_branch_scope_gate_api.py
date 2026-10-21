@@ -94,6 +94,28 @@ def test_settlement_is_reviewed_as_master_admin_only(client_hq_admin) -> None:
     assert response.json()["code"] == "BRANCH_SCOPE_PLATFORM_ONLY"
 
 
+def test_a_branch_office_can_still_read_master_data(client_cuttack_cco) -> None:
+    """The city picker behind the booking screens lives under /admin/settings.
+    Closing the whole module to branch accounts would have taken the picker
+    with it, so reads are declared platform-wide and only writes are refused."""
+    response = client_cuttack_cco.get("/api/v1/admin/settings/master/cities")
+    assert response.status_code == 200, response.text[:200]
+
+
+def test_a_branch_manager_cannot_change_the_platform_configuration(
+    client_cuttack_admin,
+) -> None:
+    """Configuration writes are the master admin's. The branch gate answers by
+    name before the endpoint runs, the same way it answers a cross-branch
+    timesheet — the Settings page's role dependency is not the only guard."""
+    response = client_cuttack_admin.put(
+        "/api/v1/admin/settings/configurations/GST_ENABLED",
+        json={"config_value": "true"},
+    )
+    assert response.status_code == 403
+    assert response.json()["code"] == "BRANCH_SCOPE_PLATFORM_ONLY"
+
+
 def test_the_punch_list_is_readable_only_by_the_master_admin(client_hq_admin) -> None:
     """Declared global on purpose — a manager opening it would be refused by the
     role dependency below it, not by the gate, and the difference is what tells

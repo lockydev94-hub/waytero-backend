@@ -201,6 +201,46 @@ DECLARED: dict[str, Kind] = {
 
     "GET /admin/branch-scope/audit": "global",
 
+    # ── settings: one price list, one city register, for the whole platform ──
+    # Nothing under /admin/settings carries a branch column, so a read has
+    # nothing to filter: the city, category and service pickers behind the
+    # booking screens, the GST flag, the effective price rule. Writes are a
+    # different question and are declared super_only below.
+    "GET /admin/settings/api-integrations": "global",
+    "GET /admin/settings/api-integrations/{integration_id}": "global",
+    "GET /admin/settings/app-versions": "global",
+    "GET /admin/settings/blog": "global",
+    "GET /admin/settings/blog/tags": "global",
+    "GET /admin/settings/blog/{post_id}": "global",
+    "GET /admin/settings/cms/footer": "global",
+    "GET /admin/settings/cms/header": "global",
+    "GET /admin/settings/cms/picker-items": "global",
+    "GET /admin/settings/cms/sections": "global",
+    "GET /admin/settings/cms/sections/{section_key}/variants": "global",
+    "GET /admin/settings/cms/variants/{variant_id}": "global",
+    "GET /admin/settings/commission-groups": "global",
+    "GET /admin/settings/commission-groups/{group_id}": "global",
+    "GET /admin/settings/configurations": "global",
+    "GET /admin/settings/configurations/{key}": "global",
+    "GET /admin/settings/default-pricing-rules": "global",
+    "GET /admin/settings/landing-pages": "global",
+    "GET /admin/settings/landing-pages/reserved-slugs": "global",
+    "GET /admin/settings/landing-pages/slot-specs": "global",
+    "GET /admin/settings/landing-pages/specs": "global",
+    "GET /admin/settings/landing-pages/suggestions": "global",
+    "GET /admin/settings/landing-pages/{page_id}": "global",
+    "GET /admin/settings/landing-pages/{page_id}/preview": "global",
+    "GET /admin/settings/master/cities": "global",
+    "GET /admin/settings/master/places": "global",
+    "GET /admin/settings/master/service-types": "global",
+    "GET /admin/settings/master/states": "global",
+    "GET /admin/settings/master/vehicle-categories": "global",
+    "GET /admin/settings/media-library": "global",
+    "GET /admin/settings/notification-templates": "global",
+    "GET /admin/settings/notification-templates/{template_id}": "global",
+    "GET /admin/settings/pricing-rules": "global",
+    "GET /admin/settings/pricing-rules/effective": "global",
+
     "GET /auth/admin/session-config": "global",
     "GET /auth/admin/work-hours": "global",
 
@@ -253,6 +293,68 @@ DECLARED: dict[str, Kind] = {
     "POST /admin/settlements/settle": "super_only",
     "POST /admin/settlements/statements/generate": "super_only",
     "POST /admin/settlements/tour/settle": "super_only",
+
+    # ── settings writes: the master admin's price list and configuration ─────
+    # The portal's nav matrix already shows Settings to SUPER_ADMIN alone; these
+    # declarations make the API say the same. A pricing rule edited here
+    # re-prices every office's future quotes and a commission group re-splits
+    # every partner's trip — platform decisions, not branch ones. Reads stay
+    # global above, because the booking screens need the pickers.
+    "DELETE /admin/settings/api-integrations/{integration_id}": "super_only",
+    "DELETE /admin/settings/app-versions/{version_id}": "super_only",
+    "DELETE /admin/settings/blog/{post_id}": "super_only",
+    "DELETE /admin/settings/cms/variants/{variant_id}": "super_only",
+    "DELETE /admin/settings/commission-groups/{group_id}": "super_only",
+    "DELETE /admin/settings/commission-rules/{rule_id}": "super_only",
+    "DELETE /admin/settings/configurations/{key}": "super_only",
+    "DELETE /admin/settings/landing-pages/{page_id}": "super_only",
+    "DELETE /admin/settings/master/cities/{city_id}": "super_only",
+    "DELETE /admin/settings/master/places/{place_id}": "super_only",
+    "DELETE /admin/settings/master/service-types/{st_id}": "super_only",
+    "DELETE /admin/settings/master/vehicle-categories/{cat_id}": "super_only",
+    "DELETE /admin/settings/media-library/{public_id:path}": "super_only",
+    "DELETE /admin/settings/notification-templates/{template_id}": "super_only",
+    "DELETE /admin/settings/pricing-rules/{rule_id}": "super_only",
+
+    "PATCH /admin/settings/api-integrations/{integration_id}": "super_only",
+    "PATCH /admin/settings/app-versions/{version_id}": "super_only",
+    "PATCH /admin/settings/blog/{post_id}": "super_only",
+    "PATCH /admin/settings/cms/footer": "super_only",
+    "PATCH /admin/settings/cms/header": "super_only",
+    "PATCH /admin/settings/cms/sections/{section_key}": "super_only",
+    "PATCH /admin/settings/cms/variants/{variant_id}": "super_only",
+    "PATCH /admin/settings/commission-groups/{group_id}": "super_only",
+    "PATCH /admin/settings/commission-rules/{rule_id}": "super_only",
+    "PATCH /admin/settings/default-pricing-rules/{rule_id}": "super_only",
+    "PATCH /admin/settings/landing-pages/{page_id}": "super_only",
+    "PATCH /admin/settings/master/cities/{city_id}": "super_only",
+    "PATCH /admin/settings/master/places/{place_id}": "super_only",
+    "PATCH /admin/settings/master/service-types/{st_id}": "super_only",
+    "PATCH /admin/settings/master/vehicle-categories/{cat_id}": "super_only",
+    "PATCH /admin/settings/notification-templates/{template_id}": "super_only",
+    "PATCH /admin/settings/pricing-rules/{rule_id}": "super_only",
+
+    "POST /admin/settings/api-integrations": "super_only",
+    "POST /admin/settings/app-versions": "super_only",
+    "POST /admin/settings/blog": "super_only",
+    "POST /admin/settings/blog/{post_id}/publish": "super_only",
+    "POST /admin/settings/cms/sections/{section_key}/variants": "super_only",
+    "POST /admin/settings/cms/variants/{variant_id}/activate": "super_only",
+    "POST /admin/settings/commission-groups": "super_only",
+    "POST /admin/settings/commission-groups/{group_id}/rules": "super_only",
+    "POST /admin/settings/landing-pages": "super_only",
+    "POST /admin/settings/landing-pages/sync": "super_only",
+    "POST /admin/settings/landing-pages/{page_id}/publish": "super_only",
+    "POST /admin/settings/master/cities": "super_only",
+    "POST /admin/settings/master/cities/geocode": "super_only",
+    "POST /admin/settings/master/places": "super_only",
+    "POST /admin/settings/master/service-types": "super_only",
+    "POST /admin/settings/master/vehicle-categories": "super_only",
+    "POST /admin/settings/notification-templates": "super_only",
+    "POST /admin/settings/pricing-rules": "super_only",
+    "POST /admin/settings/upload-media": "super_only",
+
+    "PUT /admin/settings/configurations/{key}": "super_only",
 }
 
 

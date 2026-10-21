@@ -114,7 +114,6 @@ def test_screens_not_reviewed_this_round_stay_undeclared() -> None:
         "GET /admin/vehicles",
         "GET /admin/wallets/customers",
         "GET /admin/reports/bookings",
-        "GET /admin/settings/api-integrations",
         "GET /admin/audit-logs",
         "GET /admin/tours/bookings",
         "GET /admin/dashboard/expiring-documents",
@@ -135,6 +134,22 @@ def test_settlement_is_reviewed_as_master_admin_only() -> None:
         "PATCH /admin/settlements/statements/{settlement_id}/status",
     ):
         assert DECLARED.get(key) == "super_only", key
+
+
+def test_the_settings_surface_is_classified_whole() -> None:
+    """Every /admin/settings route is reviewed: reads platform-wide (the booking
+    screens' pickers live here), writes the master admin's. A route added here
+    next month starts undeclared, which is the point."""
+    live = [
+        key
+        for key in _live_keys()
+        if key.split(" ", 1)[1].startswith("/admin/settings/")
+    ]
+    assert live
+    assert [key for key in live if key not in DECLARED] == []
+    for key in live:
+        expected = "global" if key.startswith("GET ") else "super_only"
+        assert DECLARED[key] == expected, key
 
 
 def test_every_auth_admin_route_is_classified() -> None:
