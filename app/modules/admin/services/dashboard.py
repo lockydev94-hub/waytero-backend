@@ -614,6 +614,7 @@ class AdminDashboardService:
         db: AsyncSession,
         status: Optional[str] = None,
         partner_type: Optional[str] = None,
+        search: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> Dict[str, Any]:
@@ -627,6 +628,14 @@ class AdminDashboardService:
         if partner_type:
             where_clauses.append("partner_type = :partner_type")
             params["partner_type"] = partner_type
+
+        if search and search.strip():
+            where_clauses.append(
+                "(business_name ILIKE :search OR owner_name ILIKE :search "
+                "OR partner_code ILIKE :search OR mobile ILIKE :search "
+                "OR email ILIKE :search)"
+            )
+            params["search"] = f"%{search.strip()}%"
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
@@ -678,6 +687,7 @@ class AdminDashboardService:
     async def list_drivers(
         db: AsyncSession,
         status: Optional[str] = None,
+        search: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> Dict[str, Any]:
@@ -687,6 +697,13 @@ class AdminDashboardService:
         if status:
             where_clauses.append("status = :status")
             params["status"] = status
+
+        if search and search.strip():
+            where_clauses.append(
+                "(full_name ILIKE :search OR mobile ILIKE :search "
+                "OR driver_code ILIKE :search OR license_number ILIKE :search)"
+            )
+            params["search"] = f"%{search.strip()}%"
 
         where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
         total = (
@@ -727,6 +744,7 @@ class AdminDashboardService:
     async def list_vehicles(
         db: AsyncSession,
         status: Optional[str] = None,
+        search: Optional[str] = None,
         page: int = 1,
         page_size: int = 20,
     ) -> Dict[str, Any]:
@@ -737,10 +755,23 @@ class AdminDashboardService:
             where_clauses.append("v.status = :status")
             params["status"] = status
 
+        if search and search.strip():
+            where_clauses.append(
+                "(v.registration_number ILIKE :search OR v.vehicle_code ILIKE :search "
+                "OR v.vehicle_brand ILIKE :search OR v.vehicle_model ILIKE :search "
+                "OR p.business_name ILIKE :search OR p.owner_name ILIKE :search)"
+            )
+            params["search"] = f"%{search.strip()}%"
+
         where_sql = "WHERE " + " AND ".join(where_clauses)
         total = (
             await db.execute(
-                text(f"SELECT COUNT(*) FROM vehicles v {where_sql}"), params
+                text(
+                    "SELECT COUNT(*) FROM vehicles v "
+                    "LEFT JOIN partners p ON p.id = v.partner_id "
+                    f"{where_sql}"
+                ),
+                params,
             )
         ).scalar() or 0
         rows = await db.execute(
@@ -1187,6 +1218,7 @@ class AdminDashboardService:
         action_type: Optional[str] = None,
         module: Optional[str] = None,
         entity_name: Optional[str] = None,
+        q: Optional[str] = None,
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         page: int = 1,
@@ -1207,6 +1239,12 @@ class AdminDashboardService:
         if entity_name:
             where_clauses.append("entity_name = :entity_name")
             params["entity_name"] = entity_name
+        if q and q.strip():
+            where_clauses.append(
+                "(module_name ILIKE :q OR action_type ILIKE :q "
+                "OR entity_name ILIKE :q)"
+            )
+            params["q"] = f"%{q.strip()}%"
         if date_from is not None:
             where_clauses.append("created_at >= :date_from")
             params["date_from"] = date_from

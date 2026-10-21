@@ -430,12 +430,20 @@ async def list_partners(
         description="PENDING | UNDER_REVIEW | DOCUMENT_PENDING | APPROVED | ACTIVE | SUSPENDED | BLOCKED",
     ),
     partner_type: Optional[str] = Query(None, description="INDIVIDUAL | COMPANY"),
+    search: Optional[str] = Query(
+        None, description="Name, partner code, mobile or email"
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
 ):
     result = await AdminDashboardService.list_partners(
-        db, status=status, partner_type=partner_type, page=page, page_size=page_size
+        db,
+        status=status,
+        partner_type=partner_type,
+        search=search,
+        page=page,
+        page_size=page_size,
     )
     from app.modules.admin.schemas.dashboard import AdminPartnerOut
 
@@ -1234,12 +1242,15 @@ async def list_drivers(
     status: Optional[str] = Query(
         None, description="ACTIVE | PENDING | SUSPENDED | BLOCKED"
     ),
+    search: Optional[str] = Query(
+        None, description="Name, driver code, mobile or licence number"
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
     result = await AdminDashboardService.list_drivers(
-        db, status=status, page=page, page_size=page_size
+        db, status=status, search=search, page=page, page_size=page_size
     )
     from app.modules.admin.schemas.dashboard import AdminDriverOut
 
@@ -1625,12 +1636,15 @@ async def list_vehicles(
     status: Optional[str] = Query(
         None, description="ACTIVE | PENDING | SUSPENDED | REJECTED"
     ),
+    search: Optional[str] = Query(
+        None, description="Registration, vehicle code, make/model or partner name"
+    ),
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
 ):
     result = await AdminDashboardService.list_vehicles(
-        db, status=status, page=page, page_size=page_size
+        db, status=status, search=search, page=page, page_size=page_size
     )
     from app.modules.admin.schemas.dashboard import AdminVehicleOut
 
@@ -1943,6 +1957,9 @@ async def list_audit_logs(
     ),
     module: Optional[str] = Query(None, description="Partial match on module_name"),
     entity_name: Optional[str] = Query(None, description="Exact match on entity_name"),
+    q: Optional[str] = Query(
+        None, description="Free-text search across module_name, action_type and entity_name"
+    ),
     date_from: Optional[_datetime] = Query(
         None, description="Inclusive lower bound on created_at (ISO 8601)"
     ),
@@ -1960,6 +1977,7 @@ async def list_audit_logs(
         action_type=action_type,
         module=module,
         entity_name=entity_name,
+        q=q,
         date_from=date_from,
         date_to=date_to,
         page=page,

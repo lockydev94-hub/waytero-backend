@@ -717,7 +717,9 @@ async def create_hotel(
 )
 async def commission_audit(
     source_filter: Optional[str] = Query(
-        None, description="HOTEL_OVERRIDE | CITY_RULE | GLOBAL_RULE | SYSTEM_DEFAULT"
+        None,
+        alias="source",
+        description="HOTEL_OVERRIDE | CITY_RULE | GLOBAL_RULE | SYSTEM_DEFAULT",
     ),
     city_id: Optional[int] = Query(None),
     search: Optional[str] = Query(None),
@@ -743,6 +745,38 @@ async def commission_audit(
             "OR p.business_name ILIKE :q OR p.partner_code ILIKE :q)"
         )
         params["q"] = f"%{search.strip()}%"
+    # The same precedence resolve_hotel_commission applies (override → city
+    # rule → global rule → platform default), expressed once here so the
+    # source filter narrows the whole set before LIMIT. Deciding it per row
+    # after paging made the count and every page after the first lie.
+    source_expr = """
+        CASE
+          WHEN EXISTS (
+            SELECT 1 FROM hotel_commission_configs hc
+            WHERE hc.hotel_id = h.id AND hc.is_active = TRUE
+              AND (hc.effective_from IS NULL OR hc.effective_from <= CURRENT_DATE)
+              AND (hc.effective_to IS NULL OR hc.effective_to >= CURRENT_DATE)
+          ) THEN 'HOTEL_OVERRIDE'
+          WHEN EXISTS (
+            SELECT 1 FROM commission_rules cr
+            WHERE cr.service_type = 'HOTEL' AND cr.is_active = TRUE
+              AND cr.city_id = h.city_id
+              AND (cr.effective_from IS NULL OR cr.effective_from <= CURRENT_DATE)
+              AND (cr.effective_to IS NULL OR cr.effective_to >= CURRENT_DATE)
+          ) THEN 'CITY_RULE'
+          WHEN EXISTS (
+            SELECT 1 FROM commission_rules cr
+            WHERE cr.service_type = 'HOTEL' AND cr.is_active = TRUE
+              AND cr.city_id IS NULL
+              AND (cr.effective_from IS NULL OR cr.effective_from <= CURRENT_DATE)
+              AND (cr.effective_to IS NULL OR cr.effective_to >= CURRENT_DATE)
+          ) THEN 'GLOBAL_RULE'
+          ELSE 'SYSTEM_DEFAULT'
+        END
+    """
+    if source_filter:
+        where.append(f"({source_expr}) = :source_filter")
+        params["source_filter"] = source_filter.upper()
     where_clause = " AND ".join(where)
 
     # Get the page first, then resolve commission per hotel (the resolver
@@ -773,14 +807,13 @@ async def commission_audit(
     hotel_service = HotelService(db)
     for r in hotel_rows:
         hid = int(r["id"])
+        resolved: dict[str, Any] = {}
         try:
             resolved = await hotel_service.get_commission(hid)
             source = (resolved.get("resolved") or {}).get("source")
         except Exception:
             source = None
-        if source_filter and source != source_filter:
-            continue
-        override = resolved.get("override") if "resolved" in resolved else None
+        override = resolved.get("override")
         items.append(
             {
                 "hotel_id": hid,

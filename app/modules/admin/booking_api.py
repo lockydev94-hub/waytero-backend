@@ -1150,6 +1150,10 @@ async def list_bookings(
     journey_date: Optional[str] = Query(
         None, description="Filter by journey_start_date YYYY-MM-DD"
     ),
+    sort_by: Optional[str] = Query(
+        None, description="created_at (default) | journey_start_date | total_amount"
+    ),
+    sort_dir: Optional[str] = Query(None, description="asc | desc (default desc)"),
     db: AsyncSession = Depends(get_db),
     scope: BranchScope = Depends(get_branch_scope),
 ):
@@ -1215,10 +1219,23 @@ async def list_bookings(
         await db.execute(select(func.count()).select_from(q.subquery()))
     ).scalar() or 0
     offset = (page - 1) * page_size
+    # Same whitelist convention as the hotel list: an unknown column falls back
+    # to newest-first rather than erroring, and direction defaults to desc.
+    sortable = {
+        "created_at": MasterBooking.created_at,
+        "journey_start_date": MasterBooking.journey_start_date,
+        "total_amount": MasterBooking.total_amount,
+    }
+    sort_column = sortable.get((sort_by or "").lower(), MasterBooking.created_at)
+    sort_order = (
+        sort_column.desc()
+        if (sort_dir or "desc").lower() != "asc"
+        else sort_column.asc()
+    )
     rows = (
         (
             await db.execute(
-                q.order_by(desc(MasterBooking.created_at))
+                q.order_by(sort_order)
                 .offset(offset)
                 .limit(page_size)
             )
