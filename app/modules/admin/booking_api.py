@@ -266,6 +266,13 @@ class CabBookingOut(BaseModel):
     pickup_location: Optional[str]
     drop_location: Optional[str]
     pickup_datetime: Optional[datetime]
+    # The amend dialog re-sends these untouched fields so re-pricing the trip
+    # does not quietly drop the return leg or the pinned coordinates.
+    return_datetime: Optional[datetime] = None
+    pickup_latitude: Optional[float] = None
+    pickup_longitude: Optional[float] = None
+    drop_latitude: Optional[float] = None
+    drop_longitude: Optional[float] = None
     estimated_distance: Optional[float]
     estimated_amount: Optional[float]
     final_amount: Optional[float]
@@ -781,6 +788,19 @@ async def _build_cab_out(cb: CabBooking, db: AsyncSession) -> CabBookingOut:
         pickup_location=cb.pickup_location,
         drop_location=cb.drop_location,
         pickup_datetime=cb.pickup_datetime,
+        return_datetime=cb.return_datetime,
+        pickup_latitude=(
+            float(cb.pickup_latitude) if cb.pickup_latitude is not None else None
+        ),
+        pickup_longitude=(
+            float(cb.pickup_longitude) if cb.pickup_longitude is not None else None
+        ),
+        drop_latitude=(
+            float(cb.drop_latitude) if cb.drop_latitude is not None else None
+        ),
+        drop_longitude=(
+            float(cb.drop_longitude) if cb.drop_longitude is not None else None
+        ),
         estimated_distance=(
             float(cb.estimated_distance) if cb.estimated_distance else None
         ),
