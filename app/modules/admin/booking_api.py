@@ -297,6 +297,11 @@ class CabBookingOut(BaseModel):
     acceptance_deadline: Optional[datetime] = None
     acceptance_status: Optional[str] = None
     partner_responded_at: Optional[datetime] = None
+    # Coupon + invoice snapshot (migration 0020/0035). The admin desk must be
+    # able to see what the customer saved and download the tax document.
+    coupon_code: Optional[str] = None
+    coupon_discount: Optional[float] = None
+    invoice_number: Optional[str] = None
     # Offer attribution (migration 0077) — badge on booking records.
     offer_id: Optional[int] = None
     offer_title: Optional[str] = None
@@ -822,6 +827,11 @@ async def _build_cab_out(cb: CabBooking, db: AsyncSession) -> CabBookingOut:
         acceptance_deadline=cb.acceptance_deadline,
         acceptance_status=acceptance_status,
         partner_responded_at=cb.partner_responded_at,
+        coupon_code=cb.coupon_code,
+        coupon_discount=(
+            float(cb.coupon_discount) if cb.coupon_discount is not None else None
+        ),
+        invoice_number=cb.invoice_number,
         offer_id=ob[0] if ob else None,
         offer_title=ob[1] if ob else None,
         offer_slug=ob[2] if ob else None,
@@ -1076,6 +1086,21 @@ async def edit_cab_details(
             f"Invalid trip_type '{payload.trip_type}'. Valid: {', '.join(valid_trip_types)}",
         )
 
+    # Moving a booking into a product the admin switched off is a new sale of
+    # that product. Editing an existing disabled-type booking stays allowed so
+    # operations can still correct a trip that was booked before the switch.
+    if payload.trip_type is not None:
+        from app.modules.booking.services.cab_availability import (
+            cab_booking_disabled_message,
+            is_cab_trip_type_enabled,
+        )
+
+        new_type = payload.trip_type.upper()
+        if new_type != (
+            cb.trip_type or ""
+        ).upper() and not await is_cab_trip_type_enabled(db, new_type):
+            raise HTTPException(400, cab_booking_disabled_message(new_type))
+
     # Track changes for timeline
     changes = []
 
@@ -1233,13 +1258,7 @@ async def list_bookings(
         else sort_column.asc()
     )
     rows = (
-        (
-            await db.execute(
-                q.order_by(sort_order)
-                .offset(offset)
-                .limit(page_size)
-            )
-        )
+        (await db.execute(q.order_by(sort_order).offset(offset).limit(page_size)))
         .scalars()
         .all()
     )
@@ -1390,7 +1409,9 @@ async def booking_stats(
             stmt, MasterBooking.city_id, scope, allow_unassigned=False
         )
 
-    total = (await db.execute(_scoped(select(func.count(MasterBooking.id))))).scalar() or 0
+    total = (
+        await db.execute(_scoped(select(func.count(MasterBooking.id))))
+    ).scalar() or 0
     today_count = (
         await db.execute(
             _scoped(
@@ -1870,7 +1891,7 @@ async def _count_partner_free_cabs(
                 FROM vehicles v
                 WHERE v.partner_id = :pid
                   AND v.status IN ('APPROVED', 'ACTIVE')
-                  AND (:cat_id IS NULL OR v.vehicle_category_id = :cat_id)
+                  AND (CAST(:cat_id AS BIGINT) IS NULL OR v.vehicle_category_id = :cat_id)
                   AND NOT EXISTS (
                         SELECT 1
                         FROM cab_booking_assignments cba2

@@ -203,6 +203,7 @@ async def record_final_payment(
     received_by: Optional[str],
     collected_by_user_id: Optional[Any] = None,
     collected_by_role: Optional[str] = None,
+    reference_note: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """The ledger line for the balance collected at the end of a trip.
 
@@ -241,6 +242,7 @@ async def record_final_payment(
         received_by=received_by,
         collected_by_user_id=collected_by_user_id,
         collected_by_role=collected_by_role,
+        reference_note=reference_note,
     )
     await derive_master_payment_status(db, master_booking_id)
     return result
@@ -270,8 +272,10 @@ async def void_advance_payment(
                AND voided_at IS NULL
             """
         ),
-        {"reason": (reason or "").strip()[:255] or "Advance receipt voided",
-         "adv": advance_payment_id},
+        {
+            "reason": (reason or "").strip()[:255] or "Advance receipt voided",
+            "adv": advance_payment_id,
+        },
     )
     await derive_master_payment_status(db, master_booking_id)
     return r.rowcount > 0
@@ -293,9 +297,10 @@ async def mark_payment_refunded(
     if amount <= ZERO:
         return None
     row = (
-        await db.execute(
-            text(
-                """
+        (
+            await db.execute(
+                text(
+                    """
                 SELECT id, refunded_amount, refunded_amount + :amt AS new_refunded,
                        amount
                   FROM payments
@@ -303,10 +308,13 @@ async def mark_payment_refunded(
                    AND voided_at IS NULL
                  FOR UPDATE
                 """
-            ),
-            {"pid": payment_id, "amt": amount},
+                ),
+                {"pid": payment_id, "amt": amount},
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     if row is None:
         return None
     if money(row["new_refunded"]) > money(row["amount"]):
@@ -329,8 +337,11 @@ async def mark_payment_refunded(
              WHERE id = :pid
             """
         ),
-        {"new_refunded": money(row["new_refunded"]), "status": new_status,
-         "pid": payment_id},
+        {
+            "new_refunded": money(row["new_refunded"]),
+            "status": new_status,
+            "pid": payment_id,
+        },
     )
     return new_status
 
@@ -473,14 +484,18 @@ async def derive_master_payment_status(
     drift this round is removing, not something to reintroduce.
     """
     services = (
-        await db.execute(
-            text(
-                "SELECT service_type FROM booking_services "
-                "WHERE master_booking_id = :m"
-            ),
-            {"m": master_booking_id},
+        (
+            await db.execute(
+                text(
+                    "SELECT service_type FROM booking_services "
+                    "WHERE master_booking_id = :m"
+                ),
+                {"m": master_booking_id},
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     if set(services) & {"HOTEL", "TOUR"}:
         return None
 

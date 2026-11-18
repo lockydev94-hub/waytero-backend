@@ -694,6 +694,11 @@ async def collect_advance(
     booking.advance_received_by = receiver
     _refresh_payment_status(booking)
 
+    # The session runs with autoflush disabled, so the new receipt is still
+    # pending when the rollup runs. Flush it first or the master stays PENDING
+    # until some later request happens to flush. (Same bug the hotel path had.)
+    await db.flush()
+
     await db.execute(
         text(
             "INSERT INTO booking_timelines (master_booking_id, event_type, event_description, event_timestamp) "

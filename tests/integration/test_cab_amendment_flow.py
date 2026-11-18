@@ -22,6 +22,7 @@ has run, one with money collected against it, and one carrying a redemption that
 longer validates — because the gate is worth nothing if it only refuses bookings
 that do not exist.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -48,8 +49,12 @@ Bhubaneswar = 5  # the city with fare sheets and with a published corridor
 Puri = 4
 Berhampur = 1
 
-PICKUP = datetime(2026, 11, 5, 14, 30)  # afternoon: no night charge anywhere
-AMENDED_PICKUP = datetime(2026, 11, 12, 16, 0)
+# Fixed future dates, not "now + 3 days": the booking path refuses a pickup
+# that has already passed, and a relative date would make the assertions below
+# move with the calendar.
+PICKUP = datetime(2027, 11, 5, 14, 30)  # afternoon: no night charge anywhere
+AMENDED_PICKUP = datetime(2027, 11, 12, 16, 0)
+AMENDED_RETURN = datetime(2027, 11, 13, 10, 0)
 
 SUPER_SCOPE = BranchScope(
     actor_id="00000000-0000-0000-0000-000000000000",
@@ -159,8 +164,7 @@ async def _seed_sheet(session: AsyncSession, category_id: int, sheet: dict) -> N
             "city": Bhubaneswar,
             "vcid": category_id,
             **{
-                k: Decimal(v) if k not in {"trip_type"} else v
-                for k, v in sheet.items()
+                k: Decimal(v) if k not in {"trip_type"} else v for k, v in sheet.items()
             },
         },
     )
@@ -213,25 +217,27 @@ async def _free_mobile(session: AsyncSession) -> str:
     somebody is a fact about this database, not about the code.
     """
     row = (
-        await session.execute(
-            text(
-                "SELECT '9' || lpad(n::text, 9, '0') AS mobile "
-                "FROM generate_series(0, 999) AS n "
-                "WHERE NOT EXISTS (SELECT 1 FROM users u "
-                "                  WHERE u.mobile_number = '9' || lpad(n::text, 9, '0')) "
-                "ORDER BY n LIMIT 1"
+        (
+            await session.execute(
+                text(
+                    "SELECT '9' || lpad(n::text, 9, '0') AS mobile "
+                    "FROM generate_series(0, 999) AS n "
+                    "WHERE NOT EXISTS (SELECT 1 FROM users u "
+                    "                  WHERE u.mobile_number = '9' || lpad(n::text, 9, '0')) "
+                    "ORDER BY n LIMIT 1"
+                )
             )
         )
-    ).mappings().one()
+        .mappings()
+        .one()
+    )
     return str(row["mobile"])
 
 
 async def _any_branch(session: AsyncSession) -> int:
     return int(
         (
-            await session.execute(
-                text("SELECT id FROM branches ORDER BY id LIMIT 1")
-            )
+            await session.execute(text("SELECT id FROM branches ORDER BY id LIMIT 1"))
         ).scalar_one()
     )
 
@@ -348,6 +354,7 @@ def _amended_edit(category_id: int, reason: str) -> CabBookingEditByAdmin:
         pickup_location="Bhubaneswar Railway Station",
         drop_location="Berhampur Bus Stand",
         pickup_datetime=AMENDED_PICKUP,
+        return_datetime=AMENDED_RETURN,
         reason=reason,
     )
 
@@ -415,6 +422,21 @@ async def _offer_row(session: AsyncSession, offer_id: int) -> dict:
 
 
 async def _flow(session: AsyncSession) -> dict:
+    # This suite exercises the amendment engine, not the product switch. One Way
+    # is disabled in the launch configuration, so opt it back in inside this
+    # transaction; the rollback at the end restores the real setting.
+    await session.execute(
+        text(
+            "INSERT INTO system_configurations "
+            "(config_key, config_value, description, updated_at) "
+            "VALUES ('CAB_BOOKING_ONE_WAY_ENABLED', 'true', "
+            "        'Test opt-in for amendment flow', NOW()) "
+            "ON CONFLICT (config_key) DO UPDATE "
+            "SET config_value = 'true', updated_at = NOW()"
+        )
+    )
+    await session.flush()
+
     category_id = int(
         (
             await session.execute(
@@ -513,6 +535,7 @@ async def _flow(session: AsyncSession) -> dict:
             pickup_location="Bhubaneswar Railway Station",
             drop_location="Berhampur Bus Stand",
             pickup_datetime=AMENDED_PICKUP,
+            return_datetime=AMENDED_RETURN,
             reason="Customer re-read the fare back to us",
         ),
         db=session,
@@ -543,7 +566,9 @@ async def _flow(session: AsyncSession) -> dict:
     # Refusal 2: an advance is open against the booking, at the ORIGINAL status —
     # otherwise the first gate would answer before this one is ever reached.
     await session.execute(
-        text("UPDATE cab_bookings SET booking_status = 'PENDING_ASSIGNMENT' WHERE id = :id"),
+        text(
+            "UPDATE cab_bookings SET booking_status = 'PENDING_ASSIGNMENT' WHERE id = :id"
+        ),
         {"id": created.cab_booking_id},
     )
     await session.execute(
@@ -637,7 +662,9 @@ async def _flow(session: AsyncSession) -> dict:
     closed_offer_note = kept_offer_note = ""
     offer_closed = offer_kept = None
     if partner_id is not None:
-        changed_offer = await _open_offer(session, created.cab_booking_id, int(partner_id))
+        changed_offer = await _open_offer(
+            session, created.cab_booking_id, int(partner_id)
+        )
         offer_closed = await edit_cab_booking_by_admin(
             created.cab_booking_id,
             _refusal_edit(category_id),
@@ -777,7 +804,7 @@ def test_an_amended_trip_is_measured_priced_and_written_as_one_number() -> None:
     assert "Customer extended the trip to Berhampur" in note
     assert str(out["timeline"]["created_by"]) == out["actor_id"]
     # The time is named as the agent named it, not as the column stores it.
-    assert "pickup moved to 12 Nov 2026 16:00" in note
+    assert "pickup moved to 12 Nov 2027 16:00" in note
 
     # A save that changes nothing about the journey claims nothing either, and it
     # does not drift the fare: re-reading the trip back is not a re-price.
@@ -812,7 +839,9 @@ def test_an_amended_trip_is_measured_priced_and_written_as_one_number() -> None:
     assert "coupon" in str(coupon.detail).lower()
     # Refused means refused: the fare the customer was last quoted is still on the
     # row, with neither the old trip nor the discount rewritten.
-    assert Decimal(str(out["after_coupon_refusal"]["estimated_amount"])) == AMENDED_TOTAL
+    assert (
+        Decimal(str(out["after_coupon_refusal"]["estimated_amount"])) == AMENDED_TOTAL
+    )
 
     # Nothing survived the transaction — the row this flow booked, repriced and
     # refused three times was never in the database the owner uses.
@@ -858,7 +887,9 @@ def test_a_changed_trip_closes_the_offer_a_partner_has_not_answered() -> None:
     kept = out["offer_kept"]
     assert kept.re_offered is False
     assert "outstanding partner offers closed" not in out["kept_offer_note"]
-    assert out["kept_row"]["closed_at"] is None, "a no-change edit must not close an offer"
+    assert (
+        out["kept_row"]["closed_at"] is None
+    ), "a no-change edit must not close an offer"
     still = out["after_keep"]
     assert still["booking_status"] == "PENDING_PARTNER_ACCEPTANCE"
     assert int(still["pending_partner_id"]) == int(out["partner_id"])

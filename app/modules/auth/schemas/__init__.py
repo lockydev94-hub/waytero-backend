@@ -78,6 +78,70 @@ class VerifyOTPRequest(OTPLoginRequest):
     """POST /api/v1/auth/verify-otp"""
 
 
+class PartnerRegisterStartRequest(BaseModel):
+    """POST /api/v1/auth/partner/register/otp — verify the applicant mobile."""
+
+    mobile: str
+
+    @field_validator("mobile")
+    @classmethod
+    def validate_mobile(cls, value: str) -> str:
+        return _normalize_mobile(value)
+
+
+class PartnerSelfRegisterRequest(BaseModel):
+    """POST /api/v1/auth/partner/register — create a pending partner account.
+
+    A partner chooses services at application time. Those rows are what the
+    app and the API gates use after activation: a CAB+TOUR partner never gets
+    the HOTEL screens or the hotel API, even if they know the route.
+    """
+
+    mobile: str
+    otp: str
+    password: str
+    owner_name: str = Field(..., min_length=2, max_length=255)
+    business_name: str = Field(..., min_length=2, max_length=255)
+    email: str
+    partner_type: str = Field("INDIVIDUAL", pattern="^(INDIVIDUAL|COMPANY)$")
+    city_id: int
+    services: list[str] = Field(..., min_length=1)
+
+    @field_validator("mobile")
+    @classmethod
+    def validate_mobile(cls, value: str) -> str:
+        return _normalize_mobile(value)
+
+    @field_validator("otp")
+    @classmethod
+    def validate_otp(cls, value: str) -> str:
+        value = value.strip()
+        if not re.match(r"^\d{6}$", value):
+            raise ValueError("OTP must be a 6-digit number")
+        return value
+
+    @field_validator("password")
+    @classmethod
+    def validate_password(cls, value: str) -> str:
+        return _validate_password(value)
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", value):
+            raise ValueError("Enter a valid email address")
+        return value
+
+    @field_validator("services")
+    @classmethod
+    def validate_services(cls, value: list[str]) -> list[str]:
+        cleaned = sorted({v.strip().upper() for v in value if v.strip()})
+        if not cleaned:
+            raise ValueError("Select at least one service")
+        return cleaned
+
+
 class PartnerLoginRequest(BaseModel):
     """POST /api/v1/auth/partner/login — accepts mobile OR email + password"""
 
@@ -407,6 +471,11 @@ class SessionConfigResponse(BaseModel):
     mpin_attempts_remaining: Optional[int] = None
     mpin_min_length: int
     access_token_expires_in: int
+    # Absolute session bound (12 h for admin/partner dashboards). The client
+    # signs out when this passes even if the refresh token row has not been
+    # touched, so the browser tab cannot outlive the server-side session.
+    session_started_at: Optional[datetime] = None
+    session_expires_at: Optional[datetime] = None
     # The shell boots on this call, so the topbar branch chip comes with it
     # instead of costing a second round trip. `is_super` is what the switcher
     # renders for — a branch account gets a chip, never a selector.
@@ -490,6 +559,11 @@ class AuthUserResponse(BaseModel):
     partner_id: Optional[int] = (
         None  # Integer partners.id — populated for PARTNER user_type
     )
+    # Partner-only access context. The app routes on these before the first
+    # page request, so a pending application cannot open an operational screen
+    # and a CAB+TOUR partner never sees the HOTEL surface.
+    partner_status: Optional[str] = None
+    active_services: list[str] = Field(default_factory=list)
     # Staff-only: which office this account works from, and whether it sees all
     # of them. A customer/partner/driver has neither, so both stay None/False.
     branch: Optional[BranchSummary] = None

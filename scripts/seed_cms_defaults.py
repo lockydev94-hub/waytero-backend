@@ -16,6 +16,11 @@ import asyncio
 import sys
 import os
 
+# Ensure UTF-8 output even on Windows CP1252 terminals (the status lines
+# contain emoji; without this the seeder crashes on print after the SQL ran).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Path setup ────────────────────────────────────────────────────────────────
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -82,12 +87,12 @@ async def seed(session: AsyncSession) -> None:
                 contact_email     = COALESCE(NULLIF(contact_email, ''),     'support@waytero.com'),
                 nav_links         = CASE
                                       WHEN nav_links  = '[]'::jsonb OR nav_links  IS NULL
-                                      THEN :nav_links::jsonb
+                                      THEN CAST(:nav_links AS jsonb)
                                       ELSE nav_links
                                     END,
                 social_links      = CASE
                                       WHEN social_links = '{}'::jsonb OR social_links IS NULL
-                                      THEN :social_links::jsonb
+                                      THEN CAST(:social_links AS jsonb)
                                       ELSE social_links
                                     END,
                 show_search_bar   = COALESCE(show_search_bar,   TRUE),
@@ -114,17 +119,17 @@ async def seed(session: AsyncSession) -> None:
                 contact_email   = COALESCE(NULLIF(contact_email, ''),   'support@waytero.com'),
                 quick_links     = CASE
                                     WHEN quick_links = '[]'::jsonb OR quick_links IS NULL
-                                    THEN :quick_links::jsonb
+                                    THEN CAST(:quick_links AS jsonb)
                                     ELSE quick_links
                                   END,
                 legal_links     = CASE
                                     WHEN legal_links = '[]'::jsonb OR legal_links IS NULL
-                                    THEN :legal_links::jsonb
+                                    THEN CAST(:legal_links AS jsonb)
                                     ELSE legal_links
                                   END,
                 social_links    = CASE
                                     WHEN social_links = '{}'::jsonb OR social_links IS NULL
-                                    THEN :social_links::jsonb
+                                    THEN CAST(:social_links AS jsonb)
                                     ELSE social_links
                                   END,
                 is_active       = COALESCE(is_active, TRUE)

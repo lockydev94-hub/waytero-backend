@@ -90,6 +90,8 @@ from app.modules.auth.constants import (
     MPIN_MAX_ATTEMPTS_DEFAULT,
     MPIN_MIN_LENGTH_DEFAULT,
     STAFF_USER_TYPES,
+    DASHBOARD_USER_TYPES,
+    DASHBOARD_SESSION_HOURS,
     HEARTBEAT_MAX_SECONDS,
     OTP_PURPOSE_MPIN_SET,
 )
@@ -105,6 +107,7 @@ from app.modules.auth.schemas import (
     BranchSummary,
     LoginResponse,
     OTPSentResponse,
+    PartnerSelfRegisterRequest,
     RefreshResponse,
     SessionConfigResponse,
     TokenResponse,
@@ -380,6 +383,228 @@ class AuthService:
             code,
         )
 
+    async def send_partner_registration_otp(self, mobile: str) -> OTPSentResponse:
+        """Verify ownership of the applicant mobile before creating anything."""
+        if await self.user_repo.exists_by_mobile(mobile):
+            raise BusinessException(
+                message=(
+                    "An account already exists for this mobile number. "
+                    "Sign in instead, or use a different number."
+                ),
+                code="MOBILE_ALREADY_REGISTERED",
+            )
+        return await self.otp_service.send_otp(
+            mobile=mobile, purpose="PARTNER_REGISTER"
+        )
+
+    async def partner_self_register(
+        self,
+        data: PartnerSelfRegisterRequest,
+        device_name: Optional[str] = None,
+        device_os: Optional[str] = None,
+        ip_address: Optional[str] = None,
+    ) -> LoginResponse:
+        """Create a PARTNER user and a PENDING partner application.
+
+        This is the app's self-service path. The account is usable immediately
+        so the applicant can log in and watch the approval state, but the
+        partner record stays PENDING until an admin activates it. Service rows
+        are written now because they are what the API gates enforce later.
+        """
+        import random as _random
+        import uuid as _uuid
+        from sqlalchemy import text as _text
+
+        await self.otp_service.verify_otp(
+            data.mobile, data.otp, purpose="PARTNER_REGISTER"
+        )
+
+        if await self.user_repo.exists_by_mobile(data.mobile):
+            raise BusinessException(
+                message="An account already exists for this mobile number.",
+                code="MOBILE_ALREADY_REGISTERED",
+            )
+        if await self.user_repo.get_by_email(data.email):
+            raise BusinessException(
+                message="An account already exists for this email address.",
+                code="EMAIL_ALREADY_REGISTERED",
+            )
+
+        city = (
+            await self.db.execute(
+                _text("SELECT id FROM cities WHERE id = :id AND is_active = TRUE"),
+                {"id": data.city_id},
+            )
+        ).first()
+        if city is None:
+            raise ValidationException("Select a valid operating city")
+
+        valid_rows = (
+            (
+                await self.db.execute(
+                    _text(
+                        "SELECT type_code FROM service_types "
+                        "WHERE is_active = TRUE AND type_code = ANY(:services)"
+                    ),
+                    {"services": data.services},
+                )
+            )
+            .scalars()
+            .all()
+        )
+        valid_services = {str(row) for row in valid_rows}
+        invalid = sorted(set(data.services) - valid_services)
+        if invalid:
+            raise ValidationException(
+                f"Unknown or inactive service type(s): {', '.join(invalid)}"
+            )
+
+        name_parts = data.owner_name.strip().split(" ", 1)
+        first_name = name_parts[0]
+        last_name = name_parts[1] if len(name_parts) > 1 else None
+
+        user = await self.user_repo.create(
+            mobile_number=data.mobile,
+            email=data.email,
+            password_hash=hash_password(data.password),
+            user_type=UserType.PARTNER,
+            status=UserStatus.ACTIVE,
+            is_mobile_verified=True,
+            is_email_verified=False,
+            first_name=first_name,
+            last_name=last_name,
+        )
+        await self.role_repo.ensure_default_role_for_user(user)
+
+        partner_code = f"PRT-{_random.randint(100000, 999999)}"
+        while (
+            await self.db.execute(
+                _text("SELECT id FROM partners WHERE partner_code = :code"),
+                {"code": partner_code},
+            )
+        ).first():
+            partner_code = f"PRT-{_random.randint(100000, 999999)}"
+
+        partner_id = (
+            await self.db.execute(
+                _text(
+                    """
+                    INSERT INTO partners
+                        (uuid, user_id, partner_code, partner_type, owner_name,
+                         business_name, mobile, email, city_id, status,
+                         onboarding_source, office_city_id, created_at, updated_at)
+                    VALUES
+                        (:uuid, :user_id, :code, :partner_type, :owner_name,
+                         :business_name, :mobile, :email, :city_id, 'PENDING',
+                         'MOBILE_APP', :city_id, NOW(), NOW())
+                    RETURNING id
+                    """
+                ),
+                {
+                    "uuid": _uuid.uuid4(),
+                    "user_id": user.id,
+                    "code": partner_code,
+                    "partner_type": data.partner_type,
+                    "owner_name": data.owner_name.strip(),
+                    "business_name": data.business_name.strip(),
+                    "mobile": data.mobile,
+                    "email": data.email,
+                    "city_id": data.city_id,
+                },
+            )
+        ).scalar_one()
+
+        await self.db.execute(
+            _text(
+                """
+                INSERT INTO partner_ratings
+                    (partner_id, average_rating, total_reviews, updated_at)
+                VALUES (:pid, 0, 0, NOW())
+                """
+            ),
+            {"pid": partner_id},
+        )
+        await self.db.execute(
+            _text(
+                """
+                INSERT INTO wallets
+                    (partner_id, wallet_type, available_balance, hold_balance,
+                     credit_limit, wallet_status, created_at)
+                VALUES (:pid, 'PREPAID', 0, 0, 0, 'ACTIVE', NOW())
+                ON CONFLICT (partner_id) DO NOTHING
+                """
+            ),
+            {"pid": partner_id},
+        )
+        for service_type in data.services:
+            await self.db.execute(
+                _text(
+                    """
+                    INSERT INTO partner_services
+                        (partner_id, service_type, is_active, created_at)
+                    VALUES (:pid, :service_type, TRUE, NOW())
+                    ON CONFLICT DO NOTHING
+                    """
+                ),
+                {"pid": partner_id, "service_type": service_type},
+            )
+        await self.db.execute(
+            _text(
+                """
+                INSERT INTO partner_verification_logs
+                    (partner_id, action, remarks, created_at)
+                VALUES
+                    (:pid, 'PARTNER_APPLIED',
+                     'Self-registration submitted from the partner app', NOW())
+                """
+            ),
+            {"pid": partner_id},
+        )
+
+        await self.db.flush()
+        logger.info(
+            "partner_self_registered",
+            user_id=str(user.id),
+            partner_id=partner_id,
+            partner_code=partner_code,
+            services=data.services,
+        )
+
+        try:
+            from app.infrastructure.email import send_event_email
+
+            await send_event_email(
+                self.db,
+                event_type="partner_registered",
+                to_email=data.email,
+                to_name=data.owner_name,
+                context={
+                    "name": data.owner_name or data.business_name or "partner",
+                    "message": (
+                        f"Thank you for applying to WayTero. Your application "
+                        f"({partner_code}) is pending review."
+                    ),
+                    "body": [
+                        "Our verification team will review your business details. "
+                        "You can track the status in the partner app.",
+                    ],
+                    "details": [
+                        ("Partner code", partner_code),
+                        ("Business name", data.business_name),
+                        ("Services", ", ".join(data.services)),
+                        ("Status", "Pending review"),
+                    ],
+                },
+                related_type="PARTNER",
+                related_id=partner_id,
+            )
+        except Exception:  # pragma: no cover — email must never break signup
+            pass
+
+        return await self._create_session_and_tokens(
+            user, device_name, device_os, ip_address
+        )
+
     async def customer_otp_login(
         self,
         mobile: str,
@@ -576,6 +801,88 @@ class AuthService:
             user, device_name, device_os, ip_address
         )
 
+    async def partner_firebase_login(
+        self,
+        id_token: str,
+        device_name: Optional[str] = None,
+        device_os: Optional[str] = None,
+        ip_address: Optional[str] = None,
+    ) -> LoginResponse:
+        """Google sign-in for an existing partner account.
+
+        Google is a login method, not a second registration path: a partner
+        must already have applied (or been created by an admin) and the Google
+        email must match users.email. Creating a partner from a social login
+        would skip city, services and KYC, so that deliberately does not happen.
+        """
+        await self._enforce_login_rate_limit("partner:firebase")
+
+        try:
+            claims = await verify_firebase_id_token(self.db, id_token)
+        except FirebaseAuthUnavailableError as exc:
+            raise BusinessException(
+                message=(
+                    "Google sign-in is not available right now. "
+                    "Please use your mobile number and password."
+                ),
+                code="FIREBASE_UNAVAILABLE",
+            ) from exc
+        except InvalidFirebaseIdTokenError as exc:
+            raise AuthenticationException(
+                message="Google sign-in failed. Please try again.",
+                code="INVALID_FIREBASE_TOKEN",
+            ) from exc
+
+        email = (claims.get("email") or "").strip().lower()
+        if not email:
+            raise AuthenticationException(
+                message="Google account did not return an email address.",
+                code="FIREBASE_NO_EMAIL",
+            )
+        if not claims.get("email_verified", False):
+            raise AuthenticationException(
+                message="Google account email is not verified.",
+                code="FIREBASE_EMAIL_UNVERIFIED",
+            )
+
+        user = await self.user_repo.get_by_email_and_type(email, UserType.PARTNER)
+        if user is None:
+            raise AuthenticationException(
+                message=(
+                    "No partner account uses this Google email. "
+                    "Apply as a partner first or sign in with your registered mobile."
+                ),
+                code="PARTNER_NOT_FOUND",
+            )
+
+        partner = await PartnerRepository(self.db).get_by_user_id(user.id)
+        if partner is None:
+            raise AuthenticationException(
+                message="Partner application not found. Please contact support.",
+                code="PARTNER_NOT_FOUND",
+            )
+
+        await self.user_repo.mark_email_verified(user.id)
+        user.is_email_verified = True
+        display_name = (claims.get("name") or "").strip()
+        if display_name:
+            first_name, last_name = _split_display_name(
+                display_name, fallback_email=email
+            )
+            await self.user_repo.update_profile(
+                user.id,
+                first_name=first_name or user.first_name,
+                last_name=last_name if last_name is not None else user.last_name,
+                profile_image_url=claims.get("picture"),
+            )
+
+        await self.role_repo.ensure_default_role_for_user(user)
+        await self._check_account_active(user)
+        logger.info("partner_google_login", user_id=str(user.id), partner_id=partner.id)
+        return await self._create_session_and_tokens(
+            user, device_name, device_os, ip_address
+        )
+
     async def driver_otp_login(
         self,
         mobile: str,
@@ -598,6 +905,155 @@ class AuthService:
         user.is_mobile_verified = True
         await self.role_repo.ensure_default_role_for_user(user)
         await self._check_account_active(user)
+        return await self._create_session_and_tokens(
+            user, device_name, device_os, ip_address
+        )
+
+    async def driver_firebase_login(
+        self,
+        id_token: str,
+        device_name: Optional[str] = None,
+        device_os: Optional[str] = None,
+        ip_address: Optional[str] = None,
+    ) -> LoginResponse:
+        """Google sign-in for a driver created by a partner.
+
+        Google is a login method, not a registration path: the email must match
+        a driver record (or the DRIVER user already linked to it). A driver
+        without an email is told to use mobile OTP instead of being given an
+        empty account that no partner can recognise.
+        """
+        await self._enforce_login_rate_limit("driver:firebase")
+
+        try:
+            claims = await verify_firebase_id_token(self.db, id_token)
+        except FirebaseAuthUnavailableError as exc:
+            raise BusinessException(
+                message=(
+                    "Google sign-in is not available right now. "
+                    "Please use mobile OTP."
+                ),
+                code="FIREBASE_UNAVAILABLE",
+            ) from exc
+        except InvalidFirebaseIdTokenError as exc:
+            raise AuthenticationException(
+                message="Google sign-in failed. Please try again.",
+                code="INVALID_FIREBASE_TOKEN",
+            ) from exc
+
+        email = (claims.get("email") or "").strip().lower()
+        if not email:
+            raise AuthenticationException(
+                message="Google account did not return an email address.",
+                code="FIREBASE_NO_EMAIL",
+            )
+        if not claims.get("email_verified", False):
+            raise AuthenticationException(
+                message="Google account email is not verified.",
+                code="FIREBASE_EMAIL_UNVERIFIED",
+            )
+
+        from sqlalchemy import func, select
+
+        from app.modules.driver.models import Driver
+
+        user = await self.user_repo.get_by_email_and_type(email, UserType.DRIVER)
+        driver = None
+
+        if user is not None:
+            driver = (
+                await self.db.execute(
+                    select(Driver).where(
+                        Driver.user_id == user.id, Driver.deleted_at.is_(None)
+                    )
+                )
+            ).scalar_one_or_none()
+
+        if driver is None:
+            driver = (
+                await self.db.execute(
+                    select(Driver).where(
+                        func.lower(Driver.email) == email,
+                        Driver.deleted_at.is_(None),
+                    )
+                )
+            ).scalar_one_or_none()
+
+        if driver is None:
+            raise AuthenticationException(
+                message=(
+                    "No driver account uses this Google email. Ask your partner "
+                    "to add the email to your driver profile, or sign in with "
+                    "your mobile number."
+                ),
+                code="DRIVER_NOT_FOUND",
+            )
+
+        if user is None and driver.user_id is not None:
+            candidate = await self.user_repo.get_by_id(driver.user_id)
+            if candidate is not None:
+                if candidate.user_type != UserType.DRIVER:
+                    raise AuthenticationException(
+                        message="This Google email belongs to a non-driver account.",
+                        code="DRIVER_ACCOUNT_CONFLICT",
+                    )
+                user = candidate
+
+        if user is None:
+            # A partner-created driver may predate the user backfill. Reuse the
+            # DRIVER user with this mobile when one exists; never move a
+            # customer/partner account into the driver portal.
+            user = await self.user_repo.get_by_mobile_and_type(
+                driver.mobile, UserType.DRIVER
+            )
+            if user is None:
+                mobile_owner = await self.user_repo.get_by_mobile(driver.mobile)
+                if mobile_owner is not None:
+                    raise AuthenticationException(
+                        message=(
+                            "This driver mobile is linked to another WayTero "
+                            "account. Please contact support."
+                        ),
+                        code="DRIVER_ACCOUNT_CONFLICT",
+                    )
+                parts = (driver.full_name or "Driver").split()
+                first_name = parts[0] if parts else "Driver"
+                last_name = " ".join(parts[1:]) if len(parts) > 1 else None
+                user = await self.user_repo.create(
+                    mobile_number=driver.mobile,
+                    email=email,
+                    user_type=UserType.DRIVER,
+                    status=UserStatus.ACTIVE,
+                    first_name=first_name,
+                    last_name=last_name,
+                    is_email_verified=True,
+                    is_mobile_verified=True,
+                )
+
+        if driver.user_id != user.id:
+            driver.user_id = user.id
+        if not user.email:
+            owner = await self.user_repo.get_by_email(email)
+            if owner is None:
+                user.email = email
+
+        await self.user_repo.mark_email_verified(user.id)
+        user.is_email_verified = True
+        display_name = (claims.get("name") or "").strip()
+        if display_name:
+            first_name, last_name = _split_display_name(
+                display_name, fallback_email=email
+            )
+            await self.user_repo.update_profile(
+                user.id,
+                first_name=first_name or user.first_name,
+                last_name=last_name if last_name is not None else user.last_name,
+                profile_image_url=claims.get("picture"),
+            )
+
+        await self.role_repo.ensure_default_role_for_user(user)
+        await self._check_account_active(user)
+        logger.info("driver_google_login", user_id=str(user.id), driver_id=driver.id)
         return await self._create_session_and_tokens(
             user, device_name, device_os, ip_address
         )
@@ -1271,10 +1727,16 @@ class AuthService:
             raise ResourceNotFoundException("User", user_id)
         await self.role_repo.ensure_default_role_for_user(user)
         roles, permissions = await self._get_access_context(user.id)
+        partner_id, partner_status, active_services = (
+            await self._resolve_partner_access(user)
+        )
         return self._build_user_response(
             user,
             roles,
             permissions,
+            partner_id=partner_id,
+            partner_status=partner_status,
+            active_services=active_services,
             branch=await self._resolve_branch(user),
         )
 
@@ -1321,6 +1783,8 @@ class AuthService:
         roles: list[str],
         permissions: list[str],
         partner_id: Optional[int] = None,
+        partner_status: Optional[str] = None,
+        active_services: Optional[list[str]] = None,
         branch: Optional[BranchSummary] = None,
     ) -> AuthUserResponse:
         return AuthUserResponse(
@@ -1338,11 +1802,13 @@ class AuthService:
             # No PIN means the shell can only log the admin out on idle, so the
             # profile asks for one. Staff-only: a customer has no dashboard.
             must_set_mpin=(
-                user.user_type.value in STAFF_USER_TYPES and user.mpin_hash is None
+                user.user_type.value in DASHBOARD_USER_TYPES and user.mpin_hash is None
             ),
             user_code=user.user_code,
             last_login_at=user.last_login_at,
             partner_id=partner_id,
+            partner_status=partner_status,
+            active_services=active_services or [],
             branch=branch,
             is_super=user.user_type == UserType.SUPER_ADMIN,
         )
@@ -1362,9 +1828,15 @@ class AuthService:
             await self.session_repo.deactivate_oldest_session(user.id)
 
         provisional_hash = _hash_token(generate_secure_token())
-        expires_at = datetime.now(timezone.utc) + timedelta(
-            days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS
+        # Dashboard sessions get the absolute 12-hour cap; customers keep the
+        # normal refresh-token lifetime. The DB row is the gate: /auth/refresh
+        # refuses an expired session even if the JWT itself has not expired.
+        session_lifetime = (
+            timedelta(hours=DASHBOARD_SESSION_HOURS)
+            if user.user_type.value in DASHBOARD_USER_TYPES
+            else timedelta(days=settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS)
         )
+        expires_at = datetime.now(timezone.utc) + session_lifetime
         session = await self.session_repo.create(
             user_id=user.id,
             refresh_token_hash=provisional_hash,
@@ -1374,8 +1846,12 @@ class AuthService:
             expires_at=expires_at,
         )
 
-        # Resolve integer partner_id for PARTNER user type (needed by vehicle/booking endpoints)
-        partner_int_id = await self._resolve_partner_int_id(user)
+        # Resolve the partner's access context once: the integer id goes into
+        # the token, while status + active services go into the user envelope
+        # so the app can gate routes without a second request.
+        partner_int_id, partner_status, active_services = (
+            await self._resolve_partner_access(user)
+        )
         branch = await self._resolve_branch(user)
 
         access_payload = {
@@ -1423,6 +1899,8 @@ class AuthService:
                 roles,
                 permissions,
                 partner_id=partner_int_id,
+                partner_status=partner_status,
+                active_services=active_services,
                 branch=branch,
             ),
             tokens=TokenResponse(
@@ -1433,21 +1911,35 @@ class AuthService:
             session_id=session.id,
         )
 
-    async def _resolve_partner_int_id(self, user: User) -> Optional[int]:
-        """Resolve the integer partner_id for a PARTNER user, else None.
+    async def _resolve_partner_access(
+        self, user: User
+    ) -> tuple[Optional[int], Optional[str], list[str]]:
+        """Return (partner_id, status, active services) for a partner user.
 
+        The app routes on this context before rendering any operational screen.
         Doc Ref: Security Hardening — S6: partner_id from JWT, not query params.
         """
         if user.user_type.value != UserType.PARTNER.value:
-            return None
+            return None, None, []
         try:
             partner_repo = PartnerRepository(self.db)
             partner_obj = await partner_repo.get_by_user_id(user.id)
             if partner_obj:
-                return partner_obj.id
+                services = sorted(
+                    {
+                        str(service.service_type)
+                        for service in (partner_obj.services or [])
+                        if service.is_active
+                    }
+                )
+                return partner_obj.id, str(partner_obj.status), services
         except Exception:
             pass  # Non-fatal — endpoints can still resolve it via DB when needed
-        return None
+        return None, None, []
+
+    async def _resolve_partner_int_id(self, user: User) -> Optional[int]:
+        partner_id, _, _ = await self._resolve_partner_access(user)
+        return partner_id
 
     async def _resolve_branch(self, user: User) -> Optional[BranchSummary]:
         """The office this staff account answers to, for the portal's topbar.
@@ -1502,19 +1994,32 @@ class AuthService:
         CONFIG_ADMIN_MPIN_LOCKOUT_MINUTES,
     )
 
-    async def _staff_user(self, user_id: UUID) -> User:
-        """Load a signed-in admin-portal user.
+    async def _dashboard_user(self, user_id: UUID) -> User:
+        """Load a signed-in dashboard user (admin staff or partner).
 
         mpin_hash and idle_lock_minutes sit on the shared `users` row, so these
         routes check the user type themselves — the /auth/admin/* prefix is a
-        URL, not a gate, and a CUSTOMER token must not reach them.
+        URL, not a gate, and a CUSTOMER or DRIVER token must not reach them.
+        Partners share the same gate; they have their own portal and the same
+        operational data at stake.
         """
+        user = await self.user_repo.get_by_id(user_id)
+        if not user:
+            raise ResourceNotFoundException("User", user_id)
+        if user.user_type.value not in DASHBOARD_USER_TYPES:
+            raise PermissionDeniedException(
+                "The dashboard unlock PIN is only available to dashboard accounts."
+            )
+        return user
+
+    async def _staff_user(self, user_id: UUID) -> User:
+        """Load a signed-in staff user for attendance-only operations."""
         user = await self.user_repo.get_by_id(user_id)
         if not user:
             raise ResourceNotFoundException("User", user_id)
         if user.user_type.value not in STAFF_USER_TYPES:
             raise PermissionDeniedException(
-                "The dashboard unlock PIN is only available to admin staff."
+                "This operation is only available to admin staff."
             )
         return user
 
@@ -1556,8 +2061,12 @@ class AuthService:
                 DAILY_LOGOUT_HOUR_MIN,
                 DAILY_LOGOUT_HOUR_MAX,
             ),
-            "mpin_min_length": as_int(CONFIG_ADMIN_MPIN_MIN_LENGTH, MPIN_MIN_LENGTH_DEFAULT, 4, 12),
-            "mpin_max_attempts": as_int(CONFIG_ADMIN_MPIN_MAX_ATTEMPTS, MPIN_MAX_ATTEMPTS_DEFAULT, 1, 10),
+            "mpin_min_length": as_int(
+                CONFIG_ADMIN_MPIN_MIN_LENGTH, MPIN_MIN_LENGTH_DEFAULT, 4, 12
+            ),
+            "mpin_max_attempts": as_int(
+                CONFIG_ADMIN_MPIN_MAX_ATTEMPTS, MPIN_MAX_ATTEMPTS_DEFAULT, 1, 10
+            ),
             "mpin_lockout_minutes": as_int(
                 CONFIG_ADMIN_MPIN_LOCKOUT_MINUTES, MPIN_LOCKOUT_MINUTES_DEFAULT, 1, 240
             ),
@@ -1571,7 +2080,9 @@ class AuthService:
                 code="MPIN_TOO_SHORT",
             )
 
-    async def _confirm_password(self, user: User, current_password: Optional[str]) -> None:
+    async def _confirm_password(
+        self, user: User, current_password: Optional[str]
+    ) -> None:
         """Password re-entry for any change that touches the gate itself.
 
         Without it, a hijacked live session token could install, rotate or strip
@@ -1677,15 +2188,25 @@ class AuthService:
         )
         raise self._lockout_error(user)
 
-    async def get_session_config(self, user_id: UUID) -> SessionConfigResponse:
-        """Everything the admin shell needs about this session, in one call.
+    async def get_session_config(
+        self, user_id: UUID, session_id: Optional[str] = None
+    ) -> SessionConfigResponse:
+        """Everything the dashboard shell needs about this session, in one call.
 
         `server_now` is what the client counts the daily-logout hour against, so
-        a wrong laptop clock cannot skip the forced logout.
+        a wrong laptop clock cannot skip the forced logout. `session_expires_at`
+        is the absolute 12-hour bound; the client signs out at that instant even
+        if the tab has been idle-locked and never refreshed a token.
         """
-        user = await self._staff_user(user_id)
+        user = await self._dashboard_user(user_id)
         policy = await self._admin_policy()
         has_mpin = user.mpin_hash is not None
+        session = None
+        if session_id:
+            try:
+                session = await self.session_repo.get_by_id(UUID(session_id))
+            except (TypeError, ValueError):
+                session = None
         return SessionConfigResponse(
             has_mpin=has_mpin,
             has_password=user.password_hash is not None,
@@ -1703,6 +2224,8 @@ class AuthService:
             ),
             mpin_min_length=policy["mpin_min_length"],
             access_token_expires_in=settings.JWT_ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+            session_started_at=session.login_at if session else None,
+            session_expires_at=session.expires_at if session else None,
             branch=await self._resolve_branch(user),
             is_super=user.user_type == UserType.SUPER_ADMIN,
         )
@@ -1714,7 +2237,7 @@ class AuthService:
         Subject-scoped on purpose: `/auth/send-otp` takes any mobile from the
         body, and this route must only ever reach the caller's own number.
         """
-        user = await self._staff_user(user_id)
+        user = await self._dashboard_user(user_id)
         return await self.otp_service.send_otp(
             user.mobile_number, purpose=OTP_PURPOSE_MPIN_SET
         )
@@ -1726,7 +2249,7 @@ class AuthService:
         current_password: Optional[str],
         otp: Optional[str] = None,
     ) -> None:
-        user = await self._staff_user(user_id)
+        user = await self._dashboard_user(user_id)
         policy = await self._admin_policy()
         if user.mpin_hash is not None:
             raise BusinessException(
@@ -1754,11 +2277,14 @@ class AuthService:
     async def change_mpin(
         self, user_id: UUID, current_mpin: Optional[str], new_mpin: str
     ) -> None:
-        user = await self._staff_user(user_id)
+        user = await self._dashboard_user(user_id)
         policy = await self._admin_policy()
         self._require_unlockable(user)
         await self._check_mpin(
-            user, current_mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"]
+            user,
+            current_mpin,
+            policy["mpin_max_attempts"],
+            policy["mpin_lockout_minutes"],
         )
         self._validate_mpin_length(new_mpin, policy["mpin_min_length"])
         if new_mpin == current_mpin:
@@ -1777,10 +2303,12 @@ class AuthService:
 
     async def verify_mpin(self, user_id: UUID, mpin: Optional[str]) -> None:
         """Unlock the dashboard after an idle lock. Never issues tokens."""
-        user = await self._staff_user(user_id)
+        user = await self._dashboard_user(user_id)
         policy = await self._admin_policy()
         self._require_unlockable(user)
-        await self._check_mpin(user, mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"])
+        await self._check_mpin(
+            user, mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"]
+        )
         logger.info(AUTH_EVENT_MPIN_VERIFIED, user_id=str(user_id))
 
     async def remove_mpin(
@@ -1789,7 +2317,7 @@ class AuthService:
         current_password: Optional[str],
         current_mpin: Optional[str] = None,
     ) -> None:
-        user = await self._staff_user(user_id)
+        user = await self._dashboard_user(user_id)
         policy = await self._admin_policy()
         if user.mpin_hash is None:
             raise BusinessException(
@@ -1803,7 +2331,10 @@ class AuthService:
             # the only proof available.
             self._require_unlockable(user)
             await self._check_mpin(
-                user, current_mpin, policy["mpin_max_attempts"], policy["mpin_lockout_minutes"]
+                user,
+                current_mpin,
+                policy["mpin_max_attempts"],
+                policy["mpin_lockout_minutes"],
             )
         user.mpin_hash = None
         user.mpin_failed_attempts = 0
@@ -1824,11 +2355,12 @@ class AuthService:
         Reduce-only: an admin may lock their own dashboard sooner than the
         platform default, never later — otherwise the idle lock becomes opt-out.
         """
-        user = await self._staff_user(user_id)
+        user = await self._dashboard_user(user_id)
         policy = await self._admin_policy()
-        if idle_lock_minutes is not None and idle_lock_minutes > policy[
-            "idle_default_minutes"
-        ]:
+        if (
+            idle_lock_minutes is not None
+            and idle_lock_minutes > policy["idle_default_minutes"]
+        ):
             raise ValidationException(
                 message=(
                     f"Your lock time can only be shorter than the platform default "

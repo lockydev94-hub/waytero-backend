@@ -12,6 +12,8 @@ from app.modules.auth.api import router as auth_router
 from app.modules.customer.api import router as customer_router
 from app.modules.partner.api import router as partner_router
 from app.modules.driver.api import router as driver_router
+from app.modules.driver.driver_app_api import router as driver_app_router
+from app.modules.driver.driver_tour_app_api import router as driver_tour_app_router
 from app.modules.vehicle.api import router as vehicle_router
 from app.modules.admin.api import router as admin_settings_router
 from app.modules.admin.api_dashboard import router as admin_dashboard_router
@@ -20,6 +22,8 @@ from app.modules.admin.branch_scope_api import router as admin_branch_scope_rout
 from app.modules.admin.coupon_api import router as coupon_router
 from app.modules.admin.booking_api import router as admin_booking_router
 from app.modules.admin.customer_care_api import router as customer_care_router
+from app.modules.admin.partner_support_api import router as partner_support_router
+from app.modules.admin.cab_rental_api import router as cab_rental_router
 from app.modules.admin.trip_assistance_api import router as trip_assist_router
 from app.modules.admin.settlement_api import router as settlement_router
 from app.modules.admin.advance_api import router as advance_router
@@ -33,6 +37,9 @@ from app.modules.admin.cab_ops_api import router as admin_cab_ops_router
 from app.modules.admin.cab_breakdown_api import router as admin_breakdown_router
 from app.modules.admin.vehicle_admin_api import router as admin_vehicle_admin_router
 from app.modules.partner.booking_api import router as partner_booking_router
+from app.modules.partner.driver_tracking_api import (
+    router as partner_driver_tracking_router,
+)
 from app.modules.partner.wallet_api import router as partner_wallet_router
 from app.modules.partner.gst_api import router as partner_gst_router
 from app.modules.partner.hotel_booking_api import router as partner_hotel_booking_router
@@ -43,10 +50,12 @@ from app.modules.notification.api import router as notification_router
 from app.modules.admin.cancellation_api import router as admin_cancellation_router
 from app.modules.admin.notices_api import router as admin_notices_router
 from app.modules.partner.notices_api import router as partner_notices_router
+from app.modules.partner.dependencies import require_partner_service
 from app.modules.partner.cancellation_request_api import (
     router as partner_cancellation_router,
 )
 from app.modules.customer.cancellation_api import router as customer_cancellation_router
+from app.modules.customer.tracking_api import router as customer_tracking_router
 from app.modules.admin.public_homepage_api import router as public_homepage_router
 from app.modules.admin.public_legal_api import router as public_legal_router
 from app.modules.admin.account_deletion_api import (
@@ -78,10 +87,15 @@ from app.modules.admin.capture_admin_api import router as admin_capture_router
 from app.modules.chat.api import router as chat_router
 from app.modules.chat.admin_api import router as admin_chat_router
 from app.modules.admin.partner_settings_api import (
+    public_router as public_master_router,
     router as partner_settings_router,
 )
 from app.modules.admin.public_firebase_api import router as public_firebase_router
 from app.modules.admin.onboarding_docs_api import router as onboarding_docs_router
+from app.modules.payment.api import (
+    public_router as public_payment_router,
+    router as payment_router,
+)
 
 # One gate for the whole API, mounted here rather than on each admin router,
 # because a dependency on a router propagates to every route included in it —
@@ -111,14 +125,33 @@ api_router.include_router(auth_router, prefix="/auth", tags=["Authentication"])
 # --- Phase 2 ---
 api_router.include_router(customer_router, prefix="/customers", tags=["Customers"])
 api_router.include_router(partner_router, prefix="/partners", tags=["Partners"])
-api_router.include_router(driver_router, prefix="/drivers", tags=["Drivers"])
+# Driver app routes must be registered before the UUID-scoped /drivers/{id}
+# router, otherwise /drivers/me is parsed as a UUID path parameter.
+api_router.include_router(driver_app_router, prefix="/drivers", tags=["Driver App"])
+api_router.include_router(
+    driver_tour_app_router, prefix="/drivers", tags=["Driver App"]
+)
+api_router.include_router(
+    driver_router,
+    prefix="/drivers",
+    tags=["Drivers"],
+    dependencies=[Depends(require_partner_service("CAB"))],
+)
 
 # --- Driver-app breakdown (mounted under /drivers) ---
 api_router.include_router(
-    driver_breakdown_router, prefix="/drivers", tags=["Driver Breakdown"]
+    driver_breakdown_router,
+    prefix="/drivers",
+    tags=["Driver Breakdown"],
+    dependencies=[Depends(require_partner_service("CAB"))],
 )
 
-api_router.include_router(vehicle_router, prefix="/vehicles", tags=["Vehicles"])
+api_router.include_router(
+    vehicle_router,
+    prefix="/vehicles",
+    tags=["Vehicles"],
+    dependencies=[Depends(require_partner_service("CAB"))],
+)
 
 # --- Phase 3 Admin ---
 api_router.include_router(
@@ -201,6 +234,14 @@ api_router.include_router(
     dependencies=[Depends(require_roles(*ADMIN_CCO))],
 )
 
+# --- Cab Rate Card & Customer Price Overrides (migration 0098) ---
+api_router.include_router(
+    cab_rental_router,
+    prefix="/admin/customer-care",
+    tags=["Customer Care"],
+    dependencies=[Depends(require_roles(*ADMIN_CCO))],
+)
+
 # --- Phase 3 Trip Assistance ---
 api_router.include_router(
     trip_assist_router,
@@ -259,12 +300,26 @@ api_router.include_router(
 
 # --- Phase 3 Partner Bookings ---
 api_router.include_router(
-    partner_booking_router, prefix="/partners", tags=["Partner Bookings"]
+    partner_booking_router,
+    prefix="/partners",
+    tags=["Partner Bookings"],
+    dependencies=[Depends(require_partner_service("CAB"))],
 )
 
 # --- Partner Driver Cash Collection ---
 api_router.include_router(
-    partner_cash_router, prefix="/partners", tags=["Partner Cash Collection"]
+    partner_cash_router,
+    prefix="/partners",
+    tags=["Partner Cash Collection"],
+    dependencies=[Depends(require_partner_service("CAB"))],
+)
+
+# --- Partner live driver tracking + distance reviews ---
+api_router.include_router(
+    partner_driver_tracking_router,
+    prefix="/partners",
+    tags=["Partner Driver Tracking"],
+    dependencies=[Depends(require_partner_service("CAB"))],
 )
 
 # --- Blog ---
@@ -308,7 +363,10 @@ api_router.include_router(partner_gst_router, prefix="/partners", tags=["Partner
 
 # --- Partner Hotel Bookings ---
 api_router.include_router(
-    partner_hotel_booking_router, prefix="/partners", tags=["Partner Hotel Bookings"]
+    partner_hotel_booking_router,
+    prefix="/partners",
+    tags=["Partner Hotel Bookings"],
+    dependencies=[Depends(require_partner_service("HOTEL"))],
 )
 
 # --- Partner Offers (My Offers: room types + exit requests) ---
@@ -354,15 +412,33 @@ api_router.include_router(
     partner_notices_router, prefix="/partners", tags=["Partner Notices"]
 )
 
+# --- Partner Support Tickets (Help & support AC4) ---
+# Partners raise tickets under /partners/me/support-tickets; support staff
+# triage them here. Guarded like the rest of the admin desk routes.
+api_router.include_router(
+    partner_support_router,
+    prefix="/admin/support-tickets",
+    tags=["Partner Support"],
+    dependencies=[Depends(require_roles(*ADMIN_CCO))],
+)
+
 # --- Partner Cancellation Requests ---
 # Partners cannot cancel directly — they submit requests, admin approves.
 api_router.include_router(
-    partner_cancellation_router, prefix="/partners", tags=["Partner Cancellation"]
+    partner_cancellation_router,
+    prefix="/partners",
+    tags=["Partner Cancellation"],
+    dependencies=[Depends(require_partner_service("CAB"))],
 )
 
 # --- Customer Self-Cancel + Booking List ---
 api_router.include_router(
     customer_cancellation_router, prefix="/customers", tags=["Customer Cancellation"]
+)
+# --- Customer live trip tracking (driver GPS, ownership-scoped) ---
+# Doc Ref: 04_FLUTTER_CUSTOMER_APP.md §24/§25
+api_router.include_router(
+    customer_tracking_router, prefix="/customers", tags=["Customer Tracking"]
 )
 
 # --- Public Homepage (CMS-driven marketing site) ---
@@ -394,7 +470,10 @@ api_router.include_router(
     dependencies=[Depends(require_roles(*SUPER_OR_ADMIN))],
 )
 api_router.include_router(
-    partner_tour_router, prefix="/partners/tours", tags=["Partner Tours"]
+    partner_tour_router,
+    prefix="/partners/tours",
+    tags=["Partner Tours"],
+    dependencies=[Depends(require_partner_service("TOUR"))],
 )
 api_router.include_router(
     public_tour_router, prefix="/public/tours", tags=["Public Tours"]
@@ -469,11 +548,31 @@ api_router.include_router(
     dependencies=[Depends(require_roles("PARTNER", "ADMIN", "SUPER_ADMIN"))],
 )
 
+# Pre-auth city picker for the partner application form. /api/v1/public is
+# already in the default-deny auth middleware's allowlist.
+api_router.include_router(
+    public_master_router, prefix="/public", tags=["Public Master Data"]
+)
+
 # --- Public FCM web config (replaces partner-portal read of api-integrations) ---
 api_router.include_router(
     public_firebase_router,
     prefix="/public",
     tags=["Public Firebase Config"],
+)
+
+# --- Customer online payments (Razorpay) ---
+# Public: enabled/disabled + publishable key id only. Authenticated: order
+# creation and signature verification. The webhook is its own signature check.
+api_router.include_router(
+    public_payment_router,
+    prefix="/public/payments",
+    tags=["Public Payments"],
+)
+api_router.include_router(
+    payment_router,
+    prefix="/payments",
+    tags=["Payments"],
 )
 
 # --- Onboarding Guides + Forms (Docs/22_Partner_Onboarding_Guides) ---

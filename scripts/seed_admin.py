@@ -116,9 +116,10 @@ async def seed():
     print(f"  Email    : {ADMIN_EMAIL}")
     print(f"  Role     : SUPER_ADMIN")
     print("=" * 56)
-    print("  Login: POST /api/v1/auth/admin/login")
-    print("  Step 1: submit mobile + password")
-    print("  Step 2: OTP will appear in backend console logs")
+    print("  Login: POST /api/v1/auth/admin/login/password")
+    print("  Step 1: submit mobile + password -> requires_otp")
+    print("  Step 2: POST /api/v1/auth/admin/login/otp with the OTP")
+    print("          (the OTP is printed in the backend window in dev)")
     print("=" * 56)
 
 

@@ -14,7 +14,7 @@ import asyncio as _asyncio
 import json
 import math
 import uuid as _uuid
-from datetime import datetime, timezone, date
+from datetime import datetime, timezone, date, timedelta
 from decimal import Decimal
 from typing import Optional, List
 
@@ -39,6 +39,12 @@ from app.modules.booking.models import (
     CabBooking,
     BookingService,
     BookingTimeline,
+)
+from app.modules.booking.services.cab_availability import (
+    CAB_TRIP_TYPES,
+    cab_booking_disabled_message,
+    enabled_cab_trip_types,
+    is_cab_trip_type_enabled,
 )
 
 # One definition of "is this the same phone number", shared with the booking
@@ -120,6 +126,15 @@ class CustomerRegisterByAdmin(BaseModel):
     city_id: Optional[int] = None
 
 
+class CabStopIn(BaseModel):
+    """A place between pickup and drop, as the agent read it down the phone."""
+
+    name: str = Field(..., max_length=500)
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    city_id: Optional[int] = None
+
+
 class CabBookingQuoteRequest(BaseModel):
     """What the desk needs to quote a trip before it commits to booking one.
 
@@ -135,6 +150,9 @@ class CabBookingQuoteRequest(BaseModel):
     )
     pickup_location: str = Field(..., max_length=500)
     drop_location: str = Field(..., max_length=500)
+    # Stops are measured as extra legs, so a detour the agent promised is in the
+    # distance the customer is quoted.
+    stops: List[CabStopIn] = Field(default_factory=list)
     pickup_datetime: datetime
     return_datetime: Optional[datetime] = None
     # Minutes the customer asked the cab to wait on this trip. A property of the
@@ -157,16 +175,28 @@ class CabBookingCreateByAdmin(BaseModel):
     customer_id: int
     city_id: Optional[int] = None
     destination_city_id: Optional[int] = None
+    # PACKAGE prices from the rate card (migration 0097/0098); PER_KM is the
+    # older per-kilometre engine. The desk chooses, and both are priced by the
+    # server — the mode only decides which sheet answers.
+    pricing_mode: str = Field(default="PER_KM", description="PER_KM | PACKAGE")
+    vehicle_class: Optional[str] = Field(None, max_length=40)
+    hours: Optional[float] = Field(None, ge=0, le=24 * 30)
+    km: Optional[float] = Field(None, ge=0, le=20000)
+    days: Optional[int] = Field(None, ge=1, le=30)
+    returned_after_midnight: bool = False
     trip_type: str = Field(
         ..., description="LOCAL | AIRPORT | OUTSTATION | ONE_WAY | ROUND_TRIP"
     )
-    vehicle_category_id: int = Field(..., gt=0)
+    # Required for PER_KM. In PACKAGE mode it is derived from the rate class's
+    # card row, because the class is what was priced.
+    vehicle_category_id: Optional[int] = Field(None, gt=0)
     pickup_location: str = Field(..., max_length=500)
     pickup_latitude: Optional[float] = None
     pickup_longitude: Optional[float] = None
     drop_location: str = Field(..., max_length=500)
     drop_latitude: Optional[float] = None
     drop_longitude: Optional[float] = None
+    stops: List[CabStopIn] = Field(default_factory=list)
     pickup_datetime: datetime
     # Return datetime for ROUND_TRIP — used by the fare engine to compute
     # ``trip_days`` when the matched pricing rule has
@@ -264,6 +294,7 @@ class CabBookingEditByAdmin(BaseModel):
     drop_location: str = Field(..., max_length=500)
     drop_latitude: Optional[float] = None
     drop_longitude: Optional[float] = None
+    stops: List[CabStopIn] = Field(default_factory=list)
     pickup_datetime: datetime
     return_datetime: Optional[datetime] = None
     waiting_minutes: Optional[int] = Field(None, ge=0, le=1440)
@@ -902,7 +933,9 @@ async def get_customer_records(
     b_total = b_total_r.scalar() or 0
     b_offset = (booking_page - 1) * page_size
 
-    b_mb_scope, b_mb_params = city_scope_sql(scope, "mb.city_id", allow_unassigned=False)
+    b_mb_scope, b_mb_params = city_scope_sql(
+        scope, "mb.city_id", allow_unassigned=False
+    )
     b_rows = await db.execute(
         text(
             f"""
@@ -1187,7 +1220,9 @@ async def cab_booking_meta(
     # at random would have the desk quote a fare the booking then rejects.
     rows_by_key: dict = {}
     for row in pricing_r.mappings().all():
-        rows_by_key.setdefault((str(row["vehicle_category_id"]), row["trip_type"]), []).append(row)
+        rows_by_key.setdefault(
+            (str(row["vehicle_category_id"]), row["trip_type"]), []
+        ).append(row)
 
     pricing = {}
     for (cat_key, trip_type), group in rows_by_key.items():
@@ -1226,13 +1261,28 @@ async def cab_booking_meta(
     )
     cities = [dict(r) for r in cities_r.mappings().all()]
 
-    return {"vehicle_categories": cats, "pricing": pricing, "cities": cities}
+    # The desk's cards come from the same admin switch as the website. The
+    # full list is returned with its state so the screen can also explain why
+    # a product is absent instead of silently showing fewer options.
+    enabled_types = set(await enabled_cab_trip_types(db))
+    trip_types = [
+        {"code": code, "enabled": code in enabled_types} for code in CAB_TRIP_TYPES
+    ]
+
+    return {
+        "vehicle_categories": cats,
+        "pricing": pricing,
+        "cities": cities,
+        "trip_types": trip_types,
+    }
 
 
 # ── 7b. Quote a trip, then book it ───────────────────────────
 
 
-async def _desk_customer(db: AsyncSession, customer_id: int, scope: BranchScope) -> dict:
+async def _desk_customer(
+    db: AsyncSession, customer_id: int, scope: BranchScope
+) -> dict:
     """The customer the desk is acting for, only if this branch may act for them.
 
     `/lookup` already answers "is this customer ours" by home city, booking
@@ -1243,9 +1293,10 @@ async def _desk_customer(db: AsyncSession, customer_id: int, scope: BranchScope)
     """
     branch_clause, branch_params = _customer_in_branch_sql(scope)
     row = (
-        await db.execute(
-            text(
-                f"""
+        (
+            await db.execute(
+                text(
+                    f"""
             SELECT
                 c.id AS customer_id, c.customer_code,
                 u.first_name, u.last_name,
@@ -1256,10 +1307,13 @@ async def _desk_customer(db: AsyncSession, customer_id: int, scope: BranchScope)
             WHERE c.id = :cid AND u.user_type = 'CUSTOMER'
               AND ({branch_clause})
         """
-            ),
-            {"cid": customer_id, **branch_params},
+                ),
+                {"cid": customer_id, **branch_params},
+            )
         )
-    ).mappings().one_or_none()
+        .mappings()
+        .one_or_none()
+    )
     if row is None:
         # 404, not 403: an out-of-scope customer must not be confirmable by id.
         raise ResourceNotFoundException(
@@ -1285,6 +1339,87 @@ async def _desk_pricing_city(payload, db: AsyncSession, scope: BranchScope) -> i
     return payload.city_id
 
 
+def _assert_trip_times(
+    pickup_datetime: datetime, return_datetime: Optional[datetime]
+) -> None:
+    """Reject a trip that cannot be driven as described.
+
+    Two mistakes the desk makes on the phone and only notices after the booking
+    exists: a pickup time typed in the past (usually yesterday's date), and a
+    return before the pickup (a 10:00 pickup "returning at 09:00"). Both priced
+    happily before this check, because neither measurement nor the fare engine
+    looks at the clock.
+
+    A few minutes of grace is deliberate: an agent booking a cab for a customer
+    who is already outside is not an error, and the pickups are minute-level.
+    """
+    now = datetime.now(timezone.utc)
+    pickup = (
+        pickup_datetime
+        if pickup_datetime.tzinfo
+        else pickup_datetime.replace(tzinfo=timezone.utc)
+    )
+    if pickup < now - timedelta(minutes=5):
+        raise ValidationException(
+            "The pickup time is in the past. Choose a time that has not happened "
+            "yet, or record the trip through Trip Assistance."
+        )
+    if return_datetime is not None:
+        back = (
+            return_datetime
+            if return_datetime.tzinfo
+            else return_datetime.replace(tzinfo=timezone.utc)
+        )
+        if back <= pickup:
+            raise ValidationException(
+                "The return time is before the pickup time. Fix the return or "
+                "remove it before booking."
+            )
+
+
+async def _guard_trip_type(
+    db: AsyncSession,
+    *,
+    trip_type: str,
+    pickup_location: str,
+    drop_location: str,
+    stops: list[CabStopIn] | None,
+    pickup_datetime: datetime,
+    return_datetime: Optional[datetime],
+    allow_drop_for_duration: bool = False,
+    enforce_availability: bool = True,
+) -> None:
+    """Refuse a trip whose type does not match the places the agent named.
+
+    The desk is where this matters most: the agent picks the type from memory
+    while the customer says "airport, then Puri, then back". This runs before any
+    pricing, so a Local ending in another city cannot be quoted at all — the
+    error tells the agent which type to pick instead of pricing the wrong sheet.
+
+    The same guard enforces the admin's booking switch. `enforce_availability`
+    is false only when an operator is amending an existing trip of the same
+    disabled type — servicing a booked trip is not creating a new one.
+    """
+    from app.modules.booking.services.trip_guard import TripPoint, check_trip
+
+    trip_type = (trip_type or "").strip().upper()
+    if enforce_availability and not await is_cab_trip_type_enabled(db, trip_type):
+        raise ValidationException(cab_booking_disabled_message(trip_type))
+
+    check = await check_trip(
+        db,
+        trip_type=trip_type,
+        pickup=TripPoint(name=pickup_location),
+        drop=TripPoint(name=drop_location) if drop_location else None,
+        stops=[TripPoint(name=s.name) for s in (stops or []) if s.name],
+        pickup_datetime=pickup_datetime,
+        return_datetime=return_datetime,
+        allow_drop_for_duration=allow_drop_for_duration,
+    )
+    if check.errors:
+        raise ValidationException(" ".join(check.errors))
+
+
 def _km_text(value: Decimal | float) -> str:
     """Kilometres the way a person reads them: 30, not 30.0 and not 3E+1.
 
@@ -1300,6 +1435,7 @@ def _km_text(value: Decimal | float) -> str:
 def _cab_confirmation_context(
     quote,
     *,
+    package: bool = False,
     booking_number: str,
     trip_type: str,
     pickup_location: str,
@@ -1320,28 +1456,56 @@ def _cab_confirmation_context(
     Kept apart from the endpoint because the sum of the lines and the total the
     customer is told they pay are money claims worth testing directly.
     """
-    b = quote.breakdown
     payable = quote.total - coupon_discount
 
-    lines = [
-        ("Trip type", trip_type or ""),
-        ("Pickup", pickup_location or ""),
-        ("Drop", drop_location or ""),
-        ("Pickup time", pickup_datetime.strftime("%d %b %Y, %I:%M %p")),
-        ("Distance", f"{_km_text(quote.distance.km)} km"),
-    ]
-    money_lines = [
-        ("Base fare", b["base_fare"]),
-        # The kilometre figure in the label is what was *billed*, not what was
-        # driven: a ONE_WAY shorter than the sheet's minimum_km is billed at the
-        # minimum, and printing the driven distance there is the arithmetic that
-        # does not add up.
-        (f"Distance charge ({_km_text(b['billable_km'])} km)", b["distance_charge"]),
-        ("Driver allowance", b["driver_allowance"]),
-        ("Night charge", b["night_charge_applied"]),
-        ("Toll", b["toll"]),
-        ("Waiting", b["waiting"]),
-    ]
+    if package:
+        # A package trip is sold as hours and kilometres up front, so the email
+        # names the package instead of a distance charge the customer never saw
+        # quoted. Only the lines that carry money are listed, for the same
+        # reason the per-km panel omits its zeroes.
+        q = quote.applied
+        lines = [
+            ("Trip type", f"{trip_type.title()} package"),
+            ("Pickup", pickup_location or ""),
+            ("Drop", drop_location or ""),
+            ("Pickup time", pickup_datetime.strftime("%d %b %Y, %I:%M %p")),
+            (
+                "Package",
+                f"{q.package_hours}h / {q.package_km}km"
+                + (f" × {q.days} days" if q.days > 1 else ""),
+            ),
+        ]
+        money_lines = [
+            ("Package price", q.package_price),
+            (f"Extra hours ({q.extra_hours:g}h)", q.extra_hour_charge),
+            (f"Extra km ({q.extra_km:g}km)", q.extra_km_charge),
+            ("Driver allowance", q.driver_allowance),
+            ("Midnight return", q.midnight_charge),
+        ]
+    else:
+        b = quote.breakdown
+        lines = [
+            ("Trip type", trip_type or ""),
+            ("Pickup", pickup_location or ""),
+            ("Drop", drop_location or ""),
+            ("Pickup time", pickup_datetime.strftime("%d %b %Y, %I:%M %p")),
+            ("Distance", f"{_km_text(quote.distance.km)} km"),
+        ]
+        money_lines = [
+            ("Base fare", b["base_fare"]),
+            # The kilometre figure in the label is what was *billed*, not what was
+            # driven: a ONE_WAY shorter than the sheet's minimum_km is billed at the
+            # minimum, and printing the driven distance there is the arithmetic that
+            # does not add up.
+            (
+                f"Distance charge ({_km_text(b['billable_km'])} km)",
+                b["distance_charge"],
+            ),
+            ("Driver allowance", b["driver_allowance"]),
+            ("Night charge", b["night_charge_applied"]),
+            ("Toll", b["toll"]),
+            ("Waiting", b["waiting"]),
+        ]
     lines += [
         (label, f"₹{amount.quantize(Decimal('0.01'))}")
         for label, amount in money_lines
@@ -1408,9 +1572,7 @@ def _cab_amendment_note(cb, payload, quote, re_offered: bool) -> str:
         # Only the new time is named. The stored one comes back as an instant and
         # the requested one as wall-clock, and putting both in one sentence would
         # read as a five-and-a-half hour delay that nobody asked for.
-        parts.append(
-            f"pickup moved to {payload.pickup_datetime:%d %b %Y %H:%M}"
-        )
+        parts.append(f"pickup moved to {payload.pickup_datetime:%d %b %Y %H:%M}")
     if not cb["return_time_unchanged"]:
         parts.append(
             "return removed"
@@ -1449,6 +1611,16 @@ async def quote_cab_booking_by_admin(
 
     effective_city_id = await _desk_pricing_city(payload, db, scope)
 
+    await _guard_trip_type(
+        db,
+        trip_type=payload.trip_type,
+        pickup_location=payload.pickup_location,
+        drop_location=payload.drop_location,
+        stops=payload.stops,
+        pickup_datetime=payload.pickup_datetime,
+        return_datetime=payload.return_datetime,
+    )
+
     quote = await quote_cab_trip(
         db,
         pickup_location=payload.pickup_location,
@@ -1460,6 +1632,7 @@ async def quote_cab_booking_by_admin(
         return_datetime=payload.return_datetime,
         destination_city_id=payload.destination_city_id,
         waiting_minutes=payload.waiting_minutes,
+        stops=[s.name for s in payload.stops if s.name],
     )
     b = quote.breakdown
 
@@ -1529,29 +1702,105 @@ async def create_cab_booking_by_admin(
     row. That is why there is no distance or amount on this payload: an agent who
     re-posts the form with a friendlier number changes nothing they can control.
     """
+    from app.modules.booking.services.trip_guard import estimate_duration_minutes
     from app.modules.booking.services.trip_pricing import fare_columns, quote_cab_trip
 
     effective_city_id = await _desk_pricing_city(payload, db, scope)
     customer = await _desk_customer(db, payload.customer_id, scope)
 
-    quote = await quote_cab_trip(
+    mode = (payload.pricing_mode or "PER_KM").upper()
+    if mode not in {"PER_KM", "PACKAGE"}:
+        raise ValidationException("pricing_mode must be PER_KM or PACKAGE.")
+    _assert_trip_times(payload.pickup_datetime, payload.return_datetime)
+    await _guard_trip_type(
         db,
+        trip_type=payload.trip_type,
         pickup_location=payload.pickup_location,
         drop_location=payload.drop_location,
-        origin_city_id=effective_city_id,
-        vehicle_category_id=payload.vehicle_category_id,
-        trip_type=payload.trip_type,
+        stops=payload.stops,
         pickup_datetime=payload.pickup_datetime,
         return_datetime=payload.return_datetime,
-        destination_city_id=payload.destination_city_id,
-        waiting_minutes=payload.waiting_minutes,
+        # A package is sold by duration, so its drop is context, not a claim
+        # that the trip is a one-city ride.
+        allow_drop_for_duration=mode == "PACKAGE",
     )
+
+    # The two pricing modes answer different questions and both are priced here.
+    # A PACKAGE trip is sold as a package (hours + kilometres agreed up front),
+    # so its fare comes from the rate card and its category from the card's class
+    # mapping — not from whatever the screen posted.
+    package_quote = None
+    if mode == "PACKAGE":
+        from app.modules.booking.services.rental_booking import (
+            quote_rental_package,
+            rental_fare_columns,
+        )
+
+        if not payload.vehicle_class:
+            raise ValidationException(
+                "Choose a rate-card vehicle class for a package booking."
+            )
+        package_quote = await quote_rental_package(
+            db,
+            city_id=effective_city_id,
+            vehicle_class=payload.vehicle_class,
+            rental_type=payload.trip_type,
+            hours=payload.hours or 0,
+            km=payload.km or 0,
+            days=payload.days or 1,
+            returned_after_midnight=payload.returned_after_midnight,
+            customer_id=payload.customer_id,
+            pickup_datetime=payload.pickup_datetime,
+        )
+        # Every blocking reason at once: an agent fixing a form should not have
+        # to resubmit four times to learn four things.
+        if package_quote.errors:
+            raise ValidationException(" ".join(v.message for v in package_quote.errors))
+        if (
+            payload.vehicle_category_id
+            and payload.vehicle_category_id != package_quote.vehicle_category_id
+        ):
+            raise ValidationException(
+                "That vehicle category does not match the priced rate class. "
+                f"{package_quote.vehicle_class} books as category "
+                f"{package_quote.vehicle_category_id}."
+            )
+        trip_type = package_quote.rental_type
+        vehicle_category_id = package_quote.vehicle_category_id
+        estimated_amount = package_quote.total
+        distance_km = package_quote.km
+        distance_source = "PACKAGE"
+        billable_km = package_quote.km
+        quote_notes = [v.message for v in package_quote.validations]
+        fare_cols = rental_fare_columns(package_quote)
+    else:
+        if not payload.vehicle_category_id:
+            raise ValidationException("Choose a vehicle category.")
+        quote = await quote_cab_trip(
+            db,
+            pickup_location=payload.pickup_location,
+            drop_location=payload.drop_location,
+            origin_city_id=effective_city_id,
+            vehicle_category_id=payload.vehicle_category_id,
+            trip_type=payload.trip_type,
+            pickup_datetime=payload.pickup_datetime,
+            return_datetime=payload.return_datetime,
+            destination_city_id=payload.destination_city_id,
+            waiting_minutes=payload.waiting_minutes,
+            stops=[s.name for s in payload.stops if s.name],
+        )
+        trip_type = payload.trip_type
+        vehicle_category_id = payload.vehicle_category_id
+        estimated_amount = quote.total
+        distance_km = quote.distance.km
+        distance_source = quote.distance.source
+        billable_km = Decimal(str(quote.breakdown["billable_km"]))
+        quote_notes = quote.notes
+        fare_cols = fare_columns(quote)
     # Pre-coupon, matching the website: master_bookings.total_amount stays the
     # fare view and the discount lives on cab_bookings + coupon_usages, so the
     # invoice, the settlement line and the partner close-trip math all read the
     # discount from one place and subtract it once.
-    estimated_amount = quote.total
-    fare_cols = fare_columns(quote)
 
     # ── Coupon, through the website's validator ────────────────────────
     # Deliberately not a second rule set: `validate_coupon(reserve=True)` is the
@@ -1572,7 +1821,7 @@ async def create_cab_booking_by_admin(
             ValidateRequest(
                 coupon_code=payload.coupon_code,
                 service_type="CAB",
-                vehicle_category_id=payload.vehicle_category_id,
+                vehicle_category_id=vehicle_category_id,
                 city_id=effective_city_id,
                 booking_amount=estimated_amount,
                 customer_id=payload.customer_id,
@@ -1598,7 +1847,7 @@ async def create_cab_booking_by_admin(
             db,
             coupon_id=coupon_id_used,
             service_type="CAB",
-            vehicle_category_id=payload.vehicle_category_id,
+            vehicle_category_id=vehicle_category_id,
             hotel_id=None,
             room_category_id=None,
             tour_package_id=None,
@@ -1640,20 +1889,28 @@ async def create_cab_booking_by_admin(
         uuid=_uuid.uuid4(),
         master_booking_id=mb.id,
         booking_number=cb_number,
-        trip_type=payload.trip_type,
-        vehicle_category_id=payload.vehicle_category_id,
+        trip_type=trip_type,
+        vehicle_category_id=vehicle_category_id,
         pickup_location=payload.pickup_location,
         pickup_latitude=payload.pickup_latitude,
         pickup_longitude=payload.pickup_longitude,
         drop_location=payload.drop_location,
         drop_latitude=payload.drop_latitude,
         drop_longitude=payload.drop_longitude,
+        # The stops explain the measured distance, so they belong on the row
+        # beside it rather than only in the agent's memory of the call.
+        stops=[s.model_dump() for s in payload.stops if s.name],
+        estimated_duration_minutes=(
+            None
+            if mode == "PACKAGE"
+            else estimate_duration_minutes(float(distance_km), trip_type)
+        ),
         pickup_datetime=payload.pickup_datetime,
         return_datetime=payload.return_datetime,
         # What the trip measured, as opposed to what will be billed: the billable
         # figure is the measured one or the trip type's minimum, whichever is
         # larger, and the difference is exactly what a customer argues about.
-        estimated_distance=quote.distance.km,
+        estimated_distance=distance_km,
         estimated_amount=estimated_amount,
         coupon_code=coupon_code_used,
         coupon_id=coupon_id_used,
@@ -1699,7 +1956,14 @@ async def create_cab_booking_by_admin(
         event_description=(
             "Booking created by admin via Customer Care — "
             f"₹{estimated_amount.quantize(Decimal('0.01'))} for "
-            f"{quote.distance.km} km ({quote.distance.source})"
+            f"{_km_text(distance_km)} km ({distance_source})"
+            + (
+                f" on the {package_quote.vehicle_class} "
+                f"{package_quote.applied.package_hours}h/"
+                f"{package_quote.applied.package_km}km package"
+                if package_quote
+                else ""
+            )
             + (
                 f", coupon {coupon_code_used} −₹{coupon_discount.quantize(Decimal('0.01'))}"
                 if coupon_code_used
@@ -1741,9 +2005,10 @@ async def create_cab_booking_by_admin(
                 to_email=customer["email"],
                 to_name=customer.get("full_name") or None,
                 context=_cab_confirmation_context(
-                    quote,
+                    package_quote or quote,
+                    package=package_quote is not None,
                     booking_number=cb_number,
-                    trip_type=payload.trip_type,
+                    trip_type=trip_type,
                     pickup_location=payload.pickup_location,
                     drop_location=payload.drop_location,
                     pickup_datetime=payload.pickup_datetime,
@@ -1768,13 +2033,13 @@ async def create_cab_booking_by_admin(
         booking_number=mbk_number,
         cab_booking_id=cb.id,
         cab_booking_number=cb_number,
-        distance_km=quote.distance.km,
-        distance_source=quote.distance.source,
-        billable_km=Decimal(str(quote.breakdown["billable_km"])),
+        distance_km=distance_km,
+        distance_source=distance_source,
+        billable_km=billable_km,
         estimated_amount=estimated_amount,
         coupon_discount=coupon_discount,
         payable_amount=estimated_amount - coupon_discount,
-        notes=quote.notes,
+        notes=quote_notes,
         message=(
             "Cab booking created successfully"
             + (
@@ -1821,6 +2086,7 @@ async def edit_cab_booking_by_admin(
     puts the booking back for assignment rather than letting a partner deliver a
     job nobody quoted them.
     """
+    from app.modules.booking.services.trip_guard import estimate_duration_minutes
     from app.modules.booking.services.trip_pricing import fare_columns, quote_cab_trip
 
     cb = (
@@ -1938,6 +2204,22 @@ async def edit_cab_booking_by_admin(
     # A branch amends in its own city; a super admin may move the trip, which is
     # also what re-files the booking under the new office.
     effective_city_id = await _desk_pricing_city(payload, db, scope)
+    _assert_trip_times(payload.pickup_datetime, payload.return_datetime)
+
+    await _guard_trip_type(
+        db,
+        trip_type=payload.trip_type,
+        pickup_location=payload.pickup_location,
+        drop_location=payload.drop_location,
+        stops=payload.stops,
+        pickup_datetime=payload.pickup_datetime,
+        return_datetime=payload.return_datetime,
+        # An existing One Way trip still has to be editable after the product
+        # is switched off; changing a different trip *into* One Way does not.
+        enforce_availability=(
+            str(cb["trip_type"] or "").upper() != payload.trip_type.upper()
+        ),
+    )
 
     quote = await quote_cab_trip(
         db,
@@ -1950,6 +2232,7 @@ async def edit_cab_booking_by_admin(
         return_datetime=payload.return_datetime,
         destination_city_id=payload.destination_city_id,
         waiting_minutes=payload.waiting_minutes,
+        stops=[s.name for s in payload.stops if s.name],
     )
     old_amount = Decimal(str(cb["estimated_amount"] or 0))
     coupon_discount = Decimal(str(cb["coupon_discount"] or 0))
@@ -2045,6 +2328,8 @@ async def edit_cab_booking_by_admin(
             pickup_longitude = :pickup_lng,
             drop_location = :drop_loc, drop_latitude = :drop_lat,
             drop_longitude = :drop_lng,
+            stops = CAST(:stops AS JSONB),
+            estimated_duration_minutes = :duration_minutes,
             pickup_datetime = :pickup_dt, return_datetime = :return_dt,
             estimated_distance = :distance_km, estimated_amount = :total,
             booking_status = :new_status,
@@ -2072,6 +2357,12 @@ async def edit_cab_booking_by_admin(
             "drop_loc": payload.drop_location,
             "drop_lat": payload.drop_latitude,
             "drop_lng": payload.drop_longitude,
+            "stops": json.dumps(
+                [s.model_dump() for s in payload.stops if s.name], default=str
+            ),
+            "duration_minutes": estimate_duration_minutes(
+                float(quote.distance.km), payload.trip_type
+            ),
             "pickup_dt": payload.pickup_datetime,
             "return_dt": payload.return_datetime,
             "distance_km": quote.distance.km,

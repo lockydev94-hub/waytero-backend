@@ -65,6 +65,12 @@ import asyncio
 import sys
 from pathlib import Path
 
+# Windows consoles default to cp1252; the prose below contains "→" and
+# "—", which raise UnicodeEncodeError on print (same fix as
+# seed_cms_defaults.py).
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
 # ── Path setup (same pattern as seed_odisha_tours.py) ────────────────────────
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -295,6 +301,9 @@ async def main() -> None:
             {"value": int(counts["packages"]), "label": "Tour packages"},
             {"value": int(counts["routes"]), "label": "Cab routes"},
         ]
+        # Drop zeroes: a band that advertises "0 Hotels live" is worse than
+        # one that stays quiet, and this installation sells cab + tour only.
+        stats = [s for s in stats if s["value"] > 0]
         variant = variants.get("STATS")
         if variant is None:
             print("NOTE: no active STATS variant — band skipped.")

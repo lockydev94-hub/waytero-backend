@@ -174,24 +174,36 @@ async def linked_vehicle_category_ids(db: AsyncSession, route_id: int) -> list[i
     )
 
 
-async def quote_vehicles(
+async def quote_route_vehicles(
     db: AsyncSession,
     *,
     pricing_city_id: int,
     distance_km: Decimal,
     vehicle_category_ids: list[int],
 ) -> list[dict]:
-    """Live fare-engine breakdown per vehicle, in display order.
+    """What the booking flow charges for this corridor, per vehicle type.
 
-    A vehicle with no rule at all drops out rather than showing a zero price —
-    the route page must never advertise a fare the booking flow cannot charge.
+    Priced from the city's rate card, because that is what a search for this
+    route returns: an outstation package with its included kilometres, driver
+    allowance and extra-km rate. The earlier per-km rule quote was a second,
+    cheaper price for the same journey — the route page said ₹1,584 for a
+    Bhubaneswar→Puri sedan while checkout charged ₹4,150.
+
+    Where several rate classes share one bookable vehicle category (MUV and
+    Premium MUV are both MUV), the cheapest is shown: the results page does the
+    same, so the card here is the card there. A vehicle with no card row at all
+    drops out rather than showing a zero price.
     """
     if not vehicle_category_ids:
         return []
-    from app.modules.admin.services import DefaultPricingService
-    from app.modules.booking.services.fare import calculate_fare_breakdown
+    from app.modules.booking.services.rental_booking import load_rate_card
+    from app.modules.booking.services.rental_rates import calculate_rental_fare
 
-    rows = (
+    by_class, card_source = await load_rate_card(db, pricing_city_id)
+    if not by_class:
+        return []
+
+    categories = (
         (
             await db.execute(
                 text(
@@ -209,21 +221,50 @@ async def quote_vehicles(
         .all()
     )
     km = float(distance_km)
-    out: list[dict] = []
-    for cat in rows:
-        rule = await DefaultPricingService.get_effective_rule(
-            db, pricing_city_id, cat["id"], TRIP_TYPE
-        )
-        if not rule:
+    cheapest: dict[int, dict] = {}
+    for vehicle_class, class_rows in by_class.items():
+        if not any(
+            str(row.get("rental_type") or "").upper() == TRIP_TYPE for row in class_rows
+        ):
             continue
-        b = calculate_fare_breakdown(
-            rule=rule,
-            actual_distance_km=km,
-            start_dt=None,
-            end_dt=None,
-            trip_type=TRIP_TYPE,
-            trip_days=None,
+        category_id = class_rows[0].get("vehicle_category_id")
+        if category_id is None:
+            continue
+        category_id = int(category_id)
+        if category_id not in {int(c["id"]) for c in categories}:
+            continue
+        quote = calculate_rental_fare(
+            class_rows, rental_type=TRIP_TYPE, hours=0, km=km, days=1
         )
+        if category_id in cheapest and cheapest[category_id]["total"] <= quote.total:
+            continue
+        cheapest[category_id] = {
+            "vehicle_class": vehicle_class,
+            "vehicle_label": class_rows[0].get("vehicle_label") or vehicle_class,
+            "vehicle_models": class_rows[0].get("vehicle_models"),
+            "rental_type": TRIP_TYPE,
+            "included_hours": quote.package_hours,
+            "included_km": quote.package_km,
+            "package_price": quote.package_price,
+            "extra_km": quote.extra_km,
+            "extra_km_rate": quote.extra_km_rate,
+            "extra_km_charge": quote.extra_km_charge,
+            "extra_hour_rate": quote.extra_hour_rate,
+            "driver_allowance": quote.driver_allowance,
+            "midnight_charge": quote.midnight_charge,
+            "total": quote.total,
+            "rate_source": card_source.get(vehicle_class, "PLATFORM"),
+            "toll_included": quote.toll_included,
+            "parking_included": quote.parking_included,
+            "night_halt_included": quote.night_halt_included,
+            "actual_distance_km": km,
+        }
+
+    out: list[dict] = []
+    for cat in categories:
+        priced = cheapest.get(int(cat["id"]))
+        if not priced:
+            continue
         out.append(
             {
                 "vehicle_category_id": cat["id"],
@@ -231,19 +272,7 @@ async def quote_vehicles(
                 "seating_capacity": cat["seating_capacity"],
                 "image_url": cat["image_url"],
                 "icon_url": cat["icon_url"],
-                "base_fare": b["base_fare"],
-                "minimum_km": b["minimum_km"],
-                "per_km_rate": b["per_km_rate"],
-                "driver_allowance": b["driver_allowance"],
-                "night_charge_applied": b["night_charge_applied"],
-                "distance_charge": b["distance_charge"],
-                "is_night": b["is_night"],
-                "total": b["total"],
-                "source": rule.get("source", "default"),
-                "actual_distance_km": b["actual_distance_km"],
-                "billable_km": b["billable_km"],
-                "driver_allowance_type": b["driver_allowance_type"],
-                "trip_days": b["trip_days"],
+                **priced,
             }
         )
     return out

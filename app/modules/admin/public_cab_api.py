@@ -30,6 +30,11 @@ from app.core.dependencies import get_current_user
 from app.core.timezone import get_platform_tz_sync, to_platform_tz
 from app.modules.admin.schemas.landing_pages import LandingFareRow
 from app.modules.admin.services import DefaultPricingService
+from app.modules.booking.services.cab_availability import (
+    cab_booking_disabled_message,
+    filter_enabled_cab_trip_types,
+    is_cab_trip_type_enabled,
+)
 from app.modules.booking.services.fare import calculate_fare_breakdown
 
 router = APIRouter()
@@ -118,22 +123,92 @@ class FareBreakdownItem(BaseModel):
     trip_days: Optional[int] = None
 
 
+class PackageFareItem(BaseModel):
+    """One rate-card class, priced as a package for this search.
+
+    This is the supplier card's own vehicle: the model names, the seats, the
+    included hours/kilometres, and the price the card produces for this trip.
+    The results page shows these when the city has a card, because that is what
+    the desk quotes and what the booking will be priced at.
+    """
+
+    vehicle_class: str
+    vehicle_label: str
+    vehicle_models: Optional[str] = None
+    seating_capacity: Optional[int] = None
+    vehicle_category_id: int
+    category_name: str
+    rental_type: str
+    included_hours: int
+    included_km: int
+    days: int
+    price: Decimal
+    extra_hours: Decimal
+    extra_hour_rate: Decimal
+    extra_hour_charge: Decimal
+    extra_km: Decimal
+    extra_km_rate: Decimal
+    extra_km_charge: Decimal
+    driver_allowance: Decimal
+    midnight_charge: Decimal
+    total: Decimal
+    rate_source: str  # CITY | PLATFORM
+    toll_included: bool
+    parking_included: bool
+    night_halt_included: bool
+
+
 class FareEstimateOut(BaseModel):
     distance_km: float
     trip_type: str
     categories: List[FareBreakdownItem]
+    # Empty when the city has no rate card, in which case the per-km rows above
+    # are the whole answer.
+    packages: List[PackageFareItem] = []
+
+
+class CabStopIn(BaseModel):
+    """One place on the route — pickup, drop or a stop between them.
+
+    ``name`` is whatever the customer typed or Google returned; coordinates are
+    optional but, when present, are what let the server place the point in a
+    city without trusting the spelling.
+    """
+
+    name: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    city_id: Optional[int] = None
+
+
+class TripCheckIn(BaseModel):
+    """What the live validation needs: the type and the places it claims."""
+
+    trip_type: str
+    pickup: CabStopIn
+    drop: Optional[CabStopIn] = None
+    stops: List[CabStopIn] = []
+    pickup_datetime: Optional[str] = None
+    return_datetime: Optional[str] = None
+    # Only used when the route cannot be measured — a local hire with no drop.
+    distance_km: Optional[float] = None
 
 
 class CreateCabBookingIn(BaseModel):
     city_id: int
     trip_type: str  # LOCAL | OUTSTATION | AIRPORT | ROUND_TRIP
-    vehicle_category_id: int
+    # Required for PER_KM. A PACKAGE booking names its vehicle by rate class and
+    # the category is derived from that class's card row.
+    vehicle_category_id: Optional[int] = None
     pickup_location: str
     pickup_latitude: Optional[float] = None
     pickup_longitude: Optional[float] = None
     drop_location: Optional[str] = None
     drop_latitude: Optional[float] = None
     drop_longitude: Optional[float] = None
+    # Places the car visits between pickup and drop. The server measures each
+    # leg, so a detour is part of the distance rather than a free extra.
+    stops: List[CabStopIn] = []
     pickup_datetime: str  # ISO format
     # Return datetime for ROUND_TRIP — required so the fare engine can
     # compute ``trip_days`` when the matched pricing rule uses
@@ -141,6 +216,14 @@ class CreateCabBookingIn(BaseModel):
     # types. Added migration 0049.
     return_datetime: Optional[str] = None
     estimated_distance_km: Optional[float] = None
+    # PACKAGE prices from the rate card, the same source the results page and
+    # the admin desk use. PER_KM is the older distance engine and remains the
+    # default for a client that does not ask for packages.
+    pricing_mode: Optional[str] = None
+    vehicle_class: Optional[str] = None
+    hours: Optional[float] = None
+    km: Optional[float] = None
+    days: Optional[int] = None
     passenger_count: Optional[int] = 1
     special_instructions: Optional[str] = None
     # Quoted upfront fare (pre-GST, pre-coupon) from /public/cab/fare-estimate.
@@ -311,6 +394,174 @@ async def get_city_fare_matrix(
     )
 
 
+# ── GET /public/cab/cities/{city_id}/price-list ──────────────────────────────
+
+
+class PricePackageOut(BaseModel):
+    """One quotable package on the rate card (Local 8h/80km, Outstation, Daily)."""
+
+    rental_type: str
+    included_hours: int
+    included_km: int
+    price: Decimal
+    extra_hour_rate: Decimal
+    extra_km_rate: Decimal
+    driver_allowance: Decimal
+    midnight_return_charge: Decimal
+    toll_included: bool
+    parking_included: bool
+    night_halt_included: bool
+
+
+class PriceClassOut(BaseModel):
+    """One supplier vehicle class with every package the city sells for it."""
+
+    vehicle_class: str
+    vehicle_label: str
+    vehicle_models: Optional[str] = None
+    seating_capacity: Optional[int] = None
+    vehicle_category_id: int
+    category_name: str
+    image_url: Optional[str] = None
+    # CITY — the city's own sheet prices this class; PLATFORM — the standard
+    # card does. Stated so a price page never implies a local rate that is not.
+    rate_source: Literal["CITY", "PLATFORM"] = "PLATFORM"
+    packages: List[PricePackageOut] = []
+
+
+class PublicCabPriceListOut(BaseModel):
+    """The published cab price list for one city."""
+
+    city_id: int
+    city_name: str
+    currency: str = "INR"
+    rental_types: List[str] = []
+    classes: List[PriceClassOut] = []
+    updated_at: Optional[str] = None
+
+
+_RENTAL_TYPE_ORDER = {"LOCAL": 0, "OUTSTATION": 1, "DAILY": 2}
+
+
+@router.get(
+    "/cities/{city_id}/price-list",
+    response_model=PublicCabPriceListOut,
+    summary="Published cab price list for a city (no auth)",
+    description=(
+        "The rate card exactly as it prices a booking: every active vehicle "
+        "class, with each package the city sells (included hours/kilometres, "
+        "price, extra-hour and extra-km rates, and what is included). This is "
+        "the same sheet `create-booking` charges from, so the price page and "
+        "the checkout cannot disagree. A class priced by the platform default "
+        "says so, rather than looking like a city rate."
+    ),
+)
+async def get_cab_price_list(city_id: int, db: AsyncSession = Depends(get_db)):
+    from app.modules.booking.services.rental_booking import load_rate_card
+
+    city = (
+        (
+            await db.execute(
+                text(
+                    "SELECT id, name FROM cities "
+                    "WHERE id = :city_id AND is_active = TRUE"
+                ),
+                {"city_id": city_id},
+            )
+        )
+        .mappings()
+        .first()
+    )
+    if not city:
+        raise HTTPException(status_code=404, detail="City not found")
+
+    by_class, source = await load_rate_card(db, city_id)
+    categories = {
+        int(row["id"]): dict(row)
+        for row in (
+            (
+                await db.execute(
+                    text(
+                        "SELECT id, category_name, seating_capacity, image_url "
+                        "FROM vehicle_categories WHERE is_active = TRUE"
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+    }
+
+    def _money(value) -> Decimal:
+        return Decimal(str(value or 0))
+
+    classes: List[PriceClassOut] = []
+    for vehicle_class, rows in by_class.items():
+        sample = rows[0]
+        category_id = sample.get("vehicle_category_id")
+        # A class no fleet is matched to cannot be booked, so it is not a price
+        # a customer can pay and does not belong on a price page.
+        if category_id is None or int(category_id) not in categories:
+            continue
+        category = categories[int(category_id)]
+        packages = [
+            PricePackageOut(
+                rental_type=str(row.get("rental_type") or "").upper(),
+                included_hours=int(row.get("included_hours") or 0),
+                included_km=int(row.get("included_km") or 0),
+                price=_money(row.get("price")),
+                extra_hour_rate=_money(row.get("extra_hour_rate")),
+                extra_km_rate=_money(row.get("extra_km_rate")),
+                driver_allowance=_money(row.get("driver_allowance")),
+                midnight_return_charge=_money(row.get("midnight_return_charge")),
+                toll_included=bool(row.get("toll_included")),
+                parking_included=bool(row.get("parking_included")),
+                night_halt_included=bool(row.get("night_halt_included")),
+            )
+            for row in rows
+        ]
+        packages.sort(
+            key=lambda p: (
+                _RENTAL_TYPE_ORDER.get(p.rental_type, 9),
+                p.included_hours,
+                p.price,
+            )
+        )
+        classes.append(
+            PriceClassOut(
+                vehicle_class=vehicle_class,
+                vehicle_label=sample.get("vehicle_label") or vehicle_class,
+                vehicle_models=sample.get("vehicle_models"),
+                seating_capacity=sample.get("seating_capacity")
+                or category.get("seating_capacity"),
+                vehicle_category_id=int(category_id),
+                category_name=category["category_name"],
+                image_url=category.get("image_url"),
+                rate_source=source.get(vehicle_class, "PLATFORM"),
+                packages=packages,
+            )
+        )
+
+    # Cheapest class first, the same order the results page uses.
+    classes.sort(
+        key=lambda c: (
+            min((p.price for p in c.packages), default=Decimal("999999")),
+            c.seating_capacity or 99,
+        )
+    )
+    rental_types = sorted(
+        {p.rental_type for c in classes for p in c.packages},
+        key=lambda t: (_RENTAL_TYPE_ORDER.get(t, 9), t),
+    )
+
+    return PublicCabPriceListOut(
+        city_id=int(city["id"]),
+        city_name=city["name"],
+        rental_types=rental_types,
+        classes=classes,
+    )
+
+
 # ── GET /public/cab/vehicle-categories ───────────────────────────────────────
 
 
@@ -366,18 +617,39 @@ async def match_nearest_city(
     lng: float = Query(..., ge=-180, le=180),
     db: AsyncSession = Depends(get_db),
 ):
-    """Nearest active city to (lat, lng), by straight-line distance."""
+    """Nearest active city to (lat, lng), by straight-line distance.
+
+    Carries the same bookable-supply signal as ``/cities``. The customer form
+    calls this right after a Google Place pick and treats ``has_pricing=false``
+    as "we don't serve this area" — leaving it at its default made every pick
+    look unserved, Bhubaneswar included.
+    """
     # Pull all active cities with coords; small list, OK to do in-process.
     result = await db.execute(
         text(
             """
-            SELECT id, name, city_code, state_name, latitude, longitude,
+            SELECT id, name, city_code, state_id, state_name, latitude, longitude,
                    (
                      (latitude - :lat) * (latitude - :lat) +
                      (longitude - :lng) * (longitude - :lng)
-                   ) AS d2
+                   ) AS d2,
+                   (
+                     SELECT COUNT(*)
+                       FROM vehicle_categories vc
+                      WHERE vc.is_active = TRUE
+                        AND (
+                          EXISTS (SELECT 1 FROM vehicle_pricing_rules r
+                                   WHERE r.city_id = t.id
+                                     AND r.vehicle_category_id = vc.id)
+                          OR EXISTS (SELECT 1 FROM default_vehicle_pricing_rules d
+                                      WHERE d.vehicle_category_id = vc.id)
+                        )
+                   ) AS vehicle_count,
+                   EXISTS (SELECT 1 FROM vehicle_pricing_rules r
+                            WHERE r.city_id = t.id) AS has_city_rules,
+                   EXISTS (SELECT 1 FROM default_vehicle_pricing_rules) AS has_default_rules
             FROM (
-                SELECT c.id, c.name, c.city_code, s.name AS state_name,
+                SELECT c.id, c.name, c.city_code, c.state_id, s.name AS state_name,
                        c.latitude, c.longitude
                 FROM cities c
                 LEFT JOIN states s ON s.id = c.state_id
@@ -394,13 +666,23 @@ async def match_nearest_city(
     row = result.fetchone()
     if row is None:
         return None
+    vehicle_count = int(row.vehicle_count or 0)
+    source = (
+        "city_specific"
+        if row.has_city_rules
+        else ("default" if vehicle_count and row.has_default_rules else "none")
+    )
     return PublicCityOut(
         id=row.id,
         name=row.name,
         city_code=row.city_code,
+        state_id=row.state_id,
         state_name=row.state_name,
         latitude=float(row.latitude) if row.latitude is not None else None,
         longitude=float(row.longitude) if row.longitude is not None else None,
+        vehicle_count=vehicle_count,
+        has_pricing=vehicle_count > 0,
+        pricing_source=source,
     )
 
 
@@ -416,6 +698,14 @@ _TRIP_TYPE_META: dict[str, tuple[str, str, str]] = {
     "OUTSTATION": ("Outstation", "One-way inter-city", "Navigation"),
     "ONE_WAY": ("One Way", "Drop-only inter-city", "ArrowRight"),
     "ROUND_TRIP": ("Round Trip", "Return journey", "Repeat2"),
+    # The rate card's daily product. Sold per day (12h/100km each, driver
+    # allowance and night halt included), so the customer buys days, not a
+    # route: pickup plus when the rental ends.
+    "DAILY": (
+        "Cab Rent",
+        "Daily rental with driver — 12h / 100km per day",
+        "CalendarClock",
+    ),
 }
 
 
@@ -449,6 +739,25 @@ async def list_active_trip_types(db: AsyncSession = Depends(get_db)):
     )
     codes = sorted({row.trip_type for row in result.fetchall() if row.trip_type})
 
+    # Cab Rent is priced from the rental rate card, not the per-km rule tables,
+    # so its trip type would otherwise never be offered even when the card sells
+    # daily packages. It is listed when at least one active card has them.
+    if "DAILY" not in codes:
+        has_daily_card = (
+            await db.execute(
+                text(
+                    "SELECT 1 FROM cab_rental_rates "
+                    "WHERE rental_type = 'DAILY' AND is_active = TRUE LIMIT 1"
+                )
+            )
+        ).scalar()
+        if has_daily_card:
+            codes = sorted([*codes, "DAILY"])
+
+    # The admin's settings are the list: a type switched off in Settings →
+    # Cab Booking is not returned to the website, the customer app or sitemap.
+    codes = await filter_enabled_cab_trip_types(db, codes)
+
     out: list[PublicTripTypeOut] = []
     for code in codes:
         meta = _TRIP_TYPE_META.get(code)
@@ -475,6 +784,188 @@ async def list_active_trip_types(db: AsyncSession = Depends(get_db)):
             )
         )
     return out
+
+
+# ── Package fares (rate card) ────────────────────────────────────────────────
+
+
+def rental_type_for(trip_type: str, days: int) -> str:
+    """Which card product a website trip type is sold as.
+
+    Airport transfers are a same-city hire, so they price as LOCAL. A one-way or
+    same-day return is the outstation package. A round trip that spans days is
+    the daily product, which is the only one the card sells per day.
+    """
+    trip = (trip_type or "").upper()
+    if trip in {"DAILY", "RENTAL"}:
+        return "DAILY"
+    if trip in {"OUTSTATION", "ONE_WAY"}:
+        return "OUTSTATION"
+    if trip == "ROUND_TRIP":
+        return "DAILY" if (days or 1) > 1 else "OUTSTATION"
+    return "LOCAL"
+
+
+async def _package_fares(
+    db: AsyncSession,
+    *,
+    city_id: int,
+    distance_km: float,
+    trip_type: str,
+    days: int,
+) -> List[PackageFareItem]:
+    """Every class on the card, priced for this search as a package.
+
+    The website does not ask for duty hours, so the card's own package limits are
+    used (5h/50km, 8h/80km, 12h/250km, …) and the searched distance is billed
+    against them. Nothing here is a made-up figure: each row is
+    ``calculate_rental_fare``'s answer for that class.
+    """
+    from app.modules.booking.services.rental_booking import load_rate_card
+    from app.modules.booking.services.rental_rates import calculate_rental_fare
+
+    by_class, source = await load_rate_card(db, city_id)
+    if not by_class:
+        return []
+
+    categories = (
+        (
+            await db.execute(
+                text(
+                    "SELECT id, category_name, seating_capacity "
+                    "FROM vehicle_categories WHERE is_active = TRUE"
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    category_by_id = {int(row["id"]): dict(row) for row in categories}
+
+    rental_type = rental_type_for(trip_type, days)
+    items: List[PackageFareItem] = []
+    for vehicle_class, rows in by_class.items():
+        if not any(
+            str(row.get("rental_type") or "").upper() == rental_type for row in rows
+        ):
+            continue
+        sample = rows[0]
+        category_id = sample.get("vehicle_category_id")
+        # A class with no bookable category cannot be offered: nothing in a
+        # partner's fleet is matched to it.
+        if category_id is None or int(category_id) not in category_by_id:
+            continue
+        quote = calculate_rental_fare(
+            rows,
+            rental_type=rental_type,
+            hours=0,
+            km=distance_km,
+            days=max(1, days or 1),
+        )
+        category = category_by_id[int(category_id)]
+        items.append(
+            PackageFareItem(
+                vehicle_class=vehicle_class,
+                vehicle_label=sample.get("vehicle_label") or vehicle_class,
+                vehicle_models=sample.get("vehicle_models"),
+                seating_capacity=sample.get("seating_capacity")
+                or category.get("seating_capacity"),
+                vehicle_category_id=int(category_id),
+                category_name=category["category_name"],
+                rental_type=rental_type,
+                included_hours=quote.package_hours,
+                included_km=quote.package_km,
+                days=quote.days,
+                price=quote.package_price,
+                extra_hours=quote.extra_hours,
+                extra_hour_rate=quote.extra_hour_rate,
+                extra_hour_charge=quote.extra_hour_charge,
+                extra_km=quote.extra_km,
+                extra_km_rate=quote.extra_km_rate,
+                extra_km_charge=quote.extra_km_charge,
+                driver_allowance=quote.driver_allowance,
+                midnight_charge=quote.midnight_charge,
+                total=quote.total,
+                rate_source=source.get(vehicle_class, "PLATFORM"),
+                toll_included=quote.toll_included,
+                parking_included=quote.parking_included,
+                night_halt_included=quote.night_halt_included,
+            )
+        )
+
+    # Cheapest first, the same order the per-km rows are presented in.
+    return sorted(items, key=lambda item: item.total)
+
+
+# ── POST /public/cab/trip-check ───────────────────────────────────────────────
+
+
+@router.post(
+    "/trip-check",
+    summary="Does the chosen trip type match these places? (no auth)",
+    description=(
+        "The live guard behind both the website and the phone desk. It resolves "
+        "each place to a city, says whether the picked trip type agrees with "
+        "that (a Local trip cannot end in another city), measures the route "
+        "including any stops, and returns an estimated drive time with the "
+        "hints that follow from it. Blocking errors mean the booking must not "
+        "be created under this type; create-booking runs the same check again."
+    ),
+)
+async def check_public_trip(body: TripCheckIn, db: AsyncSession = Depends(get_db)):
+    from datetime import datetime
+
+    from app.modules.booking.services.trip_guard import TripPoint, check_trip
+
+    body.trip_type = body.trip_type.strip().upper()
+    if not await is_cab_trip_type_enabled(db, body.trip_type):
+        raise HTTPException(
+            status_code=400,
+            detail=cab_booking_disabled_message(body.trip_type),
+        )
+
+    def _dt(value: Optional[str]) -> Optional[datetime]:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    result = await check_trip(
+        db,
+        trip_type=body.trip_type,
+        pickup=TripPoint(
+            name=body.pickup.name,
+            latitude=body.pickup.latitude,
+            longitude=body.pickup.longitude,
+            city_id=body.pickup.city_id,
+        ),
+        drop=(
+            TripPoint(
+                name=body.drop.name,
+                latitude=body.drop.latitude,
+                longitude=body.drop.longitude,
+                city_id=body.drop.city_id,
+            )
+            if body.drop and body.drop.name
+            else None
+        ),
+        stops=[
+            TripPoint(
+                name=s.name,
+                latitude=s.latitude,
+                longitude=s.longitude,
+                city_id=s.city_id,
+            )
+            for s in body.stops
+            if s.name
+        ],
+        pickup_datetime=_dt(body.pickup_datetime),
+        return_datetime=_dt(body.return_datetime),
+        fallback_distance_km=body.distance_km,
+    )
+    return {"success": True, "message": "Trip checked.", "data": result.as_dict()}
 
 
 # ── GET /public/cab/fare-estimate ─────────────────────────────────────────────
@@ -511,6 +1002,13 @@ async def get_fare_estimate(
 
     from app.modules.booking.services.fare import trip_days_from
 
+    trip_type = trip_type.strip().upper()
+    if not await is_cab_trip_type_enabled(db, trip_type):
+        raise HTTPException(
+            status_code=400,
+            detail=cab_booking_disabled_message(trip_type),
+        )
+
     # Parse pickup datetime for night charge
     start_dt = None
     if pickup_datetime:
@@ -527,7 +1025,12 @@ async def get_fare_estimate(
         except ValueError:
             end_dt = None
     days = trip_days_from(start_dt, end_dt)
+    rental_days = days
+    if trip_type == "DAILY":
+        # A Cab Rent is sold in 24-hour periods, not inclusive calendar days.
+        from app.modules.booking.services.fare import rental_days_from
 
+        rental_days = rental_days_from(start_dt, end_dt)
     # The search page quotes for a trip on a calendar day, so it must read the
     # fare sheet that is in force on that day. `start_dt` is the customer's chosen
     # pickup; with no pickup time the request's own day is all there is to go on.
@@ -592,10 +1095,19 @@ async def get_fare_estimate(
             )
         )
 
+    packages = await _package_fares(
+        db,
+        city_id=city_id,
+        distance_km=distance_km,
+        trip_type=trip_type,
+        days=rental_days,
+    )
+
     return FareEstimateOut(
         distance_km=distance_km,
         trip_type=trip_type,
         categories=items,
+        packages=packages,
     )
 
 
@@ -660,9 +1172,18 @@ async def create_cab_booking(
     db: AsyncSession = Depends(get_db),
 ):
     import uuid as _uuid
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     from app.shared.utilities.mobile import require_real_mobile
+
+    # A hand-built POST can name a type the website no longer shows. The
+    # setting is enforced here, before any customer or fare work.
+    body.trip_type = body.trip_type.strip().upper()
+    if not await is_cab_trip_type_enabled(db, body.trip_type):
+        raise HTTPException(
+            status_code=400,
+            detail=cab_booking_disabled_message(body.trip_type),
+        )
 
     await require_real_mobile(db, current_user["sub"])
 
@@ -776,6 +1297,53 @@ async def create_cab_booking(
         except ValueError:
             return_dt = None
 
+    # How many days the trip spans — the daily package is sold per day, and the
+    # per-km engine uses the same number for per-day allowances.
+    from app.modules.booking.services.fare import trip_days_from
+
+    days = trip_days_from(pickup_dt, return_dt)
+    if body.trip_type == "DAILY":
+        from app.modules.booking.services.fare import rental_days_from
+
+        days = body.days or rental_days_from(pickup_dt, return_dt)
+
+    # ── Does the booking type match the places? ────────────────────────────
+    # The page runs this same check before it lets a card be clicked, but the
+    # browser's answer is not authority: a hand-built POST could still send a
+    # Local booking ending in another city, and it would be priced on the local
+    # sheet. The check is repeated here and blocks the booking.
+    from app.modules.booking.services.trip_guard import TripPoint, check_trip
+
+    trip_check = await check_trip(
+        db,
+        trip_type=body.trip_type,
+        pickup=TripPoint(
+            name=body.pickup_location,
+            latitude=body.pickup_latitude,
+            longitude=body.pickup_longitude,
+            city_id=body.city_id,
+        ),
+        drop=(
+            TripPoint(
+                name=body.drop_location,
+                latitude=body.drop_latitude,
+                longitude=body.drop_longitude,
+            )
+            if body.drop_location
+            else None
+        ),
+        stops=[
+            TripPoint(name=s.name, latitude=s.latitude, longitude=s.longitude)
+            for s in body.stops
+            if s.name
+        ],
+        pickup_datetime=pickup_dt,
+        return_datetime=return_dt,
+        fallback_distance_km=body.estimated_distance_km,
+    )
+    if trip_check.errors:
+        raise HTTPException(status_code=400, detail=" ".join(trip_check.errors))
+
     # ── Server-side price of the trip ──────────────────────────────────────
     # This used to recompute the fare from `body.estimated_distance_km`, i.e.
     # from the browser's own number. Recomputing a tampered input is arithmetic,
@@ -791,25 +1359,88 @@ async def create_cab_booking(
     )
 
     server_warning: Optional[str] = None
-    quote = await quote_cab_trip(
-        db,
-        pickup_location=body.pickup_location,
-        drop_location=body.drop_location or "",
-        origin_city_id=body.city_id,
-        vehicle_category_id=body.vehicle_category_id,
-        trip_type=body.trip_type,
-        pickup_datetime=pickup_dt,
-        return_datetime=return_dt,
-        fallback_distance_km=(
-            Decimal(str(body.estimated_distance_km))
-            if body.estimated_distance_km
-            else None
-        ),
-    )
-    server_estimated_amount = quote.total
-    fe_amount = (
-        Decimal(str(body.estimated_amount)) if body.estimated_amount else None
-    )
+    # A rent has no per-km rule to fall back on: the card is the only place its
+    # price exists, so an unstated mode on a Cab Rent booking means package.
+    default_mode = "PACKAGE" if (body.trip_type or "").upper() == "DAILY" else "PER_KM"
+    pricing_mode = (body.pricing_mode or default_mode).upper()
+    if pricing_mode not in {"PACKAGE", "PER_KM"}:
+        raise HTTPException(status_code=400, detail="Unknown pricing mode.")
+
+    if return_dt is not None:
+        back = return_dt if return_dt.tzinfo else return_dt.replace(tzinfo=timezone.utc)
+        ahead = (
+            pickup_dt if pickup_dt.tzinfo else pickup_dt.replace(tzinfo=timezone.utc)
+        )
+        if back <= ahead:
+            raise HTTPException(
+                status_code=400,
+                detail="The return time is before the pickup time.",
+            )
+
+    quote = None
+    if pricing_mode == "PACKAGE":
+        # The page quoted a rate-card package, so the booking is priced by that
+        # same calculator. The class is what was selected, not the category —
+        # the card's class is the vehicle the customer was shown.
+        from app.modules.booking.services.rental_booking import (
+            quote_rental_package,
+            rental_fare_columns,
+        )
+
+        if not body.vehicle_class:
+            raise HTTPException(
+                status_code=400, detail="Choose a vehicle for a package booking."
+            )
+        package_quote = await quote_rental_package(
+            db,
+            city_id=body.city_id,
+            vehicle_class=body.vehicle_class,
+            rental_type=rental_type_for(body.trip_type, days),
+            hours=body.hours or 0,
+            km=body.km if body.km is not None else (body.estimated_distance_km or 0),
+            days=max(1, body.days or days or 1),
+            pickup_datetime=pickup_dt,
+        )
+        if package_quote.errors:
+            raise HTTPException(
+                status_code=400,
+                detail=" ".join(v.message for v in package_quote.errors),
+            )
+        server_estimated_amount = package_quote.total
+        vehicle_category_id = package_quote.vehicle_category_id
+        booking_trip_type = package_quote.rental_type
+        distance_km = package_quote.km
+        distance_source = "PACKAGE"
+        fare_cols = rental_fare_columns(package_quote)
+    else:
+        if not body.vehicle_category_id:
+            raise HTTPException(status_code=400, detail="Choose a vehicle category.")
+        quote = await quote_cab_trip(
+            db,
+            pickup_location=body.pickup_location,
+            drop_location=body.drop_location or "",
+            origin_city_id=body.city_id,
+            vehicle_category_id=body.vehicle_category_id,
+            trip_type=body.trip_type,
+            pickup_datetime=pickup_dt,
+            return_datetime=return_dt,
+            fallback_distance_km=(
+                Decimal(str(body.estimated_distance_km))
+                if body.estimated_distance_km
+                else None
+            ),
+            # A stop is a real leg of the journey, so the server measures it
+            # rather than pricing the direct pickup→drop line.
+            stops=[s.name for s in body.stops if s.name],
+        )
+        server_estimated_amount = quote.total
+        vehicle_category_id = body.vehicle_category_id
+        booking_trip_type = body.trip_type
+        distance_km = quote.distance.km
+        distance_source = quote.distance.source
+        fare_cols = fare_columns(quote)
+
+    fe_amount = Decimal(str(body.estimated_amount)) if body.estimated_amount else None
     if fe_amount is not None and abs(fe_amount - server_estimated_amount) > Decimal(
         "0.50"
     ):
@@ -820,13 +1451,14 @@ async def create_cab_booking(
             f"Server fare ₹{server_estimated_amount:.2f} differs from "
             f"client-quoted ₹{fe_amount:.2f}. Using server value."
         )
-    if quote.distance.source == "CLIENT_STATED":
+    if quote is not None and quote.distance.source == "CLIENT_STATED":
         # The customer is being charged on a number nobody measured. Say so in
         # the same field the page already reads, rather than letting the total
         # look as final as a corridor fare.
         server_warning = (
-            server_warning + " " if server_warning else ""
-        ) + "Distance taken from the booking form — no destination was given to measure."
+            (server_warning + " " if server_warning else "")
+            + "Distance taken from the booking form — no destination was given to measure."
+        )
 
     # ── Coupon validation + persistence ──────────────────────────────────
     # Re-validate the coupon against the SERVER-recomputed amount so a tampered
@@ -863,7 +1495,7 @@ async def create_cab_booking(
             ValidateRequest(
                 coupon_code=body.coupon_code,
                 service_type="CAB",
-                vehicle_category_id=body.vehicle_category_id,
+                vehicle_category_id=vehicle_category_id,
                 city_id=body.city_id,
                 booking_amount=server_estimated_amount,
                 customer_id=customer_id,
@@ -888,7 +1520,7 @@ async def create_cab_booking(
             db,
             coupon_id=coupon_id_used,
             service_type="CAB",
-            vehicle_category_id=body.vehicle_category_id,
+            vehicle_category_id=vehicle_category_id,
             hotel_id=None,
             room_category_id=None,
             tour_package_id=None,
@@ -928,11 +1560,23 @@ async def create_cab_booking(
     )
     master_id = mbr.scalar()
 
+    # The route and the trip-type verdict are part of the booking's story: the
+    # legs explain the distance, and the verdict records that the chosen type
+    # was checked against the places rather than assumed.
+    snapshot = dict(fare_cols.get("rate_snapshot") or {})
+    snapshot["stops"] = [s.name for s in body.stops if s.name]
+    snapshot["trip_validation"] = {
+        "checked": True,
+        "detected_type": trip_check.detected_type,
+        "cities": trip_check.cities,
+        "warnings": trip_check.warnings,
+    }
+    fare_cols["rate_snapshot"] = snapshot
+
     # 2. Insert cab booking — includes the persisted coupon snapshot and the
     #    server's own fare lines. The lines are stored rather than re-derived at
     #    invoice time so the page the customer agreed to, the invoice and the
     #    settlement line are provably the same arithmetic.
-    fare_cols = fare_columns(quote)
     await db.execute(
         text(
             """
@@ -941,6 +1585,7 @@ async def create_cab_booking(
             trip_type, vehicle_category_id,
             pickup_location, pickup_latitude, pickup_longitude,
             drop_location, drop_latitude, drop_longitude,
+            stops, estimated_duration_minutes,
             pickup_datetime, return_datetime, estimated_distance, estimated_amount,
             coupon_code, coupon_id, coupon_discount, offer_id,
             pricing_city_id, distance_source, billing_distance_km,
@@ -952,6 +1597,7 @@ async def create_cab_booking(
             :trip_type, :vehicle_category_id,
             :pickup_location, :pickup_lat, :pickup_lng,
             :drop_location, :drop_lat, :drop_lng,
+            CAST(:stops AS jsonb), :duration_minutes,
             :pickup_datetime, :return_datetime, :distance, :estimated,
             :coupon_code, :coupon_id, :coupon_discount, :offer_id,
             :pricing_city_id, :distance_source, :billing_distance_km,
@@ -966,17 +1612,19 @@ async def create_cab_booking(
             "uuid": cab_uuid,
             "master_id": master_id,
             "booking_number": cab_num,
-            "trip_type": body.trip_type,
-            "vehicle_category_id": body.vehicle_category_id,
+            "trip_type": booking_trip_type,
+            "vehicle_category_id": vehicle_category_id,
             "pickup_location": body.pickup_location,
             "pickup_lat": body.pickup_latitude,
             "pickup_lng": body.pickup_longitude,
             "drop_location": body.drop_location,
             "drop_lat": body.drop_latitude,
             "drop_lng": body.drop_longitude,
+            "stops": json.dumps([s.model_dump() for s in body.stops if s.name]),
+            "duration_minutes": trip_check.duration_minutes,
             "pickup_datetime": pickup_dt,
             "return_datetime": return_dt,
-            "distance": quote.distance.km,
+            "distance": distance_km,
             "estimated": server_estimated_amount,
             "coupon_code": coupon_code_used,
             "coupon_id": coupon_id_used,
@@ -1128,8 +1776,8 @@ async def create_cab_booking(
             "estimated_amount": float(server_estimated_amount),
             # So the page can say where the kilometres came from instead of
             # presenting an estimated fare as though it were measured.
-            "distance_km": float(quote.distance.km),
-            "distance_source": quote.distance.source,
+            "distance_km": float(distance_km),
+            "distance_source": distance_source,
             "coupon_code": coupon_code_used,
             "coupon_discount": float(coupon_discount_applied),
             "warning": server_warning,

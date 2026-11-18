@@ -1386,6 +1386,16 @@ async def admin_create_driver(
         {"driver_id": driver_id},
     )
 
+    # The admin-created driver also needs a login row for the driver app.
+    from app.modules.driver.identity import ensure_driver_user
+    from app.modules.driver.models import Driver as _Driver
+
+    _driver = (
+        await db.execute(_select(_Driver).where(_Driver.id == driver_id))
+    ).scalar_one_or_none()
+    if _driver is not None:
+        await ensure_driver_user(db, _driver)
+
     await db.commit()
 
     # ── Email: driver registration received (when an email is provided) ──
@@ -2880,7 +2890,17 @@ async def admin_upload_partner_logo(
 )
 async def admin_upload_partner_document(
     partner_id: int,
-    file: UploadFile = File(..., description="Document file (JPG/PNG/PDF, max 10 MB)"),
+    file: _Optional[UploadFile] = File(
+        None, description="Document file (JPG/PNG/PDF, max 10 MB)"
+    ),
+    file_url: _Optional[str] = Form(
+        None,
+        description=(
+            "Existing Cloudinary secure_url picked from the media library. "
+            "Use instead of `file` to re-attach an asset already uploaded, "
+            "so the same document is not uploaded twice."
+        ),
+    ),
     document_type: str = Form(
         ...,
         description="AADHAAR|PAN|GST_CERTIFICATE|TRADE_LICENSE|BUSINESS_REGISTRATION|BANK_PROOF|AGREEMENT",
@@ -2919,28 +2939,39 @@ async def admin_upload_partner_document(
     if not row:
         raise HTTPException(status_code=404, detail="Partner not found")
 
-    content = await file.read()
-    if len(content) > 10 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="File too large — maximum 10 MB.")
+    picked_url = (file_url or "").strip()
+    if not picked_url and file is None:
+        raise HTTPException(
+            status_code=422, detail="Provide a file or a file_url picked from the media library."
+        )
 
-    cloud_name, api_key, api_secret = await _get_cloudinary_creds(db)
-    ts = int(_time.time())
-    ct = file.content_type or "application/octet-stream"
-    resource_type = "raw" if "pdf" in ct else "image"
-    data = await _upload_to_cloudinary(
-        cloud_name,
-        api_key,
-        api_secret,
-        content,
-        file.filename or "document",
-        ct,
-        folder="waytero/partners/documents",
-        public_id=f"partner_{partner_id}_{document_type.lower()}_{ts}",
-        resource_type=resource_type,
-    )
-    secure_url = data.get("secure_url")
-    if not secure_url:
-        raise HTTPException(status_code=502, detail="Cloudinary did not return a URL.")
+    if picked_url:
+        if not picked_url.startswith(("https://", "http://")):
+            raise HTTPException(status_code=422, detail="file_url must be an http(s) URL.")
+        secure_url = picked_url
+    else:
+        content = await file.read()  # type: ignore[union-attr]
+        if len(content) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="File too large — maximum 10 MB.")
+
+        cloud_name, api_key, api_secret = await _get_cloudinary_creds(db)
+        ts = int(_time.time())
+        ct = file.content_type or "application/octet-stream"  # type: ignore[union-attr]
+        resource_type = "raw" if "pdf" in ct else "image"
+        data = await _upload_to_cloudinary(
+            cloud_name,
+            api_key,
+            api_secret,
+            content,
+            file.filename or "document",  # type: ignore[union-attr]
+            ct,
+            folder="waytero/partners/documents",
+            public_id=f"partner_{partner_id}_{document_type.lower()}_{ts}",
+            resource_type=resource_type,
+        )
+        secure_url = data.get("secure_url")
+        if not secure_url:
+            raise HTTPException(status_code=502, detail="Cloudinary did not return a URL.")
 
     # Insert document record — use document_number if the column exists
     try:
@@ -2989,7 +3020,14 @@ async def admin_upload_partner_document(
             VALUES (:pid, 'DOCUMENT_UPLOADED', :remarks, NOW())
         """
         ),
-        {"pid": partner_id, "remarks": f"Admin uploaded {document_type} document"},
+        {
+            "pid": partner_id,
+            "remarks": (
+                f"Admin attached existing {document_type} document from the media library"
+                if picked_url
+                else f"Admin uploaded {document_type} document"
+            ),
+        },
     )
     await db.commit()
     return AdminActionResponse(

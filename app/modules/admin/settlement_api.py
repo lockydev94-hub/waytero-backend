@@ -268,13 +268,18 @@ def _compute_position(
     advance_amount = float(advance["net_amount"]) if advance else 0.0
     advance_receiver = advance["received_by"] if advance else None
 
-    balance_due = advance_service.compute_balance_due(
-        final_amount=final,
-        # Compatibility boundary for the existing float-based fare calculator.
-        coupon_discount=float(coupon_discount),
-        advance_paid=advance_amount,
-        gst_amount=gst_amount,
-        is_tax_invoice=is_tax_invoice,
+    # compute_balance_due returns Decimal; the rest of this function works in
+    # floats, so convert once at the boundary instead of mixing the two at
+    # `advance_held + balance_held` (which raised on every cash settlement).
+    balance_due = float(
+        advance_service.compute_balance_due(
+            final_amount=final,
+            # Compatibility boundary for the existing float-based fare calculator.
+            coupon_discount=float(coupon_discount),
+            advance_paid=advance_amount,
+            gst_amount=gst_amount,
+            is_tax_invoice=is_tax_invoice,
+        )
     )
 
     advance_held = (
@@ -1131,6 +1136,28 @@ async def settle_booking(
         f"{workings}. " + settlement_note,
     )
     await db.commit()
+
+    # The partner app is often open on the booking when finance settles it.
+    # Without this event its cached booking keeps saying "Settlement pending"
+    # and offers a stale "Start trip" action.
+    try:
+        from app.modules.notification.services.booking_notifications import (
+            notify_booking_updated,
+        )
+
+        await notify_booking_updated(
+            db,
+            service_type="CAB",
+            master_booking_id=mb.id,
+            service_id=cb.id,
+            booking_number=cb.booking_number,
+            service_status=cb.booking_status,
+            action="SETTLED",
+            payment_status="PAID",
+            partner_ids=[partner_id],
+        )
+    except Exception:  # pragma: no cover — never fail a settlement on a socket
+        pass
 
     # ── Email: settlement summary to the partner ──
     try:
@@ -2682,7 +2709,9 @@ async def list_settlement_statements(
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     total = (
-        await db.execute(text(f"SELECT COUNT(*) FROM settlements s {where_sql}"), params)
+        await db.execute(
+            text(f"SELECT COUNT(*) FROM settlements s {where_sql}"), params
+        )
     ).scalar() or 0
     rows = (
         (
@@ -2714,10 +2743,16 @@ async def list_settlement_statements(
         "items": [
             {
                 **dict(row),
-                "start_date": row["start_date"].isoformat() if row["start_date"] else None,
+                "start_date": (
+                    row["start_date"].isoformat() if row["start_date"] else None
+                ),
                 "end_date": row["end_date"].isoformat() if row["end_date"] else None,
-                "settled_at": row["settled_at"].isoformat() if row["settled_at"] else None,
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                "settled_at": (
+                    row["settled_at"].isoformat() if row["settled_at"] else None
+                ),
+                "created_at": (
+                    row["created_at"].isoformat() if row["created_at"] else None
+                ),
                 "gross_amount": float(row["gross_amount"] or 0),
                 "commission_amount": float(row["commission_amount"] or 0),
                 "gst_amount": float(row["gst_amount"] or 0),

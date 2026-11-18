@@ -60,6 +60,12 @@ class AuthenticationGuardMiddleware(BaseHTTPMiddleware):
         if path in PUBLIC_PATHS:
             return await call_next(request)
 
+        # Razorpay calls this endpoint server-to-server and cannot carry a
+        # customer bearer token. The route verifies X-Razorpay-Signature using
+        # the webhook secret from admin Settings before touching any booking.
+        if path == "/api/v1/payments/webhook":
+            return await call_next(request)
+
         if path.startswith("/api/v1") and not path.startswith(PUBLIC_API_PREFIXES):
             auth_header = request.headers.get("Authorization", "")
             token = None

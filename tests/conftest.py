@@ -155,7 +155,9 @@ class StubAuthService:
     # ── Admin session policy (Admin Portal §39, migration 0084) ──
     # Kept in step with AuthService so the /auth/admin/* routes stay testable.
 
-    async def get_session_config(self, user_id: UUID) -> SessionConfigResponse:
+    async def get_session_config(
+        self, user_id: UUID, session_id: str | None = None
+    ) -> SessionConfigResponse:
         return SessionConfigResponse(
             has_mpin=self.mpin_set,
             has_password=True,

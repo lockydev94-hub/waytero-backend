@@ -206,8 +206,12 @@ async def _customer_id(db: AsyncSession, user: dict) -> Optional[int]:
 
 
 async def _validate_booking_coupon(
-    db: AsyncSession, *, code: Optional[str], customer_id: int,
-    package: TourPackage, total: Decimal,
+    db: AsyncSession,
+    *,
+    code: Optional[str],
+    customer_id: int,
+    package: TourPackage,
+    total: Decimal,
 ):
     if not code:
         return None
@@ -914,7 +918,8 @@ async def admin_booking_status(
     booking = await db.scalar(select(TourBooking).where(TourBooking.id == booking_id))
     if not booking:
         raise HTTPException(404, "Tour booking not found")
-    if payload.status.upper() not in {
+    desired = payload.status.upper()
+    if desired not in {
         "PENDING_CONFIRMATION",
         "CONFIRMED",
         "IN_PROGRESS",
@@ -924,13 +929,13 @@ async def admin_booking_status(
         "SETTLED",
     }:
         raise HTTPException(422, "Unsupported tour booking status")
-    if payload.status.upper() == "IN_PROGRESS" and not (
-        booking.vehicle_id and booking.driver_id
-    ):
-        raise HTTPException(422, "Assign a vehicle and driver before starting the trip")
-    if payload.status.upper() == "COMPLETED" and booking.payment_status != "PAID":
-        raise HTTPException(422, "Collect the full payment before completing the tour.")
-    booking.booking_status = payload.status.upper()
+    if desired in {"IN_PROGRESS", "COMPLETED"}:
+        raise HTTPException(
+            409,
+            "The assigned driver starts and closes this tour in the WayTero "
+            "driver app. Admin can invoice and settle after closure.",
+        )
+    booking.booking_status = desired
     return {"id": booking.id, "booking_status": booking.booking_status}
 
 
@@ -1568,15 +1573,18 @@ async def partner_submit_package(
     return await _package_payload(db, package)
 
 
-# Partner-managed tour booking workflow (mirrors the hotel flow):
+# Partner-managed tour booking workflow:
 #   PENDING_CONFIRMATION → (partner accepts) → CONFIRMED
-#   CONFIRMED            → (partner starts tour) → IN_PROGRESS
-#   IN_PROGRESS          → (partner completes) → COMPLETED
+#   CONFIRMED            → (assigned driver starts in driver app) → IN_PROGRESS
+#   IN_PROGRESS          → (driver closes in driver app) → COMPLETED
 #   PENDING_CONFIRMATION | CONFIRMED → (partner cancels) → CANCELLED
+#
+# Start/Complete are deliberately NOT partner transitions. The assigned
+# driver owns execution and payment collection; settlement stays with admin.
 TOUR_PARTNER_TRANSITIONS: dict[str, set[str]] = {
     "PENDING_CONFIRMATION": {"CONFIRMED", "CANCELLED"},
-    "CONFIRMED": {"IN_PROGRESS", "CANCELLED"},
-    "IN_PROGRESS": {"COMPLETED"},
+    "CONFIRMED": {"CANCELLED"},
+    "IN_PROGRESS": set(),
     "COMPLETED": set(),
     "CANCELLED": set(),
 }
@@ -1801,9 +1809,10 @@ async def partner_tour_booking_status(
     admin step in between, mirroring the hotel flow):
 
       Accept:   PENDING_CONFIRMATION → CONFIRMED
-      Start:    CONFIRMED → IN_PROGRESS
-      Complete: IN_PROGRESS → COMPLETED
       Cancel:   PENDING_CONFIRMATION | CONFIRMED → CANCELLED (reason required)
+
+    Start and completion belong to the assigned driver's app, not the partner:
+    only the driver can record the odometer and collect the balance.
 
     The master booking status is kept in sync, a timeline row is written,
     and the partner's other tabs are told to close any accept popup.
@@ -1822,6 +1831,12 @@ async def partner_tour_booking_status(
         raise HTTPException(403, "This booking does not belong to your tour packages")
 
     desired = payload.status.upper()
+    if desired in {"IN_PROGRESS", "COMPLETED"}:
+        raise HTTPException(
+            409,
+            "The assigned driver starts and closes this tour in the WayTero "
+            "driver app. The partner cannot change execution status.",
+        )
     allowed = TOUR_PARTNER_TRANSITIONS.get(booking.booking_status, set())
     if desired not in allowed:
         raise HTTPException(
@@ -2716,8 +2731,11 @@ async def create_public_booking(
     # Reserve before any booking writes; the shared helper records funding
     # under this lock in the same transaction, without committing internally.
     validation = await _validate_booking_coupon(
-        db, code=payload.coupon_code, customer_id=customer_id,
-        package=package, total=total,
+        db,
+        code=payload.coupon_code,
+        customer_id=customer_id,
+        package=package,
+        total=total,
     )
     discount = validation.discount_amount if validation else Decimal("0.00")
     payable = total - discount
@@ -2727,8 +2745,12 @@ async def create_public_booking(
         from app.modules.admin.offer_service import resolve_offer_for_booking
 
         offer_id_used = await resolve_offer_for_booking(
-            db, coupon_id=validation.coupon_id, service_type="TOUR",
-            vehicle_category_id=None, hotel_id=None, room_category_id=None,
+            db,
+            coupon_id=validation.coupon_id,
+            service_type="TOUR",
+            vehicle_category_id=None,
+            hotel_id=None,
+            room_category_id=None,
             tour_package_id=package.id,
         )
     master = MasterBooking(
@@ -2752,7 +2774,9 @@ async def create_public_booking(
         travel_end_date=end_date,
         persons_count=payload.persons_count,
         total_amount=total,
-        coupon_code=payload.coupon_code.strip().upper() if payload.coupon_code else None,
+        coupon_code=(
+            payload.coupon_code.strip().upper() if payload.coupon_code else None
+        ),
         coupon_discount=discount,
         offer_id=offer_id_used,
         payment_status="PAID" if payable == 0 else "PENDING",
@@ -2777,8 +2801,11 @@ async def create_public_booking(
         from app.modules.admin.coupon_api import record_coupon_usage
 
         await record_coupon_usage(
-            db, validation=validation, customer_id=customer_id,
-            master_booking_id=master.id, tour_booking_id=tour.id,
+            db,
+            validation=validation,
+            customer_id=customer_id,
+            master_booking_id=master.id,
+            tour_booking_id=tour.id,
         )
     if payable == 0:
         master.payment_status = "PAID"
@@ -2937,8 +2964,11 @@ async def care_create_tour(
     # Reserve before any booking writes; the shared helper records funding
     # under this lock in the same transaction, without committing internally.
     validation = await _validate_booking_coupon(
-        db, code=payload.coupon_code, customer_id=customer_id,
-        package=package, total=total,
+        db,
+        code=payload.coupon_code,
+        customer_id=customer_id,
+        package=package,
+        total=total,
     )
     discount = validation.discount_amount if validation else Decimal("0.00")
     payable = total - discount
@@ -2948,8 +2978,12 @@ async def care_create_tour(
         from app.modules.admin.offer_service import resolve_offer_for_booking
 
         offer_id_used = await resolve_offer_for_booking(
-            db, coupon_id=validation.coupon_id, service_type="TOUR",
-            vehicle_category_id=None, hotel_id=None, room_category_id=None,
+            db,
+            coupon_id=validation.coupon_id,
+            service_type="TOUR",
+            vehicle_category_id=None,
+            hotel_id=None,
+            room_category_id=None,
             tour_package_id=package.id,
         )
     master = MasterBooking(
@@ -2973,7 +3007,9 @@ async def care_create_tour(
         travel_end_date=end_date,
         persons_count=payload.persons_count,
         total_amount=total,
-        coupon_code=payload.coupon_code.strip().upper() if payload.coupon_code else None,
+        coupon_code=(
+            payload.coupon_code.strip().upper() if payload.coupon_code else None
+        ),
         coupon_discount=discount,
         offer_id=offer_id_used,
         payment_status="PAID" if payable == 0 else "PENDING",
@@ -2999,8 +3035,11 @@ async def care_create_tour(
         from app.modules.admin.coupon_api import record_coupon_usage
 
         await record_coupon_usage(
-            db, validation=validation, customer_id=customer_id,
-            master_booking_id=master.id, tour_booking_id=tour.id,
+            db,
+            validation=validation,
+            customer_id=customer_id,
+            master_booking_id=master.id,
+            tour_booking_id=tour.id,
         )
     if payable == 0:
         master.payment_status = "PAID"

@@ -94,6 +94,7 @@ async def quote_cab_trip(
     destination_city_id: Optional[int] = None,
     waiting_minutes: Optional[int] = None,
     fallback_distance_km: Optional[Decimal] = None,
+    stops: Optional[list[str]] = None,
 ) -> TripQuote:
     """Price a cab trip from the server's own measurement of it.
 
@@ -108,18 +109,34 @@ async def quote_cab_trip(
     quoting a fare over the phone has a destination, and a figure typed by the
     agent is the thing this round removed.
 
+    `stops` are places between pickup and drop. A trip that visits them is longer
+    than the pickup→drop distance, so each leg is measured and summed; pricing a
+    detour as the direct route is a discount nobody asked for. A published
+    corridor is only used for a two-point trip, because a corridor row describes
+    the direct journey, not the detour.
+
     Raises ValidationException when the trip cannot be measured *and* no fallback
     was offered, or when no rule sheet covers the combination — both of which the
     caller must fix rather than price around.
     """
+    route_stops = [s for s in (stops or []) if (s or "").strip()]
     try:
-        distance = await resolve_trip_distance(
-            db,
-            pickup_location=pickup_location,
-            drop_location=drop_location,
-            origin_city_id=origin_city_id,
-            destination_city_id=destination_city_id,
-        )
+        if route_stops:
+            distance = await _measure_with_stops(
+                db,
+                pickup_location=pickup_location,
+                drop_location=drop_location,
+                stops=route_stops,
+                origin_city_id=origin_city_id,
+            )
+        else:
+            distance = await resolve_trip_distance(
+                db,
+                pickup_location=pickup_location,
+                drop_location=drop_location,
+                origin_city_id=origin_city_id,
+                destination_city_id=destination_city_id,
+            )
     except ValidationException:
         if fallback_distance_km is None or fallback_distance_km <= 0:
             raise
@@ -166,6 +183,40 @@ async def quote_cab_trip(
     )
 
 
+async def _measure_with_stops(
+    db: AsyncSession,
+    *,
+    pickup_location: str,
+    drop_location: str,
+    stops: list[str],
+    origin_city_id: int,
+) -> TripDistance:
+    """Pickup → stop 1 → … → drop, leg by leg.
+
+    Google is asked per leg so a stop that the direct-distance shortcut would
+    ignore is counted. The reported source is the *worst* one used: if any leg
+    fell back to a straight-line estimate, the whole figure is approximate and
+    the booking must say so.
+    """
+    from app.modules.admin.cab_route_distance import resolve_route_distance
+
+    points = [pickup_location, *stops, drop_location]
+    total = Decimal("0")
+    sources: set[str] = set()
+    for a, b in zip(points, points[1:]):
+        km, source = await resolve_route_distance(db, a, b)
+        total += Decimal(str(km))
+        sources.add(source)
+    source = "GOOGLE" if sources == {"GOOGLE"} else "HAVERSINE"
+    return TripDistance(
+        km=total.quantize(Decimal("0.1")),
+        source=source,
+        toll=Decimal("0.00"),
+        toll_configured=False,
+        pricing_city_id=origin_city_id,
+    )
+
+
 def _notes_for(distance: TripDistance, breakdown: dict[str, Any]) -> list[str]:
     notes: list[str] = []
     if distance.source == "HAVERSINE":
@@ -183,10 +234,12 @@ def _notes_for(distance: TripDistance, breakdown: dict[str, Any]) -> list[str]:
             f"Billed at the {billable} km minimum for this trip type, not the "
             f"{actual} km of the journey."
         )
-    if breakdown.get("is_night") and Decimal(str(breakdown["night_charge_applied"])) > 0:
+    if (
+        breakdown.get("is_night")
+        and Decimal(str(breakdown["night_charge_applied"])) > 0
+    ):
         notes.append(
-            "Night charge applies to this pickup time "
-            "(22:00–06:00 IST window)."
+            "Night charge applies to this pickup time " "(22:00–06:00 IST window)."
         )
     return notes
 

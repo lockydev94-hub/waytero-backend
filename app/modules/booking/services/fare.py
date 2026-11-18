@@ -40,6 +40,7 @@
 # treating them as zero (matches what get_effective_rule already does).
 # ============================================================
 
+import math
 from datetime import datetime, time, timezone, timedelta
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any, Dict, Mapping, Optional
@@ -337,7 +338,9 @@ def calculate_fare(
 
     # Waiting charge: free_waiting_minutes, actual_waiting_minutes, rate_per_hour, granularity
     free_waiting = _rule_decimal(rule, "free_waiting_minutes")
-    actual_waiting = _decimal_or_rule(actual_waiting_minutes, rule, "actual_waiting_minutes")
+    actual_waiting = _decimal_or_rule(
+        actual_waiting_minutes, rule, "actual_waiting_minutes"
+    )
     waiting_rate = _rule_decimal(rule, "waiting_rate_per_hour")
     waiting_granularity = rule.get("waiting_granularity") or "PER_15_MINUTES"
     waiting = _waiting_charge(
@@ -437,7 +440,9 @@ def calculate_fare_breakdown(
     is_night = is_night_trip(start_dt, end_dt)
 
     # Toll charge — the trip's own when given, otherwise the rule's flat amount.
-    toll = _decimal_or_rule(toll, rule, "toll").quantize(TWO_PLACES, rounding=ROUND_HALF_UP)
+    toll = _decimal_or_rule(toll, rule, "toll").quantize(
+        TWO_PLACES, rounding=ROUND_HALF_UP
+    )
 
     # Waiting charge — the trip's own minutes when given, otherwise the rule's.
     free_waiting = _rule_decimal(rule, "free_waiting_minutes")
@@ -500,3 +505,22 @@ def trip_days_from(
         return 1
     delta = (return_dt.date() - pickup_dt.date()).days
     return max(1, delta + 1)
+
+
+def rental_days_from(
+    pickup_dt: Optional[datetime],
+    return_dt: Optional[datetime],
+) -> int:
+    """Days of hire for a Cab Rent (daily package).
+
+    The daily package is sold in whole 24-hour periods rounded up, so a hire
+    from 09:00 on the 10th to 09:00 on the 12th is 2 days — unlike
+    :func:`trip_days_from`, which counts calendar days inclusively (3 here) for
+    the PER_DAY driver-allowance formula.
+    """
+    if pickup_dt is None or return_dt is None:
+        return 1
+    seconds = (return_dt - pickup_dt).total_seconds()
+    if seconds <= 0:
+        return 1
+    return max(1, math.ceil(seconds / 86_400))

@@ -74,6 +74,9 @@ class UserRepoStub:
     async def get_by_id(self, user_id):
         return self._user
 
+    async def update_last_login(self, user_id):
+        return None
+
 
 def _make_user(
     *,
@@ -418,3 +421,77 @@ async def test_customer_tokens_cannot_reach_the_pin_endpoints(monkeypatch):
 
     with pytest.raises(PermissionDeniedException):
         await service.verify_mpin(user.id, "248157")
+
+
+class SessionRepoStub:
+    """Captures the expiry the login path hands the sessions table."""
+
+    def __init__(self) -> None:
+        self.created: SimpleNamespace | None = None
+
+    async def count_active_sessions(self, user_id):
+        return 0
+
+    async def create(self, **kwargs):
+        self.created = SimpleNamespace(
+            id=uuid4(),
+            refresh_token_hash=kwargs["refresh_token_hash"],
+            login_at=datetime.now(timezone.utc),
+            expires_at=kwargs["expires_at"],
+        )
+        return self.created
+
+
+class RoleRepoStub:
+    async def list_roles_for_user(self, user_id):
+        return ["ADMIN"]
+
+    async def list_permissions_for_user(self, user_id):
+        return []
+
+
+class WorkRepoStub:
+    async def open_day(self, **_kwargs):
+        return None
+
+
+@pytest.mark.parametrize(
+    "user_type, expected_hours",
+    [
+        (UserType.PARTNER, 12),
+        (UserType.ADMIN, 12),
+        (UserType.CUSTOMER, settings.JWT_REFRESH_TOKEN_EXPIRE_DAYS * 24),
+    ],
+)
+async def test_dashboard_logins_cap_the_session_at_twelve_hours(
+    user_type, expected_hours, monkeypatch
+):
+    user = _make_user(user_type=user_type)
+    service, _ = _service(user, monkeypatch=monkeypatch)
+    service.session_repo = SessionRepoStub()
+    service.role_repo = RoleRepoStub()
+    service.work_repo = WorkRepoStub()
+
+    await service._create_session_and_tokens(user, None, None, None)
+
+    started = service.session_repo.created.login_at
+    expires = service.session_repo.created.expires_at
+    assert (expires - started).total_seconds() / 3600 == pytest.approx(
+        expected_hours, abs=0.01
+    )
+
+
+async def test_partner_tokens_reach_the_same_dashboard_pin(monkeypatch):
+    """The partner portal runs the identical lock screen, so a partner is a
+    dashboard user for MPIN purposes — while attendance stays staff-only."""
+    user = _make_user(user_type=UserType.PARTNER)
+    service, audits = _service(user, monkeypatch=monkeypatch)
+
+    await service.set_mpin(user.id, "248157", "Str0ng!Passw0rd")
+    await service.verify_mpin(user.id, "248157")
+
+    config = await service.get_session_config(user.id)
+
+    assert config.has_mpin is True
+    assert config.idle_default_minutes == 5
+    assert "MPIN_SET" in audits

@@ -134,16 +134,20 @@ def _serving_partner_id(cb: CabBooking) -> Optional[int]:
     if not cb.assignments:
         return None
     active = next((a for a in cb.assignments if a.closed_at is None), None)
-    latest = active or sorted(
-        cb.assignments, key=lambda a: a.assigned_at, reverse=True
-    )[0]
+    latest = (
+        active or sorted(cb.assignments, key=lambda a: a.assigned_at, reverse=True)[0]
+    )
     return latest.partner_id
 
 
-async def _partner_city_id(db: AsyncSession, partner_id: Optional[int]) -> Optional[int]:
+async def _partner_city_id(
+    db: AsyncSession, partner_id: Optional[int]
+) -> Optional[int]:
     if not partner_id:
         return None
-    p = (await db.execute(select(Partner).where(Partner.id == partner_id))).scalar_one_or_none()
+    p = (
+        await db.execute(select(Partner).where(Partner.id == partner_id))
+    ).scalar_one_or_none()
     return p.city_id if p else None
 
 
@@ -737,6 +741,7 @@ async def admin_close_trip(
         city_id=commission_city_id,
         service_type="CAB",
         for_date=payload.end_datetime.date() if payload.end_datetime else None,
+        partner_id=partner_id,
     )
 
     # ── GST calculation (BRD §155, Migration 0024) ────────────────────────────
@@ -1662,6 +1667,7 @@ async def get_commission_preview(
         db,
         city_id=await _partner_city_id(db, partner_id),
         service_type="CAB",
+        partner_id=partner_id,
     )
     return {
         "booking_number": booking_number,

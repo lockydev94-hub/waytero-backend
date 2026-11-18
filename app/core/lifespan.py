@@ -50,7 +50,9 @@ async def _acceptance_expiry_loop() -> None:
     janitor.
     """
     from app.core.database import AsyncSessionLocal
-    from app.modules.booking.services.auto_assign import settings as auto_assign_settings
+    from app.modules.booking.services.auto_assign import (
+        settings as auto_assign_settings,
+    )
     from app.workers.timeout_sweeper import _expire_pending_acceptances_async
 
     while True:
@@ -469,59 +471,76 @@ async def lifespan(app: FastAPI):
             hint="RUN_MIGRATIONS_ON_STARTUP=false — expecting the migrate service to have run.",
         )
 
-    # ---- Default Seeders (idempotent — skips if data already exists) ----
-    # Doc Ref: Security Hardening — H2. The admin seeder plants a super-admin
-    # with known dev credentials, and the partner password seeder sets a
-    # published default password. Neither may run in production — those
-    # credentials are provisioned explicitly by an operator instead.
-    if not settings.is_production:
-        logger.info("db_seeders_starting", hint="Running default seeders…")
-        _run_seeders()
-
+    # ---- Startup data work (seeders + idempotent repairs) ----
+    # Every step below spawns its own Python interpreter, and each import of
+    # the model layer costs seconds on Windows — the set was measured at ~4-5
+    # minutes on a cold first start. Scripts/setup/dev-start.ps1 already runs
+    # migrations and scripts/seed_dev_data before it launches uvicorn, so it
+    # sets RUN_SEEDERS_ON_STARTUP=false and the API boots in seconds instead
+    # of repeating the same idempotent work. A manual `uvicorn` run keeps the
+    # default (True) and behaves exactly as before.
+    if not settings.RUN_SEEDERS_ON_STARTUP:
         logger.info(
-            "partner_password_seeder_starting",
-            hint="Seeding default passwords for partners without passwords…",
+            "startup_seeders_skipped",
+            hint="RUN_SEEDERS_ON_STARTUP=false — migrations/seeders already ran "
+            "from the dev start script.",
         )
-        _run_partner_password_seeder()
     else:
+        # ---- Default Seeders (idempotent — skips if data already exists) ----
+        # Doc Ref: Security Hardening — H2. The admin seeder plants a super-admin
+        # with known dev credentials, and the partner password seeder sets a
+        # published default password. Neither may run in production — those
+        # credentials are provisioned explicitly by an operator instead.
+        if not settings.is_production:
+            logger.info("db_seeders_starting", hint="Running default seeders…")
+            _run_seeders()
+
+            logger.info(
+                "partner_password_seeder_starting",
+                hint="Seeding default passwords for partners without passwords…",
+            )
+            _run_partner_password_seeder()
+        else:
+            logger.info(
+                "db_seeders_skipped",
+                hint="Production — admin/partner seeders disabled. "
+                "Provision credentials via scripts/seed_admin.py or the forgot-password flow.",
+            )
+
+        # ---- Wallet Seeder (ensures every partner + customer has a wallet) ----
         logger.info(
-            "db_seeders_skipped",
-            hint="Production — admin/partner seeders disabled. "
-            "Provision credentials via scripts/seed_admin.py or the forgot-password flow.",
+            "wallet_seeder_starting",
+            hint="Ensuring all partner/customer wallets exist…",
         )
+        _run_wallet_seeder()
 
-    # ---- Wallet Seeder (ensures every partner + customer has a wallet) ----
-    logger.info(
-        "wallet_seeder_starting", hint="Ensuring all partner/customer wallets exist…"
-    )
-    _run_wallet_seeder()
+        # ---- Legal Content Seeder (privacy / terms / refund / cookies / instructions) ----
+        logger.info("legal_seeder_starting", hint="Seeding legal page content…")
+        _run_legal_seeder()
 
-    # ---- Legal Content Seeder (privacy / terms / refund / cookies / instructions) ----
-    logger.info("legal_seeder_starting", hint="Seeding legal page content…")
-    _run_legal_seeder()
+        # ---- Fix Stuck Bookings (payment collected but invoice missing) ----
+        logger.info(
+            "fix_stuck_bookings_starting",
+            hint="Checking for bookings with payment but missing invoice…",
+        )
+        _run_fix_stuck_bookings()
 
-    # ---- Fix Stuck Bookings (payment collected but invoice missing) ----
-    logger.info(
-        "fix_stuck_bookings_starting",
-        hint="Checking for bookings with payment but missing invoice…",
-    )
-    _run_fix_stuck_bookings()
+        # ---- Fix Payment State Mismatch (timeline says paid, column still NULL) ----
+        logger.info(
+            "fix_payment_mismatch_starting",
+            hint="Checking for payment state mismatches…",
+        )
+        _run_fix_payment_mismatch()
 
-    # ---- Fix Payment State Mismatch (timeline says paid, column still NULL) ----
-    logger.info(
-        "fix_payment_mismatch_starting", hint="Checking for payment state mismatches…"
-    )
-    _run_fix_payment_mismatch()
-
-    # ---- Fix Hotel Payment Sync (re-roll hotel totals/collections onto master) ----
-    # Repairs legacy master rows whose payment_status / total_paid_amount drifted
-    # out of sync with their hotel_reservations / hotel_advance_payments rows
-    # because the partner-driven lifecycle never called the helper. Idempotent.
-    logger.info(
-        "fix_hotel_payment_sync_starting",
-        hint="Re-rolling hotel payment fields onto master bookings…",
-    )
-    _run_fix_hotel_payment_sync()
+        # ---- Fix Hotel Payment Sync (re-roll hotel totals/collections onto master) ----
+        # Repairs legacy master rows whose payment_status / total_paid_amount drifted
+        # out of sync with their hotel_reservations / hotel_advance_payments rows
+        # because the partner-driven lifecycle never called the helper. Idempotent.
+        logger.info(
+            "fix_hotel_payment_sync_starting",
+            hint="Re-rolling hotel payment fields onto master bookings…",
+        )
+        _run_fix_hotel_payment_sync()
 
     # ---- Redis (optional in Phase 0 — warns cleanly if not running) ----
     # Doc Ref: Phase 1 Foundation — Redis is part of Data Services setup

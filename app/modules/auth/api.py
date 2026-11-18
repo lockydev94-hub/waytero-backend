@@ -33,6 +33,8 @@ from app.modules.auth.schemas import (
     OTPLoginRequest,
     PartnerLoginRequest,
     PartnerChangeFirstPasswordRequest,
+    PartnerRegisterStartRequest,
+    PartnerSelfRegisterRequest,
     RefreshResponse,
     RefreshTokenRequest,
     ResetPasswordRequest,
@@ -211,6 +213,79 @@ async def driver_login(
 
 
 @router.post(
+    "/driver/google",
+    response_model=LoginResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Driver Google sign-in (existing driver email)",
+)
+async def driver_google_login(
+    request: Request,
+    body: FirebaseSignInRequest,
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    ip_address = request.client.host if request.client else None
+    return await auth_service.driver_firebase_login(
+        id_token=body.id_token,
+        device_name=body.device_name or "WayTero Partner Driver Android",
+        device_os=body.device_os or "Android",
+        ip_address=ip_address,
+    )
+
+
+@router.post(
+    "/partner/register/otp",
+    response_model=OTPSentResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Send OTP for partner self-registration",
+)
+async def partner_register_otp(
+    body: PartnerRegisterStartRequest,
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    return await auth_service.send_partner_registration_otp(body.mobile)
+
+
+@router.post(
+    "/partner/register",
+    response_model=LoginResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Apply as a partner and create a pending partner account",
+)
+async def partner_register(
+    request: Request,
+    body: PartnerSelfRegisterRequest,
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    ip_address = request.client.host if request.client else None
+    return await auth_service.partner_self_register(
+        data=body,
+        device_name="WayTero Partner Android",
+        device_os="Android",
+        ip_address=ip_address,
+    )
+
+
+@router.post(
+    "/partner/google",
+    response_model=LoginResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Partner Google sign-in (existing partner email)",
+)
+async def partner_google_login(
+    request: Request,
+    body: FirebaseSignInRequest,
+    auth_service: AuthService = Depends(get_auth_service),
+):
+    ip_address = request.client.host if request.client else None
+    return await auth_service.partner_firebase_login(
+        id_token=body.id_token,
+        device_name=body.device_name,
+        device_os=body.device_os,
+        ip_address=ip_address,
+    )
+
+
+@router.post(
     "/partner/login",
     response_model=LoginResponse,
     status_code=status.HTTP_200_OK,
@@ -350,7 +425,9 @@ async def admin_session_config(
     current_user: dict = Depends(get_current_user),
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    return await auth_service.get_session_config(UUID(current_user["sub"]))
+    return await auth_service.get_session_config(
+        UUID(current_user["sub"]), current_user.get("session_id")
+    )
 
 
 @router.post(
@@ -396,7 +473,11 @@ async def admin_mpin_set(
     )
     return {
         "success": True,
-        "data": (await auth_service.get_session_config(user_id)).model_dump(mode="json"),
+        "data": (
+            await auth_service.get_session_config(
+                user_id, current_user.get("session_id")
+            )
+        ).model_dump(mode="json"),
     }
 
 
@@ -416,7 +497,11 @@ async def admin_mpin_change(
     )
     return {
         "success": True,
-        "data": (await auth_service.get_session_config(user_id)).model_dump(mode="json"),
+        "data": (
+            await auth_service.get_session_config(
+                user_id, current_user.get("session_id")
+            )
+        ).model_dump(mode="json"),
     }
 
 
@@ -435,9 +520,7 @@ async def admin_mpin_verify(
     current_user: dict = Depends(get_current_user),
     auth_service: AuthService = Depends(get_auth_service),
 ):
-    await auth_service.verify_mpin(
-        user_id=UUID(current_user["sub"]), mpin=body.mpin
-    )
+    await auth_service.verify_mpin(user_id=UUID(current_user["sub"]), mpin=body.mpin)
     return {"success": True, "data": {"unlocked": True}}
 
 
@@ -463,7 +546,11 @@ async def admin_mpin_remove(
     )
     return {
         "success": True,
-        "data": (await auth_service.get_session_config(user_id)).model_dump(mode="json"),
+        "data": (
+            await auth_service.get_session_config(
+                user_id, current_user.get("session_id")
+            )
+        ).model_dump(mode="json"),
     }
 
 
@@ -489,7 +576,11 @@ async def admin_idle_lock_minutes(
     # refreshed policy rather than guessing what the effective minute count is.
     return {
         "success": True,
-        "data": (await auth_service.get_session_config(user_id)).model_dump(mode="json"),
+        "data": (
+            await auth_service.get_session_config(
+                user_id, current_user.get("session_id")
+            )
+        ).model_dump(mode="json"),
     }
 
 

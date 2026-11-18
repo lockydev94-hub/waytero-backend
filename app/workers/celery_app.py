@@ -19,6 +19,7 @@ celery_app = Celery(
         "app.workers.invoices",
         "app.workers.reports",
         "app.workers.timeout_sweeper",
+        "app.workers.driver_alerts",
         "app.workers.inventory",
     ],
 )
@@ -53,6 +54,13 @@ celery_app.conf.update(
         "extend-hotel-inventory-horizon": {
             "task": "waytero.inventory.extend_horizon",
             "schedule": 3600.0,
+        },
+        # Auto-resume stale driver pauses and warn about missed pickup times.
+        # Runs every minute so the five-minute resume deadline and overdue
+        # pickup push are never more than a minute late.
+        "sweep-driver-alerts": {
+            "task": "waytero.driver_alerts.sweep",
+            "schedule": 60.0,
         },
     },
 )

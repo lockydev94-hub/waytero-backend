@@ -12,15 +12,52 @@
 # stored: the same rule lookup and breakdown the booking engine uses.
 # ============================================================
 
+from decimal import Decimal
+from typing import Optional
+
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
-from app.modules.admin.cab_route_service import TRIP_TYPE, quote_vehicles
-from app.modules.admin.public_cab_api import FareBreakdownItem
+from app.modules.admin.cab_route_service import TRIP_TYPE, quote_route_vehicles
 
 router = APIRouter()
+
+
+class RouteVehicleOut(BaseModel):
+    """One vehicle on the corridor, priced from the rate card.
+
+    Package fields rather than base/per-km: a route is booked as the outstation
+    package, so the page shows the package price, its included kilometres and
+    any distance charged beyond them — the same lines checkout prints.
+    """
+
+    vehicle_category_id: int
+    category_name: str
+    seating_capacity: Optional[int] = None
+    image_url: Optional[str] = None
+    icon_url: Optional[str] = None
+    vehicle_class: str
+    vehicle_label: str
+    vehicle_models: Optional[str] = None
+    rental_type: str
+    included_hours: int
+    included_km: int
+    package_price: Decimal
+    extra_km: Decimal
+    extra_km_rate: Decimal
+    extra_km_charge: Decimal
+    extra_hour_rate: Decimal
+    driver_allowance: Decimal
+    midnight_charge: Decimal
+    total: Decimal
+    rate_source: str
+    toll_included: bool = False
+    parking_included: bool = False
+    night_halt_included: bool = False
+    actual_distance_km: float
 
 
 async def _active_route_by_slug(db: AsyncSession, slug: str) -> dict:
@@ -122,14 +159,14 @@ async def get_route(slug: str, db: AsyncSession = Depends(get_db)):
         .scalars()
         .all()
     )
-    quoted = await quote_vehicles(
+    quoted = await quote_route_vehicles(
         db,
         pricing_city_id=route["pricing_city_id"],
         distance_km=route["distance_km"],
         vehicle_category_ids=list(vehicle_ids),
     )
     route["trip_type"] = TRIP_TYPE
-    route["vehicles"] = [FareBreakdownItem(**q) for q in quoted]
+    route["vehicles"] = [RouteVehicleOut(**q) for q in quoted]
     return route
 
 

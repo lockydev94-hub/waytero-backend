@@ -92,11 +92,11 @@ def _service(monkeypatch, partner_int_id=None):
     async def fake_access_context(user_id):
         return (["ADMIN"], ["auth.self.read"])
 
-    async def fake_partner_id(user):
-        return partner_int_id
+    async def fake_partner_access(user):
+        return partner_int_id, None, []
 
     service._get_access_context = fake_access_context
-    service._resolve_partner_int_id = fake_partner_id
+    service._resolve_partner_access = fake_partner_access
     return service, audit_calls
 
 

@@ -180,6 +180,24 @@ class TourBooking(Base):
     hotel_details = Column(Text, nullable=True)
     other_details = Column(Text, nullable=True)
     itinerary_snapshot = Column(JSONB, nullable=True)
+
+    # ── Driver execution (migration 0104) ────────────────────
+    # The assigned driver starts and closes the tour from the driver app.
+    # The odometer is execution evidence; the package price stays fixed.
+    trip_start_km = Column(Numeric(12, 2), nullable=True)
+    trip_end_km = Column(Numeric(12, 2), nullable=True)
+    trip_started_at = Column(DateTime(timezone=True), nullable=True)
+    trip_ended_at = Column(DateTime(timezone=True), nullable=True)
+    actual_distance = Column(Numeric(12, 2), nullable=True)
+    cash_pending_at = Column(String(20), nullable=True)  # DRIVER | PARTNER
+    cash_amount_due = Column(
+        Numeric(14, 2), nullable=False, default=Decimal("0.00"), server_default="0"
+    )
+    completed_by_driver_id = Column(
+        BigInteger, ForeignKey("drivers.id", ondelete="SET NULL"), nullable=True
+    )
+    close_notes = Column(Text, nullable=True)
+
     # Money: additional charges from trip modifications + advance custody.
     additional_amount = Column(Numeric(12, 2), nullable=False, default=Decimal("0.00"))
     additional_charge_note = Column(Text, nullable=True)
@@ -197,6 +215,7 @@ class TourBooking(Base):
         Index("idx_tour_bookings_travel_date", "travel_start_date"),
         Index("idx_tour_bookings_vehicle", "vehicle_id"),
         Index("idx_tour_bookings_driver", "driver_id"),
+        Index("idx_tour_bookings_driver_status", "driver_id", "booking_status"),
     )
 
     @property

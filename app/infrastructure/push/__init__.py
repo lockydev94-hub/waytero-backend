@@ -83,6 +83,23 @@ async def _ensure_app(db: AsyncSession) -> bool:
         cfg = await _load_firebase_config(db)
         if not cfg:
             return False
+
+        # Admins often paste the service-account JSON through a settings text
+        # field, which can leave the private key's newlines double-escaped and
+        # drop the small service-account metadata fields. Normalise both here;
+        # otherwise Google sign-in and FCM fail with "invalid certificate" even
+        # though the pasted key itself is valid.
+        cfg = dict(cfg)
+        cfg.setdefault("type", "service_account")
+        cfg.setdefault("token_uri", "https://oauth2.googleapis.com/token")
+        cfg.setdefault("auth_uri", "https://accounts.google.com/o/oauth2/auth")
+        cfg.setdefault(
+            "auth_provider_x509_cert_url",
+            "https://www.googleapis.com/oauth2/v1/certs",
+        )
+        private_key = cfg.get("private_key")
+        if isinstance(private_key, str) and "\\n" in private_key:
+            cfg["private_key"] = private_key.replace("\\n", "\n")
         try:
             cred = credentials.Certificate(cfg)
             app = firebase_admin.initialize_app(cred, name="waytero-fcm")
@@ -113,12 +130,20 @@ async def send_fcm_to_tokens(
     title: str,
     body: str,
     data: dict[str, str] | None = None,
+    *,
+    data_only: bool = False,
 ) -> dict[str, int]:
     """
     Best-effort multicast. Returns counts of success / failure / total.
 
     `data` must be str->str (FCM requirement). We str() everything that
     isn't already a string.
+
+    `data_only` omits the FCM notification block and sends the message at high
+    priority. That is what the partner app needs for an incoming booking: a
+    system-drawn notification would bypass the app's ringing full-screen
+    channel. Title/body are copied into the data payload in that mode so the
+    app can build the notification itself.
 
     If Firebase isn't configured we silently no-op and return
     {'success': 0, 'failure': 0, 'skipped': len(tokens)}.
@@ -129,14 +154,26 @@ async def send_fcm_to_tokens(
         return {"success": 0, "failure": 0, "skipped": len(tokens)}
 
     safe_data = {k: str(v) for k, v in (data or {}).items()}
+    if data_only:
+        safe_data.setdefault("title", title)
+        safe_data.setdefault("body", body)
     msg = messaging.MulticastMessage(
-        notification=messaging.Notification(title=title, body=body),
+        notification=(
+            None if data_only else messaging.Notification(title=title, body=body)
+        ),
         data=safe_data or None,
+        android=messaging.AndroidConfig(priority="high"),
         tokens=tokens,
     )
 
+    # The app is registered under a name ("waytero-fcm"), not as the SDK
+    # default. Both send calls below must be given that app explicitly;
+    # without it they raise "The default Firebase app does not exist" and
+    # every push is silently dropped.
+    assert _initialised_app_name is not None
+    app = firebase_admin.get_app(_initialised_app_name)
     try:
-        resp = messaging.send_each_for_multicast(msg)
+        resp = messaging.send_each_for_multicast(msg, app=app)
         return {
             "success": int(resp.success_count),
             "failure": int(resp.failure_count),

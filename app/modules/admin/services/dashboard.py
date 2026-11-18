@@ -60,6 +60,7 @@ def action_counts_cache_key(scope: BranchScope) -> str:
     """
     return f"{ACTION_COUNTS_CACHE_PREFIX}:{scope.branch_id or 'all'}"
 
+
 # The staff register. SUPER_ADMIN is a row only a super admin may enumerate:
 # it is not a hireable role (StaffUserCreate refuses it) and a manager has no
 # reason to learn how many master accounts exist or which one to probe.
@@ -116,6 +117,15 @@ def _action_counts_statement(scope: BranchScope) -> tuple[str, dict[str, Any]]:
             "SELECT 'customer-care' AS nav_key, COUNT(*) AS c FROM customer_care_logs cl "
             f"WHERE cl.status IN ('OPEN', 'IN_PROGRESS') "
             f"AND ({city.city('cl.city_id', param='ac_care')})"
+        ),
+        (
+            "SELECT 'partner-support' AS nav_key, COUNT(*) AS c "
+            "FROM partner_support_ticket_messages m "
+            "JOIN partner_support_tickets t ON t.id = m.ticket_id "
+            "JOIN partners p ON p.id = t.partner_id "
+            "WHERE m.author_type = 'PARTNER' "
+            "AND m.read_by_admin_at IS NULL "
+            f"AND ({city.city('p.city_id', param='ac_partner_support')})"
         ),
         (
             "SELECT 'chat' AS nav_key, COUNT(*) AS c FROM chat_conversations cc "
@@ -182,9 +192,7 @@ class AdminDashboardService:
 
     # ── §3 Dashboard KPIs ────────────────────────────────────────────────────
     @staticmethod
-    async def get_dashboard(
-        db: AsyncSession, scope: BranchScope
-    ) -> Dict[str, Any]:
+    async def get_dashboard(db: AsyncSession, scope: BranchScope) -> Dict[str, Any]:
         """The KPI row on the landing page, for one caller's branch.
 
         Every figure is scoped, including the money: a Cuttack manager reading a
@@ -1394,7 +1402,9 @@ class AdminDashboardService:
         no branch concept.
         """
         visible_roles = (
-            STAFF_LIST_ROLES if scope is None or scope.is_super else MANAGER_VISIBLE_ROLES
+            STAFF_LIST_ROLES
+            if scope is None or scope.is_super
+            else MANAGER_VISIBLE_ROLES
         )
         placeholders = ",".join(f"'{r}'" for r in visible_roles)
         conditions = [f"u.user_type IN ({placeholders})"]
@@ -1817,17 +1827,21 @@ class AdminDashboardService:
         guard below) does not read it a second time after the UPDATE.
         """
         row = (
-            await db.execute(
-                text(
-                    "SELECT u.user_type, u.branch_id "
-                    "FROM users u "
-                    "WHERE u.id = :user_id "
-                    "AND u.user_type IN ('ADMIN','CCO','VERIFICATION_OFFICER',"
-                    "                    'FINANCE_MANAGER','SUPER_ADMIN')"
-                ),
-                {"user_id": str(user_id)},
+            (
+                await db.execute(
+                    text(
+                        "SELECT u.user_type, u.branch_id "
+                        "FROM users u "
+                        "WHERE u.id = :user_id "
+                        "AND u.user_type IN ('ADMIN','CCO','VERIFICATION_OFFICER',"
+                        "                    'FINANCE_MANAGER','SUPER_ADMIN')"
+                    ),
+                    {"user_id": str(user_id)},
+                )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
 
         if row is None:
             raise ResourceNotFoundException("Staff user", user_id)
@@ -2052,9 +2066,7 @@ class AdminDashboardService:
 
     # ── Sidebar action counts (Admin Portal §5 — Operations badges) ──────────
     @staticmethod
-    async def get_action_counts(
-        db: AsyncSession, scope: BranchScope
-    ) -> Dict[str, int]:
+    async def get_action_counts(db: AsyncSession, scope: BranchScope) -> Dict[str, int]:
         """How many items in each queue are waiting on somebody right now.
 
         One round trip, not eleven: the sidebar polls this every minute for

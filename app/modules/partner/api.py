@@ -4,8 +4,9 @@
 # Phase: 2 — Partner Module
 # ============================================================
 
-from uuid import UUID
-from fastapi import APIRouter, Depends, Query, status
+from uuid import UUID, uuid4
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field
 from sqlalchemy import text as _text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -843,6 +844,780 @@ async def get_my_commission(
             else None
         ),
         "rules": rules,
+    }
+
+
+# ============================================================
+# PARTNER DRIVERS
+# GET /partners/me/drivers
+# The driver module only exposes create/get/update by UUID. The partner
+# app needs the roster before it can assign a driver to a booking, so this
+# read is scoped directly from the authenticated user's partner row.
+# ============================================================
+
+
+@router.get(
+    "/me/drivers",
+    status_code=status.HTTP_200_OK,
+    summary="List the authenticated partner's drivers",
+)
+async def list_my_drivers(
+    status_filter: str | None = Query(None, alias="status"),
+    search: str | None = Query(None),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    partner_id = (
+        await db.execute(
+            _text(
+                "SELECT id FROM partners WHERE user_id = :uid AND deleted_at IS NULL"
+            ),
+            {"uid": current_user["sub"]},
+        )
+    ).scalar_one_or_none()
+    if partner_id is None:
+        return {"items": [], "total": 0}
+
+    where = ["d.partner_id = :pid", "d.deleted_at IS NULL"]
+    params: dict = {"pid": partner_id}
+    if status_filter:
+        where.append("d.status = :status")
+        params["status"] = status_filter.strip().upper()
+    if search:
+        where.append(
+            "(d.full_name ILIKE :search OR d.mobile ILIKE :search "
+            "OR d.driver_code ILIKE :search OR d.license_number ILIKE :search)"
+        )
+        params["search"] = f"%{search.strip()}%"
+
+    rows = (
+        (
+            await db.execute(
+                _text(
+                    f"""
+                    SELECT d.id, d.uuid::text AS uuid, d.driver_code,
+                           d.full_name, d.mobile, d.email, d.license_number,
+                           d.license_expiry_date, d.status, d.joining_date,
+                           COALESCE(da.availability_status, 'OFFLINE') AS availability_status,
+                           (SELECT COUNT(*) FROM driver_documents dd
+                             WHERE dd.driver_id = d.id) AS document_count,
+                           (SELECT COUNT(*) FROM cab_booking_assignments cba
+                             JOIN cab_bookings cb ON cb.id = cba.cab_booking_id
+                            WHERE cba.driver_id = d.id
+                              AND cb.booking_status IN
+                                  ('ASSIGNED','DRIVER_ASSIGNED','STARTED','IN_PROGRESS')
+                              AND cb.trip_ended_at IS NULL) AS active_trips,
+                           (SELECT v.registration_number
+                              FROM cab_booking_assignments cba
+                              JOIN cab_bookings cb ON cb.id = cba.cab_booking_id
+                              JOIN vehicles v ON v.id = cba.vehicle_id
+                             WHERE cba.driver_id = d.id
+                               AND cb.booking_status IN
+                                   ('ASSIGNED','DRIVER_ASSIGNED','STARTED','IN_PROGRESS')
+                               AND cb.trip_ended_at IS NULL
+                             ORDER BY cba.id DESC LIMIT 1) AS vehicle_reg
+                      FROM drivers d
+                      LEFT JOIN driver_availability da ON da.driver_id = d.id
+                     WHERE {' AND '.join(where)}
+                     ORDER BY d.full_name ASC
+                    """
+                ),
+                params,
+            )
+        )
+        .mappings()
+        .all()
+    )
+    items = [
+        {
+            "id": r["id"],
+            "uuid": r["uuid"],
+            "driver_code": r["driver_code"],
+            "full_name": r["full_name"],
+            "mobile": r["mobile"],
+            "email": r["email"],
+            "license_number": r["license_number"],
+            "license_expiry_date": (
+                r["license_expiry_date"].isoformat()
+                if r["license_expiry_date"]
+                else None
+            ),
+            "status": r["status"],
+            "availability_status": r["availability_status"],
+            "joining_date": (
+                r["joining_date"].isoformat() if r["joining_date"] else None
+            ),
+            "document_count": int(r["document_count"] or 0),
+            "active_trips": int(r["active_trips"] or 0),
+            "vehicle_reg": r["vehicle_reg"],
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": len(items)}
+
+
+# ============================================================
+# PARTNER SETTLEMENTS
+# GET /partners/me/settlements
+# Read-only period statements plus the current unsettled position.
+# The partner portal had no partner-scoped settlement history; the app
+# needs it for F2 without exposing the admin settlement routes.
+# ============================================================
+
+
+@router.get(
+    "/me/settlements",
+    status_code=status.HTTP_200_OK,
+    summary="Settlement history for the authenticated partner",
+)
+async def list_my_settlements(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    partner_id = (
+        await db.execute(
+            _text(
+                "SELECT id FROM partners WHERE user_id = :uid AND deleted_at IS NULL"
+            ),
+            {"uid": current_user["sub"]},
+        )
+    ).scalar_one_or_none()
+    if partner_id is None:
+        return {
+            "items": [],
+            "total": 0,
+            "page": page,
+            "pages": 0,
+            "pending": {
+                "bookings_count": 0,
+                "gross_amount": 0.0,
+                "commission_amount": 0.0,
+                "net_payable_amount": 0.0,
+                "start_date": None,
+                "end_date": None,
+            },
+        }
+
+    total = (
+        await db.execute(
+            _text("SELECT COUNT(*) FROM settlements WHERE partner_id = :pid"),
+            {"pid": partner_id},
+        )
+    ).scalar() or 0
+
+    rows = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT s.id, s.uuid::text AS uuid, s.settlement_number,
+                           s.settlement_type, s.start_date, s.end_date,
+                           s.gross_amount, s.commission_amount, s.gst_amount,
+                           s.net_payable_amount, s.settlement_status,
+                           s.settled_at, s.created_at,
+                           (SELECT COUNT(*) FROM settlement_items si
+                             WHERE si.settlement_id = s.id) AS booking_count
+                      FROM settlements s
+                     WHERE s.partner_id = :pid
+                     ORDER BY s.start_date DESC, s.id DESC
+                     LIMIT :limit OFFSET :offset
+                    """
+                ),
+                {
+                    "pid": partner_id,
+                    "limit": page_size,
+                    "offset": (page - 1) * page_size,
+                },
+            )
+        )
+        .mappings()
+        .all()
+    )
+
+    pending = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT COUNT(DISTINCT cb.id) AS booking_count,
+                           COALESCE(SUM(COALESCE(cb.final_amount, 0)
+                                        + COALESCE(cb.gst_amount, 0)), 0) AS gross_amount,
+                           COALESCE(SUM(COALESCE(cb.platform_commission, 0)), 0) AS commission_amount,
+                           COALESCE(SUM(COALESCE(NULLIF(cb.partner_payout, 0),
+                                                 cb.final_amount, 0)), 0) AS net_payable_amount,
+                           MIN(cb.trip_ended_at)::date AS start_date,
+                           MAX(cb.trip_ended_at)::date AS end_date
+                      FROM cab_bookings cb
+                      JOIN cab_booking_assignments cba
+                        ON cba.cab_booking_id = cb.id AND cba.partner_id = :pid
+                     WHERE cb.booking_status IN ('COMPLETED','SETTLEMENT_PENDING')
+                       AND cb.payment_mode IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1 FROM settlement_items si
+                            WHERE si.booking_id = cb.id
+                       )
+                    """
+                ),
+                {"pid": partner_id},
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+    return {
+        "items": [
+            {
+                "id": r["id"],
+                "uuid": r["uuid"],
+                "settlement_number": r["settlement_number"],
+                "settlement_type": r["settlement_type"],
+                "start_date": r["start_date"].isoformat() if r["start_date"] else None,
+                "end_date": r["end_date"].isoformat() if r["end_date"] else None,
+                "bookings_count": int(r["booking_count"] or 0),
+                "gross_amount": float(r["gross_amount"] or 0),
+                "commission_amount": float(r["commission_amount"] or 0),
+                "gst_amount": float(r["gst_amount"] or 0),
+                "net_payable_amount": float(r["net_payable_amount"] or 0),
+                "status": r["settlement_status"],
+                "settled_at": r["settled_at"].isoformat() if r["settled_at"] else None,
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+            }
+            for r in rows
+        ],
+        "total": int(total),
+        "page": page,
+        "pages": (int(total) + page_size - 1) // page_size,
+        "pending": {
+            "bookings_count": int(pending["booking_count"] or 0),
+            "gross_amount": float(pending["gross_amount"] or 0),
+            "commission_amount": float(pending["commission_amount"] or 0),
+            "net_payable_amount": float(pending["net_payable_amount"] or 0),
+            "start_date": (
+                pending["start_date"].isoformat() if pending["start_date"] else None
+            ),
+            "end_date": (
+                pending["end_date"].isoformat() if pending["end_date"] else None
+            ),
+        },
+    }
+
+
+# ============================================================
+# PARTNER SUPPORT TICKETS
+# Doc Ref: 04_FINANCE_ACCOUNT.md AC4
+# The help screen needs a durable place for an issue to land. Kept
+# separate from customer_care_logs: a partner issue is not about one
+# customer and must not enter the customer-care queue as if it were.
+# ============================================================
+
+SUPPORT_CATEGORIES = {
+    "TRIP_ISSUE",
+    "PAYMENT",
+    "DOCUMENT",
+    "APP",
+    "OTHER",
+}
+SUPPORT_PRIORITIES = {"LOW", "NORMAL", "HIGH", "URGENT"}
+
+
+class PartnerSupportTicketCreate(BaseModel):
+    category: str = Field(..., max_length=50)
+    subject: str = Field(..., min_length=3, max_length=255)
+    description: str = Field(..., min_length=10, max_length=4000)
+    booking_reference: str | None = Field(None, max_length=100)
+    priority: str = Field("NORMAL", max_length=20)
+
+
+class PartnerSupportMessageCreate(BaseModel):
+    message: str = Field(..., min_length=1, max_length=4000)
+
+
+async def _partner_row_id(db: AsyncSession, user_uuid: str) -> int | None:
+    return (
+        await db.execute(
+            _text(
+                "SELECT id FROM partners WHERE user_id = :uid AND deleted_at IS NULL"
+            ),
+            {"uid": user_uuid},
+        )
+    ).scalar_one_or_none()
+
+
+@router.get(
+    "/me/support-contact",
+    status_code=status.HTTP_200_OK,
+    summary="Support contact details and the categories the help form accepts",
+)
+async def get_support_contact(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    rows = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT config_key, config_value
+                      FROM system_configurations
+                     WHERE config_key IN ('SUPPORT_EMAIL', 'SUPPORT_PHONE', 'PLATFORM_NAME')
+                    """
+                )
+            )
+        )
+        .mappings()
+        .all()
+    )
+    cfg = {r["config_key"]: (r["config_value"] or "") for r in rows}
+    phone = cfg.get("SUPPORT_PHONE", "").strip()
+    return {
+        "support_email": cfg.get("SUPPORT_EMAIL", "").strip() or "support@waytero.com",
+        "support_phone": phone,
+        "whatsapp_number": phone,
+        "platform_name": cfg.get("PLATFORM_NAME", "WayTero") or "WayTero",
+        "hours": "Mon–Sat, 10 AM–7 PM IST · 24×7 for active trips",
+        "categories": sorted(SUPPORT_CATEGORIES),
+        "priorities": sorted(SUPPORT_PRIORITIES),
+    }
+
+
+@router.get(
+    "/me/support-tickets",
+    status_code=status.HTTP_200_OK,
+    summary="List the authenticated partner's support tickets",
+)
+async def list_my_support_tickets(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=100),
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    partner_id = await _partner_row_id(db, current_user["sub"])
+    if partner_id is None:
+        return {
+            "items": [],
+            "total": 0,
+            "page": page,
+            "pages": 0,
+            "unread_count": 0,
+        }
+
+    total = (
+        await db.execute(
+            _text(
+                "SELECT COUNT(*) FROM partner_support_tickets WHERE partner_id = :pid"
+            ),
+            {"pid": partner_id},
+        )
+    ).scalar() or 0
+    rows = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT t.id, t.ticket_number, t.category, t.subject,
+                           t.description, t.booking_reference, t.priority,
+                           t.status, t.resolution_notes, t.created_at,
+                           t.updated_at, t.resolved_at,
+                           (SELECT COUNT(*)
+                              FROM partner_support_ticket_messages m
+                             WHERE m.ticket_id = t.id
+                               AND m.author_type = 'ADMIN'
+                               AND m.read_by_partner_at IS NULL)
+                               AS unread_count
+                      FROM partner_support_tickets t
+                     WHERE t.partner_id = :pid
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT :limit OFFSET :offset
+                    """
+                ),
+                {
+                    "pid": partner_id,
+                    "limit": page_size,
+                    "offset": (page - 1) * page_size,
+                },
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "id": r["id"],
+                "ticket_number": r["ticket_number"],
+                "category": r["category"],
+                "subject": r["subject"],
+                "description": r["description"],
+                "booking_reference": r["booking_reference"],
+                "priority": r["priority"],
+                "status": r["status"],
+                "resolution_notes": r["resolution_notes"],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "updated_at": r["updated_at"].isoformat() if r["updated_at"] else None,
+                "resolved_at": (
+                    r["resolved_at"].isoformat() if r["resolved_at"] else None
+                ),
+                "unread_count": int(r["unread_count"] or 0),
+            }
+            for r in rows
+        ],
+        "total": int(total),
+        "page": page,
+        "pages": (int(total) + page_size - 1) // page_size,
+        "unread_count": int(
+            (
+                await db.execute(
+                    _text(
+                        "SELECT COUNT(*) "
+                        "FROM partner_support_ticket_messages m "
+                        "JOIN partner_support_tickets t ON t.id = m.ticket_id "
+                        "WHERE t.partner_id = :pid "
+                        "AND m.author_type = 'ADMIN' "
+                        "AND m.read_by_partner_at IS NULL"
+                    ),
+                    {"pid": partner_id},
+                )
+            ).scalar()
+            or 0
+        ),
+    }
+
+
+@router.post(
+    "/me/support-tickets",
+    status_code=status.HTTP_201_CREATED,
+    summary="Raise a support ticket",
+)
+async def create_support_ticket(
+    body: PartnerSupportTicketCreate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    partner_id = await _partner_row_id(db, current_user["sub"])
+    if partner_id is None:
+        raise HTTPException(status_code=404, detail="Partner profile not found")
+
+    category = body.category.strip().upper()
+    if category not in SUPPORT_CATEGORIES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported category. Valid: {', '.join(sorted(SUPPORT_CATEGORIES))}",
+        )
+    priority = body.priority.strip().upper()
+    if priority not in SUPPORT_PRIORITIES:
+        priority = "NORMAL"
+
+    ticket_number = f"PST-{uuid4().hex[:8].upper()}"
+    row = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    INSERT INTO partner_support_tickets (
+                        uuid, partner_id, ticket_number, category, subject,
+                        description, booking_reference, priority, status,
+                        created_at, updated_at
+                    ) VALUES (
+                        :uuid, :pid, :number, :category, :subject,
+                        :description, :booking, :priority, 'OPEN', NOW(), NOW()
+                    )
+                    RETURNING id, ticket_number, category, subject, description,
+                              booking_reference, priority, status, created_at
+                    """
+                ),
+                {
+                    "uuid": str(uuid4()),
+                    "pid": partner_id,
+                    "number": ticket_number,
+                    "category": category,
+                    "subject": body.subject.strip(),
+                    "description": body.description.strip(),
+                    "booking": (body.booking_reference or "").strip() or None,
+                    "priority": priority,
+                },
+            )
+        )
+        .mappings()
+        .one()
+    )
+    partner_name = (
+        await db.execute(
+            _text(
+                "SELECT COALESCE(NULLIF(owner_name, ''), business_name, 'Partner') "
+                "FROM partners WHERE id = :pid"
+            ),
+            {"pid": partner_id},
+        )
+    ).scalar_one_or_none()
+    await db.execute(
+        _text(
+            """
+            INSERT INTO partner_support_ticket_messages (
+                uuid, ticket_id, author_type, author_user_id,
+                author_name, body, created_at,
+                read_by_partner_at, read_by_admin_at
+            ) VALUES (
+                gen_random_uuid(), :ticket_id, 'PARTNER', :user_id,
+                :author_name, :body, NOW(), NOW(), NULL
+            )
+            """
+        ),
+        {
+            "ticket_id": row["id"],
+            "user_id": current_user["sub"],
+            "author_name": partner_name or "Partner",
+            "body": row["description"],
+        },
+    )
+    return {
+        "id": row["id"],
+        "ticket_number": row["ticket_number"],
+        "category": row["category"],
+        "subject": row["subject"],
+        "description": row["description"],
+        "booking_reference": row["booking_reference"],
+        "priority": row["priority"],
+        "status": row["status"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "message": "Support ticket raised",
+    }
+
+
+@router.get(
+    "/me/support-unread-count",
+    status_code=status.HTTP_200_OK,
+    summary="Unread support replies for the authenticated partner",
+)
+async def get_my_support_unread_count(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    partner_id = await _partner_row_id(db, current_user["sub"])
+    if partner_id is None:
+        return {"unread_count": 0}
+    count = (
+        await db.execute(
+            _text(
+                "SELECT COUNT(*) "
+                "FROM partner_support_ticket_messages m "
+                "JOIN partner_support_tickets t ON t.id = m.ticket_id "
+                "WHERE t.partner_id = :pid "
+                "AND m.author_type = 'ADMIN' "
+                "AND m.read_by_partner_at IS NULL"
+            ),
+            {"pid": partner_id},
+        )
+    ).scalar() or 0
+    return {"unread_count": int(count)}
+
+
+@router.get(
+    "/me/support-tickets/{ticket_id}",
+    status_code=status.HTTP_200_OK,
+    summary="Get one of the partner's support tickets with its thread",
+)
+async def get_my_support_ticket(
+    ticket_id: int,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    partner_id = await _partner_row_id(db, current_user["sub"])
+    if partner_id is None:
+        raise HTTPException(status_code=404, detail="Partner profile not found")
+
+    # Opening the thread is the read receipt for the partner side.
+    await db.execute(
+        _text(
+            "UPDATE partner_support_ticket_messages "
+            "SET read_by_partner_at = NOW() "
+            "WHERE ticket_id = :tid AND author_type = 'ADMIN' "
+            "AND read_by_partner_at IS NULL"
+        ),
+        {"tid": ticket_id},
+    )
+    ticket = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT id, ticket_number, category, subject, description,
+                           booking_reference, priority, status, resolution_notes,
+                           created_at, updated_at, resolved_at
+                      FROM partner_support_tickets
+                     WHERE id = :tid AND partner_id = :pid
+                    """
+                ),
+                {"tid": ticket_id, "pid": partner_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Support ticket not found")
+
+    messages = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT id, ticket_id, author_type, author_name, body,
+                           created_at
+                      FROM partner_support_ticket_messages
+                     WHERE ticket_id = :tid
+                     ORDER BY created_at ASC, id ASC
+                    """
+                ),
+                {"tid": ticket_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    return {
+        "id": ticket["id"],
+        "ticket_number": ticket["ticket_number"],
+        "category": ticket["category"],
+        "subject": ticket["subject"],
+        "description": ticket["description"],
+        "booking_reference": ticket["booking_reference"],
+        "priority": ticket["priority"],
+        "status": ticket["status"],
+        "resolution_notes": ticket["resolution_notes"],
+        "created_at": (
+            ticket["created_at"].isoformat() if ticket["created_at"] else None
+        ),
+        "updated_at": (
+            ticket["updated_at"].isoformat() if ticket["updated_at"] else None
+        ),
+        "resolved_at": (
+            ticket["resolved_at"].isoformat() if ticket["resolved_at"] else None
+        ),
+        "messages": [
+            {
+                "id": message["id"],
+                "ticket_id": message["ticket_id"],
+                "author_type": message["author_type"],
+                "author_name": message["author_name"],
+                "body": message["body"],
+                "created_at": (
+                    message["created_at"].isoformat() if message["created_at"] else None
+                ),
+            }
+            for message in messages
+        ],
+    }
+
+
+@router.post(
+    "/me/support-tickets/{ticket_id}/messages",
+    status_code=status.HTTP_201_CREATED,
+    summary="Reply on a partner support ticket",
+)
+async def reply_to_my_support_ticket(
+    ticket_id: int,
+    body: PartnerSupportMessageCreate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    partner_id = await _partner_row_id(db, current_user["sub"])
+    if partner_id is None:
+        raise HTTPException(status_code=404, detail="Partner profile not found")
+
+    ticket = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT id, status FROM partner_support_tickets
+                     WHERE id = :tid AND partner_id = :pid
+                    """
+                ),
+                {"tid": ticket_id, "pid": partner_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if not ticket:
+        raise HTTPException(status_code=404, detail="Support ticket not found")
+    if ticket["status"] == "CLOSED":
+        raise HTTPException(
+            status_code=400,
+            detail="This ticket is closed. Raise a new ticket for a new issue.",
+        )
+
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+
+    partner_name = (
+        await db.execute(
+            _text(
+                "SELECT COALESCE(NULLIF(owner_name, ''), business_name, 'Partner') "
+                "FROM partners WHERE id = :pid"
+            ),
+            {"pid": partner_id},
+        )
+    ).scalar_one_or_none()
+    row = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    INSERT INTO partner_support_ticket_messages (
+                        uuid, ticket_id, author_type, author_user_id,
+                        author_name, body, created_at,
+                        read_by_partner_at, read_by_admin_at
+                    ) VALUES (
+                        gen_random_uuid(), :ticket_id, 'PARTNER', :user_id,
+                        :author_name, :body, NOW(), NOW(), NULL
+                    )
+                    RETURNING id, ticket_id, author_type, author_name,
+                              body, created_at
+                    """
+                ),
+                {
+                    "ticket_id": ticket_id,
+                    "user_id": current_user["sub"],
+                    "author_name": partner_name or "Partner",
+                    "body": message,
+                },
+            )
+        )
+        .mappings()
+        .one()
+    )
+
+    # A resolved ticket is not finished if the partner comes back. Reopen it
+    # so it returns to the admin queue instead of silently staying resolved.
+    if ticket["status"] == "RESOLVED":
+        await db.execute(
+            _text(
+                "UPDATE partner_support_tickets SET status = 'OPEN', "
+                "resolved_at = NULL, updated_at = NOW() WHERE id = :id"
+            ),
+            {"id": ticket_id},
+        )
+    else:
+        await db.execute(
+            _text(
+                "UPDATE partner_support_tickets SET updated_at = NOW() WHERE id = :id"
+            ),
+            {"id": ticket_id},
+        )
+
+    return {
+        "id": row["id"],
+        "ticket_id": row["ticket_id"],
+        "author_type": row["author_type"],
+        "author_name": row["author_name"],
+        "body": row["body"],
+        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+        "ticket_status": "OPEN" if ticket["status"] == "RESOLVED" else ticket["status"],
     }
 
 

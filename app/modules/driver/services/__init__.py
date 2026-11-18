@@ -70,8 +70,17 @@ class DriverService:
         perf = DriverPerformanceSummary(driver_id=driver.id)
         self.repo.db.add(perf)
         await self.repo.db.flush()
+        # A partner-created driver needs a DRIVER login row immediately, not at
+        # the next backfill, or they cannot sign in to the driver app.
+        from app.modules.driver.identity import ensure_driver_user
+
+        await ensure_driver_user(self.repo.db, driver)
+        # Re-fetch with documents/availability eagerly loaded. Serialising the
+        # just-created instance triggers lazy IO outside the async greenlet and
+        # fails with MissingGreenlet when the response model is validated.
+        created = await self.repo.get_by_id(driver.id)
         logger.info("driver_created", driver_id=driver.id, code=code)
-        return DriverResponse.model_validate(driver)
+        return DriverResponse.model_validate(created or driver)
 
     async def get_driver(self, driver_uuid: UUID) -> DriverResponse:
         driver = await self.repo.get_by_uuid(driver_uuid)
@@ -89,6 +98,9 @@ class DriverService:
             setattr(driver, f, v)
         driver.updated_at = datetime.now(timezone.utc)
         driver = await self.repo.update(driver)
+        from app.modules.driver.identity import sync_driver_user_email
+
+        await sync_driver_user_email(self.repo.db, driver)
         return DriverResponse.model_validate(driver)
 
     async def update_status(

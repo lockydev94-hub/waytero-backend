@@ -88,6 +88,17 @@ STAFF_USER_TYPES = (
     "VERIFICATION_OFFICER",
 )
 
+# The portals protected by the screen lock. Partners get the same MPIN gate as
+# staff because their dashboard holds operational and payout data too; drivers
+# and customers do not have a dashboard to lock.
+DASHBOARD_USER_TYPES = STAFF_USER_TYPES + ("PARTNER",)
+
+# Absolute session lifetime for a dashboard sign-in. The refresh token row is
+# capped at this even though customer sessions may live for 30 days: after 12
+# hours the portal must sign in again, so a borrowed laptop cannot stay signed
+# in indefinitely. Idle locking is a separate, shorter rule.
+DASHBOARD_SESSION_HOURS = 12
+
 CONFIG_ADMIN_IDLE_DEFAULT_MINUTES = "ADMIN_IDLE_DEFAULT_MINUTES"
 CONFIG_ADMIN_DAILY_LOGOUT_HOUR = "ADMIN_DAILY_LOGOUT_HOUR"
 CONFIG_ADMIN_MPIN_MIN_LENGTH = "ADMIN_MPIN_MIN_LENGTH"

@@ -1269,43 +1269,66 @@ async def list_media_library(
     query: str = Query("", description="Optional free-text filter on public_id / filename"),
     cursor: str = Query("", alias="next_cursor", description="Pagination cursor from a previous page"),
     page_size: int = Query(30, ge=1, le=100, description="Number of results per page"),
+    resource_type: str = Query(
+        "image",
+        description=(
+            "Cloudinary resource type(s) to list: image | raw | image,raw. "
+            "PDFs uploaded as documents live under raw; the document picker "
+            "asks for both so scans and PDFs share one gallery."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
     _user: dict = Depends(require_permission("settings.manage")),
 ):
     cloud_name, api_key, api_secret = await _get_cloudinary_creds_shared(db)
 
-    # Cloudinary Admin API — list image resources by prefix.
-    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/image"
-    params: dict = {"max_results": page_size, "type": "upload"}
-    if folder.strip():
-        prefix = folder.strip().rstrip("/") + "/"
-        params["prefix"] = prefix
-    if cursor.strip():
-        params["next_cursor"] = cursor.strip()
+    types = [t.strip() for t in resource_type.split(",") if t.strip()]
+    types = [t for t in types if t in ("image", "raw")] or ["image"]
 
-    data = await _cloudinary_admin_get(url, api_key, api_secret, params)
-    resources = data.get("resources", [])
+    items: list[dict] = []
+    next_cursor = ""
+    total_count = 0
 
-    items = []
-    for r in resources:
-        pub = r.get("public_id", "")
-        if query.strip() and query.strip().lower() not in pub.lower():
-            continue
-        items.append({
-            "public_id": pub,
-            "secure_url": r.get("secure_url"),
-            "width": r.get("width"),
-            "height": r.get("height"),
-            "format": r.get("format"),
-            "folder": r.get("folder") or (pub.rsplit("/", 1)[0] if "/" in pub else ""),
-            "bytes": r.get("bytes"),
-            "created_at": r.get("created_at"),
-        })
+    for rtype in types:
+        # Cloudinary Admin API — list resources of this type by prefix.
+        url = f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/{rtype}"
+        params: dict = {"max_results": page_size, "type": "upload"}
+        if folder.strip():
+            prefix = folder.strip().rstrip("/") + "/"
+            params["prefix"] = prefix
+        # A cursor is bound to the resource type it came from, so it is only
+        # honoured for a single-type listing; merged listings start over.
+        if cursor.strip() and len(types) == 1:
+            params["next_cursor"] = cursor.strip()
+
+        data = await _cloudinary_admin_get(url, api_key, api_secret, params)
+        total_count += data.get("total_count") or 0
+        if len(types) == 1:
+            next_cursor = data.get("next_cursor") or ""
+
+        for r in data.get("resources", []):
+            pub = r.get("public_id", "")
+            if query.strip() and query.strip().lower() not in pub.lower():
+                continue
+            items.append({
+                "public_id": pub,
+                "secure_url": r.get("secure_url"),
+                "width": r.get("width"),
+                "height": r.get("height"),
+                "format": r.get("format"),
+                "folder": r.get("folder") or (pub.rsplit("/", 1)[0] if "/" in pub else ""),
+                "bytes": r.get("bytes"),
+                "created_at": r.get("created_at"),
+                "resource_type": rtype,
+            })
+
+    # Newest first across a merged listing; Cloudinary already sorts each type.
+    items.sort(key=lambda i: i.get("created_at") or "", reverse=True)
 
     return {
         "items": items,
-        "next_cursor": data.get("next_cursor") or "",
-        "total_count": data.get("total_count") or len(items),
+        "next_cursor": next_cursor,
+        "total_count": total_count or len(items),
     }
 
 
@@ -1318,15 +1341,17 @@ async def list_media_library(
 )
 async def delete_media_library_item(
     public_id: str,
+    resource_type: str = Query("image", description="image | raw — must match the asset"),
     db: AsyncSession = Depends(get_db),
     _user: dict = Depends(require_permission("settings.manage")),
 ):
     cloud_name, api_key, api_secret = await _get_cloudinary_creds_shared(db)
+    rtype = resource_type if resource_type in ("image", "raw") else "image"
 
     # Cloudinary only honours the path-parameter form (…/upload/<public_id>) for
     # GET; the same path with DELETE falls through to a 404 HTML page. The
     # supported destroy call is the collection endpoint with public_ids[].
-    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/image/upload"
+    url = f"https://api.cloudinary.com/v1_1/{cloud_name}/resources/{rtype}/upload"
     async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.delete(
             url,

@@ -284,6 +284,14 @@ class CabBooking(Base):
     drop_location = Column(Text, nullable=True)
     drop_latitude = Column(Numeric(10, 7), nullable=True)
     drop_longitude = Column(Numeric(10, 7), nullable=True)
+    # ── Stops (added migration 0099) ──────────────────────────────────────────
+    # Ordered places between pickup and drop, each with its resolved city. The
+    # distance is measured across these legs, so they are the only record of why
+    # a 180 km trip is longer than the 60 km pickup→drop line.
+    stops = Column(JSONB, nullable=False, default=list)
+    # The drive-time estimate the customer was shown, in minutes. Null means the
+    # booking was never given one — which is not the same as "zero minutes".
+    estimated_duration_minutes = Column(Integer, nullable=True)
     pickup_datetime = Column(DateTime(timezone=True), nullable=True)
     # ── Return datetime (added migration 0049) ────────────────────────────────
     # Captured for ROUND_TRIP so the fare engine can compute trip_days when
@@ -306,7 +314,26 @@ class CabBooking(Base):
     trip_started_at = Column(DateTime(timezone=True), nullable=True)
     trip_end_km = Column(Numeric(12, 2), nullable=True)
     trip_ended_at = Column(DateTime(timezone=True), nullable=True)
+    # Odometer proof captured by the driver app at start and close. The URL is
+    # the Cloudinary asset; the partner and admin can open it during review.
+    trip_start_photo_url = Column(Text, nullable=True)
+    trip_end_photo_url = Column(Text, nullable=True)
     actual_distance = Column(Numeric(12, 2), nullable=True)
+    # ── Driver-app trip execution (migration 0103) ───────────────────────────
+    # The pause anchor and accumulated pause seconds let the server subtract
+    # paused movement from the map distance. GPS points are stored separately
+    # in driver_trip_points; these last-point columns are the running cursor.
+    trip_paused_at = Column(DateTime(timezone=True), nullable=True)
+    trip_paused_seconds = Column(Integer, nullable=False, default=0)
+    gps_distance_km = Column(Numeric(12, 2), nullable=True)
+    odometer_distance_km = Column(Numeric(12, 2), nullable=True)
+    distance_mismatch_km = Column(Numeric(12, 2), nullable=True)
+    distance_mismatch_pct = Column(Numeric(7, 2), nullable=True)
+    distance_review_status = Column(String(30), nullable=True)
+    trip_last_lat = Column(Numeric(10, 7), nullable=True)
+    trip_last_lng = Column(Numeric(10, 7), nullable=True)
+    trip_last_gps_at = Column(DateTime(timezone=True), nullable=True)
+    cash_handover_notified_at = Column(DateTime(timezone=True), nullable=True)
     payment_mode = Column(String(20), nullable=True)  # CASH | ONLINE | WALLET
     payment_collected_by = Column(
         String(20), nullable=True
@@ -451,6 +478,19 @@ class CabBookingAssignment(Base):
     rejection_reason_code = Column(String(50), nullable=True)
     rejection_notes = Column(Text, nullable=True)
     acceptance_deadline = Column(DateTime(timezone=True), nullable=True)
+    # ── Driver-app offer lifecycle (migration 0103) ──────────────────────────
+    # The partner acceptance above is not the driver acceptance. The driver
+    # gets a separate, short-lived offer: PENDING → ACCEPTED | DECLINED |
+    # EXPIRED. Paused/closed rows are CLOSED. The partial unique index
+    # ux_driver_one_live_assignment makes one live offer/assignment per driver
+    # a database fact.
+    offer_status = Column(String(20), nullable=False, default="PENDING")
+    offered_at = Column(DateTime(timezone=True), nullable=True)
+    offer_expires_at = Column(DateTime(timezone=True), nullable=True)
+    driver_accepted_at = Column(DateTime(timezone=True), nullable=True)
+    driver_declined_at = Column(DateTime(timezone=True), nullable=True)
+    driver_decline_reason = Column(String(50), nullable=True)
+    driver_decline_notes = Column(Text, nullable=True)
     available_cabs_at_offer = Column(Integer, nullable=True)
     available_cabs_at_decline = Column(Integer, nullable=True)
     availability_checked_at = Column(DateTime(timezone=True), nullable=True)
@@ -474,6 +514,87 @@ class CabBookingAssignment(Base):
         Index("idx_cab_assign_cab", "cab_booking_id"),
         Index("idx_cab_assign_driver", "driver_id"),
     )
+
+
+class DriverTripPoint(Base):
+    """One batched driver GPS sample. Doc Ref: 0103 / driver app GPS contract.
+
+    Points are evidence, not the source of truth for billing. The server
+    accumulates distance into cab_bookings.gps_distance_km while the trip is
+    running and skips points captured during a pause.
+    """
+
+    __tablename__ = "driver_trip_points"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    cab_booking_id = Column(
+        BigInteger, ForeignKey("cab_bookings.id", ondelete="CASCADE"), nullable=False
+    )
+    assignment_id = Column(
+        BigInteger,
+        ForeignKey("cab_booking_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    driver_id = Column(
+        BigInteger, ForeignKey("drivers.id", ondelete="CASCADE"), nullable=False
+    )
+    latitude = Column(Numeric(10, 7), nullable=False)
+    longitude = Column(Numeric(10, 7), nullable=False)
+    accuracy_m = Column(Numeric(8, 2), nullable=True)
+    speed_mps = Column(Numeric(8, 2), nullable=True)
+    is_paused = Column(Boolean, nullable=False, default=False)
+    recorded_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (
+        Index("idx_trip_points_booking_time", "cab_booking_id", "recorded_at"),
+        Index("idx_trip_points_driver_time", "driver_id", "recorded_at"),
+    )
+
+
+class TripDistanceReview(Base):
+    """A closed trip whose odometer and map distances disagree.
+
+    Doc Ref: 0103 / partner review contract. The trip still completes; this row
+    is the durable warning the partner sees later. One row per booking.
+    """
+
+    __tablename__ = "trip_distance_reviews"
+
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    cab_booking_id = Column(
+        BigInteger,
+        ForeignKey("cab_bookings.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    assignment_id = Column(
+        BigInteger,
+        ForeignKey("cab_booking_assignments.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    driver_id = Column(BigInteger, ForeignKey("drivers.id"), nullable=False)
+    odometer_km = Column(Numeric(12, 2), nullable=False)
+    gps_km = Column(Numeric(12, 2), nullable=False)
+    difference_km = Column(Numeric(12, 2), nullable=False)
+    difference_pct = Column(Numeric(7, 2), nullable=False)
+    status = Column(String(30), nullable=False, default="PENDING_REVIEW")
+    review_note = Column(Text, nullable=True)
+    reviewed_by_user_id = Column(
+        UUID(as_uuid=True), ForeignKey("users.id"), nullable=True
+    )
+    reviewed_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        nullable=False,
+    )
+
+    __table_args__ = (Index("idx_distance_reviews_status", "status", "created_at"),)
 
 
 class BookingTimeline(Base):
@@ -734,9 +855,7 @@ class Payment(Base):
         String(50), nullable=False, default="SUCCESS"
     )  # DB Schema Part 7 §5
     amount = Column(Numeric(14, 2), nullable=False)
-    refunded_amount = Column(
-        Numeric(14, 2), nullable=False, default=Decimal("0.00")
-    )
+    refunded_amount = Column(Numeric(14, 2), nullable=False, default=Decimal("0.00"))
     received_by = Column(
         String(20), nullable=True
     )  # ADMIN | PARTNER | DRIVER — whose hand took it

@@ -24,11 +24,25 @@ from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import AsyncSessionLocal
+
+# Celery workers import only the task modules, not app.main's router graph.
+# NotificationOutbox has an FK to users, so register the auth model here or
+# background dispatch fails with "could not find table 'users'" at flush time.
+from app.modules.auth.models import User  # noqa: F401
 from app.infrastructure.push import send_fcm_to_tokens
 from app.modules.notification.models import FCMToken, NotificationOutbox
 from app.modules.notification.realtime import manager
 
 logger = logging.getLogger("waytero.notifications")
+
+# These events put a live job in front of the partner and must behave like an
+# incoming call: data-only FCM at high priority so the app's own full-screen,
+# ringing channel is used instead of a system-drawn banner.
+INCOMING_BOOKING_EVENTS = {
+    "PARTNER_ASSIGNMENT_REQUESTED",
+    "PARTNER_HOTEL_BOOKING_REQUESTED",
+    "PARTNER_TOUR_BOOKING_REQUESTED",
+}
 
 
 async def _push_ws(user_id: UUID | str, event: str, payload: dict[str, Any]) -> bool:
@@ -109,12 +123,18 @@ async def dispatch(
     try:
         tokens = await _active_fcm_tokens(db, uid)
         if tokens:
+            incoming = event_type in INCOMING_BOOKING_EVENTS
             counts = await send_fcm_to_tokens(
                 db,
                 tokens=tokens,
                 title=title,
                 body=body or "",
-                data={"event_type": event_type, **safe_data},
+                data={
+                    "event_type": event_type,
+                    **({"is_incoming_booking": "1"} if incoming else {}),
+                    **safe_data,
+                },
+                data_only=incoming,
             )
             if counts["success"] > 0:
                 channels.append("fcm")

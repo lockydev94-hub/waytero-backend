@@ -587,6 +587,214 @@ async def notify_booking_updated(
         )
 
 
+async def driver_assignment_offered(
+    db: AsyncSession,
+    *,
+    driver_id: int,
+    partner_id: int,
+    master_booking_id: int,
+    cab_booking_number: str,
+    pickup_location: str | None,
+    drop_location: str | None,
+    pickup_datetime: str | None,
+    estimated_distance_km: float | None,
+    estimated_amount: float | None,
+    expires_at_iso: str,
+) -> None:
+    """Push a real offer to the partner's driver.
+
+    Doc Ref: 06_Backend_Architecture/11_DRIVER_APP_BACKEND.md §push.
+    The partner received its own assignment event earlier; this one is the
+    driver's single-window offer and carries the expiry the app counts down.
+    """
+    from app.modules.driver.models import Driver
+
+    uid = (
+        await db.execute(select(Driver.user_id).where(Driver.id == driver_id))
+    ).scalar_one_or_none()
+    if uid is None:
+        logger.warning(
+            "booking_notify.skip_driver driver_id=%s reason=no_user_link", driver_id
+        )
+        return
+
+    title = f"New trip: {cab_booking_number}"
+    body = (
+        f"{'Pickup: ' + pickup_location + '. ' if pickup_location else ''}"
+        "Accept within 60 seconds to keep the trip."
+    )
+    try:
+        await dispatch(
+            db,
+            user_id=uid,
+            event_type="DRIVER_ASSIGNMENT_REQUESTED",
+            title=title,
+            body=body,
+            data={
+                "cab_booking_number": cab_booking_number,
+                "master_booking_id": master_booking_id,
+                "partner_id": partner_id,
+                "pickup_location": pickup_location or "",
+                "drop_location": drop_location or "",
+                "pickup_datetime": pickup_datetime or "",
+                "estimated_distance_km": estimated_distance_km,
+                "estimated_amount": estimated_amount,
+                "offer_expires_at": expires_at_iso,
+            },
+            booking_id=master_booking_id,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "booking_notify.driver_offer_failed driver=%s bn=%s err=%s",
+            driver_id,
+            cab_booking_number,
+            exc,
+        )
+
+
+async def driver_booking_overdue(
+    db: AsyncSession,
+    *,
+    driver_id: int,
+    master_booking_id: int,
+    cab_booking_number: str,
+    pickup_datetime: str | None,
+    minutes_late: int,
+) -> None:
+    """Warn the driver that the scheduled pickup time has passed.
+
+    Doc Ref: 04_API_Documentation/13_DRIVER_APP_API.md §notifications.
+    The driver may still be en route; this is an escalation, not a cancellation.
+    No customer contact or full pickup address is included before acceptance.
+    """
+    from app.modules.driver.models import Driver
+
+    uid = (
+        await db.execute(select(Driver.user_id).where(Driver.id == driver_id))
+    ).scalar_one_or_none()
+    if uid is None:
+        logger.warning(
+            "booking_notify.skip_driver_overdue driver_id=%s reason=no_user_link",
+            driver_id,
+        )
+        return
+
+    body = (
+        "The scheduled pickup time has passed. Start the trip or contact your partner."
+    )
+    if minutes_late > 0:
+        late_label = f"{minutes_late} minute{'s' if minutes_late != 1 else ''}"
+        body = (
+            f"The scheduled pickup time passed {late_label} ago. "
+            "Start the trip or contact your partner."
+        )
+    try:
+        await dispatch(
+            db,
+            user_id=uid,
+            event_type="DRIVER_BOOKING_OVERDUE",
+            title=f"Pickup time passed: {cab_booking_number}",
+            body=body,
+            data={
+                "cab_booking_number": cab_booking_number,
+                "master_booking_id": master_booking_id,
+                "pickup_datetime": pickup_datetime or "",
+                "minutes_late": minutes_late,
+            },
+            booking_id=master_booking_id,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "booking_notify.driver_overdue_failed driver=%s bn=%s err=%s",
+            driver_id,
+            cab_booking_number,
+            exc,
+        )
+
+
+async def partner_driver_responded(
+    db: AsyncSession,
+    *,
+    partner_id: int,
+    master_booking_id: int,
+    cab_booking_number: str,
+    decision: str,
+    driver_name: str,
+    reason_code: str | None = None,
+) -> None:
+    """Tell the partner whether their driver took or refused the offer."""
+    uid = await _partner_user_id(db, partner_id)
+    if uid is None:
+        return
+    title = f"Driver {decision.lower()}: {cab_booking_number}"
+    body = f"{driver_name} {'accepted' if decision == 'ACCEPTED' else 'declined'} the trip."
+    try:
+        await dispatch(
+            db,
+            user_id=uid,
+            event_type="PARTNER_DRIVER_RESPONDED",
+            title=title,
+            body=body,
+            data={
+                "cab_booking_number": cab_booking_number,
+                "master_booking_id": master_booking_id,
+                "decision": decision,
+                "driver_name": driver_name,
+                "reason_code": reason_code or "",
+            },
+            booking_id=master_booking_id,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "booking_notify.driver_response_failed bn=%s err=%s",
+            cab_booking_number,
+            exc,
+        )
+
+
+async def driver_cash_handover(
+    db: AsyncSession,
+    *,
+    driver_id: int,
+    collection_number: str,
+    amount: float,
+    bookings_count: int,
+    booking_numbers: list[str],
+) -> None:
+    """Notify the driver that the partner has taken custody of the cash.
+
+    Doc Ref: 04_API_Documentation/13_DRIVER_APP_API.md §cash-handover.
+    """
+    from app.modules.driver.models import Driver
+
+    uid = (
+        await db.execute(select(Driver.user_id).where(Driver.id == driver_id))
+    ).scalar_one_or_none()
+    if uid is None:
+        return
+    try:
+        await dispatch(
+            db,
+            user_id=uid,
+            event_type="DRIVER_CASH_HANDOVER",
+            title="Cash handover recorded",
+            body=(
+                f"₹{amount:.2f} across {bookings_count} trip(s) has been "
+                "recorded as handed over to your partner."
+            ),
+            data={
+                "collection_number": collection_number,
+                "amount": amount,
+                "bookings_count": bookings_count,
+                "booking_numbers": booking_numbers,
+            },
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning(
+            "booking_notify.driver_cash_failed driver=%s err=%s", driver_id, exc
+        )
+
+
 async def notify_hotel_booking_updated(
     db: AsyncSession,
     *,

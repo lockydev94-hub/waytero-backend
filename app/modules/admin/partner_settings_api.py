@@ -33,6 +33,23 @@ from app.modules.admin.services import CityService
 
 router = APIRouter()
 
+# Public city list for pre-auth screens such as the partner application form.
+# Mounted at /public/cities (the auth middleware allowlists /api/v1/public).
+public_router = APIRouter()
+
+
+@public_router.get(
+    "/cities",
+    response_model=List[CityOut],
+    tags=["Public Master Data"],
+)
+async def list_public_cities(
+    active_only: bool = True,
+    db: AsyncSession = Depends(get_db),
+):
+    """List active cities without requiring a token."""
+    return await CityService.list_all(db, active_only=active_only)
+
 
 @router.get(
     "/master/cities",

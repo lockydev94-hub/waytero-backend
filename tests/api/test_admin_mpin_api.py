@@ -22,6 +22,8 @@ POLICY_KEYS = {
     "mpin_attempts_remaining",
     "mpin_min_length",
     "access_token_expires_in",
+    "session_started_at",
+    "session_expires_at",
 }
 
 

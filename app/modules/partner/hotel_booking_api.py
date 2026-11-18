@@ -7,13 +7,15 @@
 
 import json
 import math
-from datetime import datetime, timezone
+import re
+import uuid as _uuid
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, text as _text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -28,6 +30,7 @@ from app.modules.hotel.models import (
     HotelAdvancePayment,
 )
 from app.modules.hotel.services import billing as hotel_billing
+from app.modules.hotel.services.quote import compute_hotel_quote, quote_to_response
 from app.modules.hotel.services.hotel_helpers import (
     check_in_date_mismatch as _check_in_date_mismatch,
 )
@@ -1982,6 +1985,482 @@ async def partner_hotel_available_rooms(
             ],
         },
     )
+
+
+# ════════════════════════════════════════════════════════════════
+# WALK-IN BOOKINGS — partner creates a stay for a walk-in guest
+# Doc Ref: 03_HOTEL_TOUR.md HT1
+# ════════════════════════════════════════════════════════════════
+
+
+class WalkInQuoteRequest(BaseModel):
+    room_category_id: int = Field(..., gt=0)
+    check_in_date: date
+    check_out_date: date
+    rooms_count: int = Field(1, ge=1, le=30)
+    adults_count: int = Field(1, ge=1, le=100)
+    children_count: int = Field(0, ge=0, le=100)
+    extra_beds: int = Field(0, ge=0, le=100)
+
+
+class WalkInBookingRequest(WalkInQuoteRequest):
+    guest_name: str = Field(..., min_length=2, max_length=150)
+    mobile: str = Field(..., min_length=10, max_length=15)
+    email: Optional[str] = Field(None, max_length=255)
+    special_requests: Optional[str] = Field(None, max_length=2000)
+    remarks: Optional[str] = Field(None, max_length=2000)
+
+
+def _walkin_booking_number() -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    uid = _uuid.uuid4().hex[:4].upper()
+    return f"WT-MTB-{ts}-{uid}"
+
+
+def _walkin_reservation_number() -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    uid = _uuid.uuid4().hex[:6].upper()
+    return f"HR-{ts}-{uid}"
+
+
+def _validate_stay(payload: WalkInQuoteRequest) -> None:
+    if payload.check_out_date <= payload.check_in_date:
+        raise HTTPException(400, "Check-out must be after check-in.")
+    if (payload.check_out_date - payload.check_in_date).days > 90:
+        raise HTTPException(400, "A stay cannot be longer than 90 nights.")
+
+
+async def _get_partner_hotel(
+    db: AsyncSession, hotel_id: int, partner_id: int
+) -> Hotel:
+    hotel = (
+        await db.execute(
+            select(Hotel).where(
+                Hotel.id == hotel_id, Hotel.deleted_at.is_(None)
+            )
+        )
+    ).scalar_one_or_none()
+    if not hotel or int(hotel.partner_id) != partner_id:
+        raise HTTPException(404, "Hotel not found for this partner.")
+    if str(hotel.status) != "ACTIVE":
+        raise HTTPException(400, "Hotel is not active / bookable.")
+    return hotel
+
+
+async def _quote_walkin(
+    db: AsyncSession, hotel: Hotel, payload: WalkInQuoteRequest
+) -> dict:
+    _validate_stay(payload)
+    category = (
+        await db.execute(
+            select(HotelRoomCategory).where(
+                HotelRoomCategory.id == payload.room_category_id,
+                HotelRoomCategory.hotel_id == hotel.id,
+                HotelRoomCategory.is_active.is_(True),
+            )
+        )
+    ).scalar_one_or_none()
+    if not category:
+        raise HTTPException(404, "Room category not found for this hotel.")
+    return await compute_hotel_quote(
+        db,
+        hotel,
+        payload.room_category_id,
+        payload.check_in_date,
+        payload.check_out_date,
+        payload.rooms_count,
+        adults_count=payload.adults_count,
+        children_count=payload.children_count,
+        extra_beds=payload.extra_beds,
+    )
+
+
+@router.get(
+    "/me/hotels",
+    summary="Active hotels owned by the authenticated partner, with room categories",
+)
+async def partner_hotels_for_walkin(
+    current_user: dict = Depends(require_partner()),
+    db: AsyncSession = Depends(get_db),
+):
+    """Metadata for the walk-in form. Scoped to the partner's own ACTIVE
+    hotels; unlike `/admin/hotels`, a partner cannot see another partner's
+    property here."""
+    partner_id = await _resolve_partner_id(db, current_user["sub"])
+
+    hotel_rows = (
+        (
+            await db.execute(
+                _text(
+                    """
+                    SELECT h.id, h.hotel_code, h.hotel_name, h.star_rating,
+                           h.city_id, ci.name AS city_name, h.address, h.tax_mode
+                      FROM hotels h
+                      LEFT JOIN cities ci ON ci.id = h.city_id
+                     WHERE h.partner_id = :pid
+                       AND h.status = 'ACTIVE'
+                       AND h.deleted_at IS NULL
+                     ORDER BY h.hotel_name
+                    """
+                ),
+                {"pid": partner_id},
+            )
+        )
+        .mappings()
+        .all()
+    )
+    hotel_ids = [int(r["id"]) for r in hotel_rows]
+    categories: dict[int, list] = {}
+    if hotel_ids:
+        cat_rows = (
+            (
+                await db.execute(
+                    _text(
+                        """
+                        SELECT id, hotel_id, category_name, room_type, meal_plan,
+                               base_occupancy, max_adults, max_children,
+                               max_occupancy, extra_bed_allowed,
+                               CAST(extra_bed_charge AS FLOAT) AS extra_bed_charge,
+                               CAST(extra_adult_charge AS FLOAT) AS extra_adult_charge,
+                               CAST(extra_child_charge AS FLOAT) AS extra_child_charge,
+                               CAST(base_price AS FLOAT) AS base_price,
+                               CAST(published_price AS FLOAT) AS published_price,
+                               total_rooms
+                          FROM hotel_room_categories
+                         WHERE hotel_id = ANY(:hids) AND is_active = TRUE
+                         ORDER BY display_order, category_name
+                        """
+                    ),
+                    {"hids": hotel_ids},
+                )
+            )
+            .mappings()
+            .all()
+        )
+        for row in cat_rows:
+            categories.setdefault(int(row["hotel_id"]), []).append(dict(row))
+
+    return success_response(
+        "Partner hotels",
+        {
+            "hotels": [
+                {
+                    **dict(r),
+                    "room_categories": categories.get(int(r["id"]), []),
+                }
+                for r in hotel_rows
+            ]
+        },
+    )
+
+
+@router.post(
+    "/me/hotels/{hotel_id}/walk-in-quote",
+    summary="Price a walk-in stay without creating it",
+)
+async def partner_walkin_quote(
+    hotel_id: int,
+    payload: WalkInQuoteRequest,
+    current_user: dict = Depends(require_partner()),
+    db: AsyncSession = Depends(get_db),
+):
+    partner_id = await _resolve_partner_id(db, current_user["sub"])
+    hotel = await _get_partner_hotel(db, hotel_id, partner_id)
+    quote = await _quote_walkin(db, hotel, payload)
+    return {"success": True, **quote_to_response(quote)}
+
+
+@router.post(
+    "/me/hotels/{hotel_id}/walk-in-bookings",
+    status_code=201,
+    summary="Create a confirmed walk-in reservation",
+)
+async def partner_create_walkin_booking(
+    hotel_id: int,
+    payload: WalkInBookingRequest,
+    current_user: dict = Depends(require_partner()),
+    db: AsyncSession = Depends(get_db),
+):
+    """A walk-in guest usually has no account. Match by mobile digits first;
+    otherwise mint a CUSTOMER user + customer profile + wallet so the
+    reservation has the same shape as every other hotel booking. Prices are
+    always server-side, never accepted from the app."""
+    partner_id = await _resolve_partner_id(db, current_user["sub"])
+    hotel = await _get_partner_hotel(db, hotel_id, partner_id)
+
+    digits = re.sub(r"\D", "", payload.mobile)
+    if len(digits) > 10 and digits.startswith("91"):
+        digits = digits[-10:]
+    if len(digits) != 10 or digits[0] not in "6789":
+        raise HTTPException(400, "Enter a valid 10-digit Indian mobile number.")
+
+    quote = await _quote_walkin(db, hotel, payload)
+
+    customer = (
+        await db.execute(
+            _text(
+                """
+                SELECT c.id
+                  FROM customers c
+                  JOIN users u ON u.id = c.user_id
+                 WHERE RIGHT(regexp_replace(u.mobile_number, '[^0-9]', '', 'g'), 10) = :digits
+                 LIMIT 1
+                """
+            ),
+            {"digits": digits},
+        )
+    ).scalar_one_or_none()
+
+    customer_created = False
+    if customer is None:
+        first_name, _, last_name = payload.guest_name.strip().partition(" ")
+        new_uid = _uuid.uuid4()
+        user_seq = (
+            await db.execute(
+                _text(
+                    "SELECT COUNT(*) FROM users WHERE user_type = 'CUSTOMER'"
+                )
+            )
+        ).scalar() or 0
+        await db.execute(
+            _text(
+                """
+                INSERT INTO users (
+                    id, user_code, first_name, last_name, mobile_number, email,
+                    user_type, status, is_active, is_mobile_verified,
+                    is_email_verified, created_by, created_at, updated_at
+                ) VALUES (
+                    :id, :code, :first, :last, :mobile, :email,
+                    'CUSTOMER', 'ACTIVE', TRUE, FALSE, FALSE,
+                    :created_by, NOW(), NOW()
+                )
+                """
+            ),
+            {
+                "id": str(new_uid),
+                "code": f"CUS-{int(user_seq) + 1:06d}",
+                "first": first_name[:100],
+                "last": last_name[:100] or None,
+                "mobile": digits,
+                "email": payload.email,
+                "created_by": str(current_user["sub"]),
+            },
+        )
+        cust_seq = (
+            await db.execute(_text("SELECT COUNT(*) FROM customers"))
+        ).scalar() or 0
+        customer = (
+            await db.execute(
+                _text(
+                    """
+                    INSERT INTO customers (
+                        uuid, user_id, customer_code, first_name, last_name,
+                        city_id, is_active, created_at, updated_at
+                    ) VALUES (
+                        :uuid, :user_id, :code, :first, :last,
+                        :city_id, TRUE, NOW(), NOW()
+                    ) RETURNING id
+                    """
+                ),
+                {
+                    "uuid": str(_uuid.uuid4()),
+                    "user_id": str(new_uid),
+                    "code": f"CT-{int(cust_seq) + 1:06d}",
+                    "first": first_name[:100],
+                    "last": last_name[:100] or None,
+                    "city_id": int(hotel.city_id),
+                },
+            )
+        ).scalar_one()
+        customer_created = True
+        await db.execute(
+            _text(
+                """
+                INSERT INTO customer_wallets
+                    (customer_id, available_balance, hold_balance,
+                     wallet_status, created_at, updated_at)
+                VALUES (:cid, 0, 0, 'ACTIVE', NOW(), NOW())
+                ON CONFLICT (customer_id) DO NOTHING
+                """
+            ),
+            {"cid": customer},
+        )
+
+    # Per-night inventory; dates without a row are open availability.
+    try:
+        upd = await db.execute(
+            _text(
+                """
+                UPDATE hotel_inventory
+                   SET booked_rooms = booked_rooms + :rooms,
+                       available_rooms = available_rooms - :rooms,
+                       updated_at = NOW()
+                 WHERE room_category_id = :cid
+                   AND inventory_date >= :dfrom
+                   AND inventory_date < :dto
+                   AND is_stop_sell = FALSE
+                RETURNING inventory_date
+                """
+            ),
+            {
+                "rooms": payload.rooms_count,
+                "cid": payload.room_category_id,
+                "dfrom": payload.check_in_date,
+                "dto": payload.check_out_date,
+            },
+        )
+        upd.fetchall()
+    except Exception:
+        await db.rollback()
+        raise HTTPException(409, "Not enough rooms available for those dates.")
+
+    booking_number = _walkin_booking_number()
+    master_id = (
+        await db.execute(
+            _text(
+                """
+                INSERT INTO master_bookings (
+                    uuid, booking_number, customer_id, city_id,
+                    booking_status, payment_status,
+                    total_amount, total_paid_amount, total_refund_amount,
+                    journey_start_date, remarks, created_at, updated_at
+                ) VALUES (
+                    :uuid, :number, :customer_id, :city_id,
+                    'CONFIRMED', 'PENDING',
+                    :amount, 0, 0,
+                    :check_in, :remarks, NOW(), NOW()
+                ) RETURNING id
+                """
+            ),
+            {
+                "uuid": str(_uuid.uuid4()),
+                "number": booking_number,
+                "customer_id": customer,
+                "city_id": int(hotel.city_id),
+                "amount": quote["total_amount"],
+                "check_in": payload.check_in_date,
+                "remarks": payload.remarks
+                or f"Walk-in booking created by partner for {payload.guest_name}",
+            },
+        )
+    ).scalar_one()
+
+    service_id = (
+        await db.execute(
+            _text(
+                """
+                INSERT INTO booking_services (
+                    master_booking_id, service_type, service_reference_id,
+                    service_status, service_amount, created_at
+                ) VALUES (:mb, 'HOTEL', 0, 'CONFIRMED', :amount, NOW())
+                RETURNING id
+                """
+            ),
+            {"mb": master_id, "amount": quote["total_amount"]},
+        )
+    ).scalar_one()
+
+    reservation_number = _walkin_reservation_number()
+    reservation_id = (
+        await db.execute(
+            _text(
+                """
+                INSERT INTO hotel_reservations (
+                    uuid, master_booking_id, booking_service_id, hotel_id,
+                    room_category_id, customer_id, reservation_number,
+                    check_in_date, check_out_date, nights, rooms_count,
+                    room_nights, adults_count, children_count,
+                    base_amount, extra_charges, discount_amount, taxable_amount,
+                    gst_percent, gst_amount, is_tax_invoice, total_amount,
+                    platform_commission, partner_payout,
+                    rate_snapshot, commission_config_snapshot,
+                    reservation_status, special_requests, confirmed_at,
+                    created_at, updated_at
+                ) VALUES (
+                    :uuid, :mb, :svc, :hotel_id,
+                    :cat, :customer_id, :number,
+                    :check_in, :check_out, :nights, :rooms,
+                    :room_nights, :adults, :children,
+                    :base, 0, 0, :taxable,
+                    :gst_pct, :gst_amount, :is_tax_invoice, :total,
+                    :commission, :payout,
+                    CAST(:rate_snapshot AS JSONB), CAST(:commission_snapshot AS JSONB),
+                    'CONFIRMED', :special, NOW(), NOW(), NOW()
+                ) RETURNING id
+                """
+            ),
+            {
+                "uuid": str(_uuid.uuid4()),
+                "mb": master_id,
+                "svc": service_id,
+                "hotel_id": hotel_id,
+                "cat": payload.room_category_id,
+                "customer_id": customer,
+                "number": reservation_number,
+                "check_in": payload.check_in_date,
+                "check_out": payload.check_out_date,
+                "nights": quote["nights"],
+                "rooms": payload.rooms_count,
+                "room_nights": quote["room_nights"],
+                "adults": payload.adults_count,
+                "children": payload.children_count,
+                "base": quote["base_amount"],
+                "taxable": quote["taxable_amount"],
+                "gst_pct": quote["gst_percent"],
+                "gst_amount": quote["gst_amount"],
+                "is_tax_invoice": quote["is_tax_invoice"],
+                "total": quote["total_amount"],
+                "commission": quote["platform_commission"],
+                "payout": quote["partner_payout"],
+                "rate_snapshot": json.dumps(quote["rate_snapshot"]),
+                "commission_snapshot": json.dumps(quote["commission_snapshot"]),
+                "special": payload.special_requests,
+            },
+        )
+    ).scalar_one()
+
+    await db.execute(
+        _text(
+            "UPDATE booking_services SET service_reference_id = :rid WHERE id = :sid"
+        ),
+        {"rid": reservation_id, "sid": service_id},
+    )
+    await db.execute(
+        _text(
+            """
+            INSERT INTO hotel_reservation_guests (
+                reservation_id, guest_name, mobile, id_type, id_number,
+                is_primary, created_at
+            ) VALUES (:rid, :name, :mobile, NULL, NULL, TRUE, NOW())
+            """
+        ),
+        {
+            "rid": reservation_id,
+            "name": payload.guest_name.strip(),
+            "mobile": digits,
+        },
+    )
+    await _log_timeline(
+        db,
+        master_id,
+        "BOOKING_CREATED",
+        f"Walk-in booking created by partner for {payload.guest_name}",
+    )
+
+    return {
+        "success": True,
+        "master_booking_id": master_id,
+        "booking_number": booking_number,
+        "reservation_id": reservation_id,
+        "reservation_number": reservation_number,
+        "customer_id": customer,
+        "customer_created": customer_created,
+        "total_amount": float(quote["total_amount"]),
+        "gst_amount": float(quote["gst_amount"]),
+        "nights": quote["nights"],
+        "rooms_count": payload.rooms_count,
+        "message": "Walk-in booking created",
+    }
 
 
 # (Hotel switch / split-stay partner read-only endpoints moved above

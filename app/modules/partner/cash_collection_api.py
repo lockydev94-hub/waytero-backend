@@ -557,6 +557,24 @@ async def collect_driver_cash(
             f"Refresh and try again. ({err.__class__.__name__})",
         )
 
+    # The driver's app must show that custody moved from their hand to the
+    # partner's. Best effort: a push failure never reverses a recorded handover.
+    try:
+        from app.modules.notification.services.booking_notifications import (
+            driver_cash_handover,
+        )
+
+        await driver_cash_handover(
+            db,
+            driver_id=payload.driver_id,
+            collection_number=collection_number,
+            amount=float(expected),
+            bookings_count=len(rows),
+            booking_numbers=[r["booking_number"] for r in rows],
+        )
+    except Exception:  # pragma: no cover - notification is best effort
+        pass
+
     return CollectResponse(
         success=True,
         message=f"₹{expected:.2f} collected from {driver['full_name']} across {len(rows)} booking(s).",

@@ -14,8 +14,10 @@
 
 import math
 from decimal import Decimal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
+
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel
@@ -42,6 +44,7 @@ from app.modules.auth.models.user import User
 from app.shared.responses.base import success_response
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 # Terminal booking states where the partner's assignment may legitimately be
@@ -49,7 +52,16 @@ router = APIRouter()
 # states the original partner must still be able to read and run downstream
 # steps (collect-payment, view pricing) even with no open assignment row.
 _PARTNER_TERMINAL_STATUSES = frozenset(
-    {"COMPLETED", "SETTLEMENT_PENDING", "CANCELLED", "REFUNDED"}
+    {
+        "COMPLETED",
+        "COMPLETED_PAYMENT_PENDING",
+        "SETTLEMENT_PENDING",
+        # A settled trip closes its assignment row, so without this the
+        # booking vanished from the partner's list the moment admin settled it.
+        "SETTLED",
+        "CANCELLED",
+        "REFUNDED",
+    }
 )
 
 
@@ -64,19 +76,29 @@ async def _partner_owned_cab_ids(db: AsyncSession, partner_id: int) -> list[int]
     partner who worked it keeps it for invoices, settlement and audit.
     """
     rows = (
-        await db.execute(
-            select(CabBookingAssignment.cab_booking_id)
-            .join(CabBooking, CabBooking.id == CabBookingAssignment.cab_booking_id)
-            .where(
-                CabBookingAssignment.partner_id == partner_id,
-                or_(
-                    CabBookingAssignment.closed_at.is_(None),
-                    CabBooking.booking_status.in_(_PARTNER_TERMINAL_STATUSES),
-                ),
+        (
+            await db.execute(
+                select(CabBookingAssignment.cab_booking_id)
+                .join(CabBooking, CabBooking.id == CabBookingAssignment.cab_booking_id)
+                .where(
+                    CabBookingAssignment.partner_id == partner_id,
+                    or_(
+                        CabBookingAssignment.closed_at.is_(None),
+                        CabBooking.booking_status.in_(_PARTNER_TERMINAL_STATUSES),
+                        # A driver decline/offer expiry closes the row but the
+                        # booking is still with this partner and must stay
+                        # visible so they can assign another driver.
+                        CabBookingAssignment.close_reason.in_(
+                            ("DRIVER_DECLINED", "OFFER_EXPIRED")
+                        ),
+                    ),
+                )
+                .distinct()
             )
-            .distinct()
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     return list(rows)
 
 
@@ -166,6 +188,8 @@ class BookingListItem(BaseModel):
     pickup_datetime: Optional[str]
     journey_start_date: Optional[str]
     amount: float
+    final_amount: Optional[float] = None
+    actual_distance: Optional[float] = None
     partner_payout: float
     customer_name: str
     customer_mobile: Optional[str]
@@ -302,6 +326,10 @@ class BookingDetail(BaseModel):
     # (migration 0077). coupon is None when the booking has no coupon.
     offer: Optional[dict] = None
     coupon: Optional[dict] = None
+    # Live commission/payout for this partner, so the offer and detail screens
+    # do not show ₹0.00 until the trip is closed.
+    commission_preview: Optional[float] = None
+    payout_preview: Optional[float] = None
 
 
 class AssignDriverRequest(BaseModel):
@@ -532,6 +560,14 @@ async def list_partner_bookings(
                     else None
                 ),
                 amount=float(cb.estimated_amount or 0),
+                final_amount=(
+                    float(cb.final_amount) if cb.final_amount is not None else None
+                ),
+                actual_distance=(
+                    float(cb.actual_distance)
+                    if cb.actual_distance is not None
+                    else None
+                ),
                 partner_payout=float(cb.partner_payout or 0),
                 customer_name=cust.full_name if cust else "—",
                 customer_mobile=cust_user.mobile_number if cust_user else None,
@@ -836,6 +872,33 @@ async def get_partner_booking_detail(
     advance_paid_val = float(advance_row["net_amount"]) if advance_row else 0.0
     advance_summary_val = advance_service.advance_summary(advance_row)
 
+    # Live payout preview. Before close, cab_bookings.partner_payout is still
+    # zero, and showing that as "Your payout" told partners they would earn
+    # nothing. Resolve the same rule the close will use instead.
+    preview_fare = float(cb.final_amount or cb.estimated_amount or 0)
+    payout_preview = float(cb.partner_payout or 0)
+    if payout_preview <= 0 and preview_fare > 0:
+        from app.modules.admin.services import CommissionService
+        from app.modules.booking.services.settlement_math import (
+            compute_close_economics,
+        )
+
+        preview_rule = await CommissionService.resolve(
+            db,
+            city_id=mb.city_id if mb else None,
+            service_type="CAB",
+            for_date=(
+                cb.pickup_datetime.date() if cb.pickup_datetime is not None else None
+            ),
+            partner_id=partner_id,
+        )
+        payout_preview = float(
+            compute_close_economics(
+                final_amount=preview_fare, commission=preview_rule
+            ).partner_payout
+        )
+    commission_preview = max(preview_fare - payout_preview, 0.0)
+
     # Prevent browser from caching booking detail — payment/invoice state must always be fresh
     if response is not None:
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
@@ -882,6 +945,8 @@ async def get_partner_booking_detail(
         payment_collected_by=cb.payment_collected_by,
         cash_pending_at=cb.cash_pending_at,
         coupon_discount=coupon_discount_val,
+        commission_preview=commission_preview,
+        payout_preview=payout_preview,
         offer=offer_info,
         coupon=coupon_info,
         advance_paid=advance_paid_val,
@@ -1382,20 +1447,29 @@ async def partner_assign_driver(
     if not cb:
         raise HTTPException(404, "Cab booking not found.")
 
-    # Ownership check — must be the partner on the ACTIVE assignment. After
-    # a handover, the original partner's row is closed and they can no longer
-    # mutate the booking.
+    # Ownership check — must be the partner on the active assignment. A driver
+    # decline or offer expiry closes the row but does not move the booking away
+    # from the partner, so that row is reopened when they assign a replacement.
     partner_assigns = [
         a
         for a in (cb.assignments or [])
         if a.partner_id == partner_id and a.closed_at is None
     ]
     if not partner_assigns:
-        raise HTTPException(
-            410,
-            "This booking is no longer with you — it was handed over to "
-            "another partner after a vehicle breakdown.",
-        )
+        reclaimable = [
+            a
+            for a in (cb.assignments or [])
+            if a.partner_id == partner_id
+            and a.close_reason in ("DRIVER_DECLINED", "OFFER_EXPIRED")
+        ]
+        if reclaimable and cb.booking_status in ("ASSIGNED", "DRIVER_ASSIGNED"):
+            partner_assigns = [max(reclaimable, key=lambda a: (a.assigned_at, a.id))]
+        else:
+            raise HTTPException(
+                410,
+                "This booking is no longer with you — it was handed over to "
+                "another partner after a vehicle breakdown.",
+            )
 
     # Status guard — can only assign driver when status is ASSIGNED
     if cb.booking_status not in ("ASSIGNED", "DRIVER_ASSIGNED"):
@@ -1419,6 +1493,74 @@ async def partner_assign_driver(
             f"Driver is not eligible (status: {driver.status}). Must be APPROVED or ACTIVE.",
         )
 
+    # Expire this driver's unanswered offers before checking busy state. An
+    # offer that timed out is not a live commitment, and leaving the row open
+    # would both block the next assignment and violate the partial unique index.
+    await db.execute(
+        text(
+            """
+            UPDATE cab_bookings cb
+               SET booking_status = 'ASSIGNED',
+                   needs_attention = 'DRIVER_OFFER_EXPIRED',
+                   updated_at = NOW()
+              FROM cab_booking_assignments a
+             WHERE a.cab_booking_id = cb.id
+               AND a.driver_id = :did
+               AND a.closed_at IS NULL
+               AND a.offer_status = 'PENDING'
+               AND a.offer_expires_at IS NOT NULL
+               AND a.offer_expires_at < NOW()
+               AND cb.booking_status = 'DRIVER_ASSIGNED'
+            """
+        ),
+        {"did": payload.driver_id},
+    )
+    await db.execute(
+        text(
+            """
+            UPDATE cab_booking_assignments
+               SET offer_status = 'EXPIRED', closed_at = NOW(),
+                   close_reason = 'OFFER_EXPIRED'
+             WHERE driver_id = :did
+               AND closed_at IS NULL
+               AND offer_status = 'PENDING'
+               AND offer_expires_at IS NOT NULL
+               AND offer_expires_at < NOW()
+            """
+        ),
+        {"did": payload.driver_id},
+    )
+
+    # One live assignment per driver. The partial unique index is the final
+    # guarantee; checking here lets the partner portal explain why rather than
+    # surfacing an IntegrityError. Exclude this booking's own row so changing
+    # the vehicle on the same assignment stays allowed.
+    current_assignment = next(
+        (
+            a
+            for a in (cb.assignments or [])
+            if a.partner_id == partner_id and a.closed_at is None
+        ),
+        None,
+    )
+    busy = (
+        await db.execute(
+            select(CabBookingAssignment.id).where(
+                CabBookingAssignment.driver_id == payload.driver_id,
+                CabBookingAssignment.closed_at.is_(None),
+                CabBookingAssignment.offer_status.in_(("PENDING", "ACCEPTED")),
+                CabBookingAssignment.id
+                != (current_assignment.id if current_assignment else -1),
+            )
+        )
+    ).first()
+    if busy is not None:
+        raise HTTPException(
+            409,
+            "This driver already has a live booking or an unanswered offer. "
+            "Wait for it to finish, expire or be declined before assigning another.",
+        )
+
     # Vehicle guard
     vehicle = (
         await db.execute(select(Vehicle).where(Vehicle.id == payload.vehicle_id))
@@ -1435,13 +1577,26 @@ async def partner_assign_driver(
 
     # Update the active assignment (closed_at IS NULL) so a prior handover
     # row is never mutated.
-    latest_assign = sorted(
-        [a for a in partner_assigns if a.closed_at is None],
-        key=lambda a: a.assigned_at,
-        reverse=True,
-    )[0]
+    open_assigns = [a for a in partner_assigns if a.closed_at is None]
+    latest_assign = max(
+        open_assigns or partner_assigns,
+        key=lambda a: (a.assigned_at, a.id),
+    )
     latest_assign.driver_id = payload.driver_id
     latest_assign.vehicle_id = payload.vehicle_id
+    # A (re)assignment starts a fresh driver-side offer. The partner's own
+    # acceptance is `accepted_at`, which is deliberately left untouched — the
+    # driver's decision is a separate fact.
+    offer_now = datetime.now(timezone.utc)
+    latest_assign.offer_status = "PENDING"
+    latest_assign.offered_at = offer_now
+    latest_assign.offer_expires_at = offer_now + timedelta(seconds=60)
+    latest_assign.driver_accepted_at = None
+    latest_assign.driver_declined_at = None
+    latest_assign.driver_decline_reason = None
+    latest_assign.driver_decline_notes = None
+    latest_assign.closed_at = None
+    latest_assign.close_reason = None
 
     # Advance cab booking status
     cb.booking_status = "DRIVER_ASSIGNED"
@@ -1466,12 +1621,45 @@ async def partner_assign_driver(
         partner_ids=[partner_id],
     )
 
+    # A real push to the driver, not just the partner portal refresh. The app
+    # counts down the 60-second offer window from this timestamp.
+    try:
+        from app.modules.notification.services.booking_notifications import (
+            driver_assignment_offered,
+        )
+
+        await driver_assignment_offered(
+            db,
+            driver_id=driver.id,
+            partner_id=partner_id,
+            master_booking_id=cb.master_booking_id,
+            cab_booking_number=cb.booking_number,
+            pickup_location=cb.pickup_location,
+            drop_location=cb.drop_location,
+            pickup_datetime=(
+                cb.pickup_datetime.isoformat() if cb.pickup_datetime else None
+            ),
+            estimated_distance_km=(
+                float(cb.estimated_distance) if cb.estimated_distance else None
+            ),
+            estimated_amount=(
+                float(cb.estimated_amount) if cb.estimated_amount else None
+            ),
+            expires_at_iso=latest_assign.offer_expires_at.isoformat(),
+        )
+    except Exception:  # pragma: no cover - notification must never block assignment
+        pass
+
     return {
         "success": True,
-        "message": "Driver and vehicle assigned successfully.",
+        "message": (
+            "Driver and vehicle assigned. The driver has 60 seconds to accept "
+            "in the WayTero Partner Driver app."
+        ),
         "cab_status": "DRIVER_ASSIGNED",
         "driver_name": driver.full_name,
         "vehicle_reg": vehicle.registration_number,
+        "offer_expires_at": latest_assign.offer_expires_at.isoformat(),
     }
 
 
@@ -1570,6 +1758,13 @@ async def _get_partner_cab_booking(
     # downstream steps like collect-payment.
     if cb.booking_status not in _PARTNER_TERMINAL_STATUSES:
         active_partner_assigns = [a for a in partner_assigns if a.closed_at is None]
+        reclaimable = [
+            a
+            for a in partner_assigns
+            if a.close_reason in ("DRIVER_DECLINED", "OFFER_EXPIRED")
+        ]
+        if not active_partner_assigns and reclaimable:
+            active_partner_assigns = reclaimable
         if not active_partner_assigns:
             raise HTTPException(
                 410,
@@ -1638,6 +1833,41 @@ async def partner_start_trip(
     cb.trip_started_at = payload.start_datetime
     cb.booking_status = "STARTED"
 
+    # ── The rental clock starts at hand-over, not at the booked hour ──────
+    # A Cab Rent is a duration the customer bought: "two days from now". If the
+    # driver hands the car over late, the customer loses that time unless the
+    # window moves with the clock, and the packet that says what was included
+    # would be describing a rental that did not happen. The window is therefore
+    # re-anchored on the actual start and the snapshot records both.
+    rental_note: Optional[str] = None
+    rental_clock: Optional[dict] = None
+    if (cb.trip_type or "").upper() == "DAILY" and cb.trip_started_at:
+        from datetime import timedelta
+
+        from app.modules.booking.services.fare import rental_days_from
+
+        snapshot = dict(cb.rate_snapshot or {})
+        days = int(snapshot.get("days") or 0) or rental_days_from(
+            cb.pickup_datetime, cb.return_datetime
+        )
+        days = max(1, days)
+        included_hours = int(snapshot.get("included_hours") or 12)
+        expected_end = cb.trip_started_at + timedelta(days=days)
+        snapshot["rental_clock"] = {
+            "started_at": cb.trip_started_at.isoformat(),
+            "days": days,
+            "included_hours": included_hours * days,
+            "expected_end": expected_end.isoformat(),
+        }
+        cb.return_datetime = expected_end
+        cb.rate_snapshot = snapshot
+        rental_clock = snapshot["rental_clock"]
+        rental_note = (
+            f" Rental clock started at {cb.trip_started_at.isoformat()} — "
+            f"{days} day(s), {included_hours * days} hours included, "
+            f"rental ends {expected_end.isoformat()}."
+        )
+
     # Migration 0041: snapshot the odometer onto the active assignment so the
     # audit trail records which km-reading each driver started from, even
     # after a mid-trip vehicle swap. Also flip the active vehicle/driver to
@@ -1662,7 +1892,8 @@ async def partner_start_trip(
         mb.id,
         "TRIP_STARTED_BY_PARTNER",
         f"Partner started trip for {cb.booking_number} on driver's behalf. "
-        f"Start KM: {payload.start_km}, Started at: {payload.start_datetime.isoformat()}",
+        f"Start KM: {payload.start_km}, Started at: {payload.start_datetime.isoformat()}."
+        + (rental_note or ""),
     )
     # get_db auto-commits on success.
 
@@ -1683,6 +1914,8 @@ async def partner_start_trip(
         "cab_status": "STARTED",
         "trip_start_km": payload.start_km,
         "trip_started_at": payload.start_datetime.isoformat(),
+        # Present only on a Cab Rent: when the paid-for window began and ends.
+        "rental_clock": rental_clock,
     }
 
 
@@ -1894,6 +2127,7 @@ async def partner_close_trip(
         city_id=p_city_id,
         service_type="CAB",
         for_date=payload.end_datetime.date() if payload.end_datetime else None,
+        partner_id=partner_id,
     )
 
     gst_cfg_rows = (
@@ -2344,13 +2578,22 @@ async def partner_collect_payment(
             f"Mode: {mode} | Collected by: {collector}.",
         )
 
+    # Read the number before committing: a failed commit expires the ORM object,
+    # and touching an expired attribute here would raise a second error that
+    # hides the real reason the commit failed.
+    cab_number = cb.booking_number
     try:
         await db.commit()
     except Exception as _commit_err:
+        logger.exception(
+            "partner_collect_payment.commit_failed booking=%s err=%s",
+            cab_number,
+            _commit_err,
+        )
         await db.rollback()
         cb_refresh = (
             await db.execute(
-                select(CabBooking).where(CabBooking.booking_number == cb.booking_number)
+                select(CabBooking).where(CabBooking.booking_number == cab_number)
             )
         ).scalar_one_or_none()
         if cb_refresh and cb_refresh.payment_mode:

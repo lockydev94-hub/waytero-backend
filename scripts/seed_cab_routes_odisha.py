@@ -14,6 +14,7 @@
 import asyncio
 import os
 import sys
+from decimal import Decimal
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -144,15 +145,40 @@ ROUTES = [
     },
 ]
 
-TERMS = """This fare is calculated live from our published cab fare rules for the distance shown on this page, so it matches what the booking flow charges.
+# Road distances (km) for the corridors above, used ONLY when neither Google
+# nor its geocode fallback can answer — i.e. when no GOOGLE_MAPS key is saved
+# in api_integrations, which is the normal state of a local dev box. This is
+# the same thing an admin does in the route editor: type the distance in, and
+# it is stored with distance_source='MANUAL' so the page never pretends it
+# came from Google. Replace a value once Maps is configured.
+MANUAL_DISTANCES = {
+    ("Bhubaneswar", "Puri"): 60,
+    ("Bhubaneswar", "Konark"): 65,
+    ("Bhubaneswar", "Cuttack"): 28,
+    ("Cuttack", "Puri"): 85,
+    ("Puri", "Konark"): 35,
+    ("Bhubaneswar", "Chandipur"): 200,
+    ("Bhubaneswar", "Dhenkanal"): 75,
+    ("Bhubaneswar", "Angul"): 125,
+    ("Bhubaneswar", "Kendrapara"): 85,
+    ("Bhubaneswar", "Jajpur"): 120,
+    ("Bhubaneswar", "Balasore"): 200,
+    ("Bhubaneswar", "Rourkela"): 340,
+    ("Bhubaneswar", "Berhampur"): 170,
+    ("Bhubaneswar", "Gopalpur"): 185,
+    ("Bhubaneswar", "Koraput"): 505,
+    ("Bhubaneswar", "Visakhapatnam"): 445,
+}
 
-Where the fare rules set a minimum distance for the vehicle, the trip is billed at that minimum even if the road distance is shorter. The vehicle card states the billed distance when that happens.
+TERMS = """This fare is calculated from the published cab rate card for the pickup city, at the road distance shown on this page — the same package price the booking flow charges.
+
+An outstation package includes a set number of kilometres and hours. Distance beyond the included kilometres is billed at the vehicle's extra-km rate and is itemised on the vehicle card above.
 
 A night surcharge is added automatically when your pickup falls inside the night window defined by the fare rules.
 
-The estimate covers a one-way drop between the two places named on this page. Waiting time, tolls, parking and permit charges are not included in it.
+The estimate covers a one-way drop between the two places named on this page. Waiting time, tolls, parking and permit charges are not included unless the card says otherwise.
 
-Prices change when the fare rules are updated; a quote you save while booking is held for that booking."""
+Prices change when the rate card is updated; a quote you save while booking is held for that booking."""
 
 
 async def seed() -> None:
@@ -229,12 +255,20 @@ async def seed() -> None:
                     origin_hint=hint,
                     destination_hint=hint,
                 )
-            except Exception as exc:
+            except Exception:
+                manual = MANUAL_DISTANCES.get((origin, destination))
+                if manual is None:
+                    print(
+                        f"[seed_cab_routes] {slug}: distance unresolved and no "
+                        "manual value — skipped"
+                    )
+                    failed += 1
+                    continue
+                distance_km, source = Decimal(manual), "MANUAL"
                 print(
-                    f"[seed_cab_routes] {slug}: distance unresolved ({exc}) — skipped"
+                    f"[seed_cab_routes] {slug}: Maps unavailable — "
+                    f"using manual {manual} km"
                 )
-                failed += 1
-                continue
 
             description = f"One-way cab from {origin} to {destination}. {r.get('note', '')}".strip()
             await db.execute(

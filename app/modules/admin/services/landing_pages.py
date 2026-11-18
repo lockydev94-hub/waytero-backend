@@ -43,6 +43,9 @@ from app.modules.admin.constants.landing_pages import (
     is_reserved_slug,
 )
 from app.modules.admin.models import CmsAuditVersion, LandingPage
+from app.modules.booking.services.cab_availability import (
+    filter_enabled_cab_trip_types,
+)
 from app.modules.master.models import City, Place, State
 from app.shared.utilities.seo import SLUG_RE, ensure_slug_unique, slugify
 
@@ -940,6 +943,11 @@ class LandingPageService:
         if trip_types_filter:
             filtered = [code for code in trip_types if code in trip_types_filter]
             trip_types = filtered or trip_types  # never show an empty teaser
+
+        # A marketing page may only quote a product the admin has left
+        # bookable. Apply this after the page-type filter so a disabled type
+        # cannot survive as the fallback teaser either.
+        trip_types = await filter_enabled_cab_trip_types(db, trip_types)
 
         rows: List[Dict[str, Any]] = []
         included_types: List[str] = []

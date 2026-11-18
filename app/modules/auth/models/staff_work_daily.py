@@ -5,7 +5,6 @@
 # Migration: 0084
 # ============================================================
 
-import uuid
 from datetime import datetime, timezone
 from sqlalchemy import (
     BigInteger,

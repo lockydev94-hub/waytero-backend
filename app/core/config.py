@@ -103,6 +103,12 @@ class Settings(BaseSettings):
     # multiple uvicorn workers never race on alembic (H9). Set False in prod.
     RUN_MIGRATIONS_ON_STARTUP: bool = True
 
+    # The dev start script runs migrations plus scripts/seed_dev_data before it
+    # launches uvicorn, so the API is told to skip its own copy of that work
+    # (seeders, wallet/legal seeding and the idempotent repair scripts). Cold
+    # boot drops from minutes to seconds. Left True for a manual uvicorn run.
+    RUN_SEEDERS_ON_STARTUP: bool = True
+
     @property
     def cors_origins_list(self) -> List[str]:
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",")]

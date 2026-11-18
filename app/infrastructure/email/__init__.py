@@ -104,6 +104,27 @@ EVENT_TEMPLATES: Dict[str, EventSpec] = {
         cta_label="Download invoice",
         cta_url="{web_url}/bookings",
     ),
+    "driver_assigned": EventSpec(
+        "Driver Assigned",
+        "Your driver for {booking_number} is confirmed",
+        tone="#0F9D58",
+        cta_label="Track my trip",
+        cta_url="{web_url}/bookings",
+    ),
+    "trip_started": EventSpec(
+        "Trip Started",
+        "Your {service} trip {booking_number} has started",
+        tone="#1A56DB",
+        cta_label="Track my trip",
+        cta_url="{web_url}/bookings",
+    ),
+    "trip_completed": EventSpec(
+        "Trip Completed",
+        "Your {service} trip {booking_number} is complete",
+        tone="#0F9D58",
+        cta_label="View my trip",
+        cta_url="{web_url}/bookings",
+    ),
     "booking_cancelled": EventSpec(
         "Booking Cancelled",
         "Your {service} booking {booking_number} has been cancelled",
@@ -158,6 +179,11 @@ EVENT_TEMPLATES: Dict[str, EventSpec] = {
         "Settlement Completed",
         "Settlement of ₹{amount} completed for {period}",
         tone="#0F9D58",
+    ),
+    "partner_support_status": EventSpec(
+        "Support Ticket Updated",
+        "Support ticket {ticket_number} is now {status_label}",
+        tone="#1A56DB",
     ),
     "password_reset_otp": EventSpec(
         "Password Reset",
@@ -294,6 +320,42 @@ async def save_config(db: AsyncSession, values: Dict[str, Any]) -> Dict[str, str
     return await public_config(db)
 
 
+async def load_templates(db: AsyncSession) -> Dict[str, Dict[str, Any]]:
+    """Admin template overrides, keyed by event type.
+
+    A missing table (database not migrated yet) is treated as "no overrides"
+    instead of an error, so the built-in registry keeps working during a
+    rolling deploy. `to_regclass` avoids aborting the caller's transaction
+    with a failed SELECT.
+    """
+    try:
+        exists = (
+            await db.execute(text("SELECT to_regclass('public.email_templates')"))
+        ).scalar()
+        if not exists:
+            return {}
+        rows = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT event_type, label, subject, heading, body, "
+                        "cta_label, cta_url, tone, is_active, updated_at "
+                        "FROM email_templates"
+                    )
+                )
+            )
+            .mappings()
+            .all()
+        )
+    except Exception:
+        logger.warning(
+            "email.load_templates failed; falling back to built-in templates",
+            exc_info=True,
+        )
+        return {}
+    return {r["event_type"]: dict(r) for r in rows}
+
+
 async def public_config(db: AsyncSession) -> Dict[str, Any]:
     """Config safe to return to the admin UI — password masked."""
     cfg = await load_config(db)
@@ -392,19 +454,29 @@ def _cta_button(spec: EventSpec, ctx: Dict[str, Any], cfg: Dict[str, str]) -> st
     url = _fill(spec.cta_url, ctx, cfg)
     if not label or not url:
         return ""
+    # Tone is admin-editable; accept only a plain #RRGGBB so nothing else can
+    # reach the inline style.
+    tone = spec.tone
+    if not (tone.startswith("#") and len(tone) == 7):
+        tone = "#1A56DB"
     return (
         '<table role="presentation" cellpadding="0" cellspacing="0" '
         'style="margin:22px 0;"><tr><td>'
         f'<a href="{_esc(url)}" '
-        'style="display:inline-block;background:linear-gradient(135deg,#1A56DB,#0B1B3B);'
+        f'style="display:inline-block;background:{tone};'
         "color:#fff;text-decoration:none;font-weight:700;font-size:14px;"
         'padding:13px 30px;border-radius:10px;">'
         f"{_esc(label)}</a></td></tr></table>"
     )
 
 
-def _hero(spec: EventSpec, ctx: Dict[str, Any], cfg: Dict[str, str]) -> str:
-    title = _fill(spec.subject, ctx, cfg).split("!")[0] + "!"
+def _hero(
+    spec: EventSpec,
+    ctx: Dict[str, Any],
+    cfg: Dict[str, str],
+    heading: str = "",
+) -> str:
+    title = heading.strip() or (_fill(spec.subject, ctx, cfg).split("!")[0] + "!")
     subtitle = _esc(ctx.get("message") or "")
     return (
         '<div style="background:linear-gradient(135deg,#0B1B3B 0%,#12326B 60%,#1A56DB 130%);'
@@ -484,13 +556,32 @@ def _brand_shell(
 </body></html>"""
 
 
+def _effective_spec(event_type: str, template: Optional[Dict[str, Any]]) -> EventSpec:
+    """Built-in spec with the admin's saved overrides applied on top."""
+    base = EVENT_TEMPLATES.get(event_type, EVENT_TEMPLATES["test_email"])
+    tpl = template or {}
+    return EventSpec(
+        label=str(tpl.get("label") or base.label),
+        subject=str(tpl.get("subject") or base.subject),
+        tone=str(tpl.get("tone") or base.tone),
+        cta_label=str(tpl.get("cta_label") or base.cta_label),
+        cta_url=str(tpl.get("cta_url") or base.cta_url),
+    )
+
+
 def render_email(
     event_type: str,
     context: Dict[str, Any],
     cfg: Dict[str, str],
+    template: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
-    """Return (subject, html_body). Never raises — falls back to a generic mail."""
-    spec = EVENT_TEMPLATES.get(event_type, EVENT_TEMPLATES["test_email"])
+    """Return (subject, html_body). Never raises — falls back to a generic mail.
+
+    An admin template supplies the subject, hero heading, body paragraphs and
+    CTA; the branded shell (logo, platform name, support footer) always comes
+    from the platform settings, never from the template row.
+    """
+    spec = _effective_spec(event_type, template)
     subject = _fill(spec.subject, context, cfg)
     ctx = dict(context)
     ctx.setdefault("name", context.get("to_name") or "there")
@@ -501,10 +592,23 @@ def render_email(
     )[:400]
     ctx["message"] = message
 
-    hero = _hero(spec, ctx, cfg)
+    heading = _fill(str((template or {}).get("heading") or ""), ctx, cfg)
+    hero = _hero(spec, ctx, cfg, heading=heading)
     paragraphs = []
-    for block in context.get("body") or []:
-        paragraphs.append(f'<p style="margin:0 0 12px;">{_esc(block)}</p>')
+    template_body = str((template or {}).get("body") or "").strip()
+    if template_body:
+        # Plain text with blank-line paragraphs; placeholders are filled, then
+        # the whole line is escaped so customer data cannot inject markup.
+        for block in template_body.replace("\r\n", "\n").split("\n\n"):
+            block = block.strip()
+            if block:
+                paragraphs.append(
+                    f'<p style="margin:0 0 12px;">'
+                    f"{_esc(_fill(block, ctx, cfg))}</p>"
+                )
+    else:
+        for block in context.get("body") or []:
+            paragraphs.append(f'<p style="margin:0 0 12px;">{_esc(block)}</p>')
     body_html = (
         "".join(paragraphs)
         + _details_rows(ctx)
@@ -753,13 +857,11 @@ async def send_event_email(
         cfg = await load_config(db)
         if not cfg["enabled"]:
             return None  # disabled → no attempt, no log noise
-        subject = _fill(
-            EVENT_TEMPLATES.get(
-                event_type, EVENT_TEMPLATES["test_email"]
-            ).subject,
-            ctx,
-            cfg,
-        )
+        template = (await load_templates(db)).get(event_type)
+        # An admin can switch one event's email off without touching SMTP.
+        if template is not None and not template.get("is_active", True):
+            return None
+        subject = _fill(_effective_spec(event_type, template).subject, ctx, cfg)
         try:
             await _mirror_to_customer_inbox(
                 db,
@@ -792,7 +894,9 @@ async def send_event_email(
             )
         # Same subject the caller's context produced above; render_email returns
         # it alongside the HTML body.
-        _, html_body = await asyncio.to_thread(render_email, event_type, ctx, cfg)
+        _, html_body = await asyncio.to_thread(
+            render_email, event_type, ctx, cfg, template
+        )
         await asyncio.to_thread(_smtp_send, cfg, to_email, subject, html_body)
         return await _write_log(
             db,
@@ -812,8 +916,9 @@ async def send_event_email(
             "email.send_failed event=%s to=%s err=%s", event_type, to_email, exc
         )
         try:
+            template = (await load_templates(db)).get(event_type)
             subject = _fill(
-                EVENT_TEMPLATES.get(event_type, EVENT_TEMPLATES["test_email"]).subject,
+                _effective_spec(event_type, template).subject,
                 ctx,
                 await load_config(db),
             )
@@ -838,6 +943,65 @@ async def send_event_email(
         except Exception as log_exc:  # pragma: no cover
             logger.error("email.log_failed err=%s", log_exc)
             return None
+
+
+async def send_customer_event_email(
+    db: AsyncSession,
+    *,
+    customer_id: int,
+    event_type: str,
+    context: Optional[Dict[str, Any]] = None,
+    related_type: Optional[str] = None,
+    related_id: Optional[Any] = None,
+) -> Optional[int]:
+    """Email a customer by id, resolving their address first.
+
+    This is the "only if the customer has an email" gate in one place: no
+    address means no attempt and no log row. Email being disabled is handled by
+    [send_event_email]. Never raises.
+    """
+    try:
+        row = (
+            (
+                await db.execute(
+                    text(
+                        "SELECT u.email, "
+                        "TRIM(CONCAT(COALESCE(u.first_name, ''), ' ', "
+                        "COALESCE(u.last_name, ''))) AS name "
+                        "FROM customers c JOIN users u ON u.id = c.user_id "
+                        "WHERE c.id = :cid LIMIT 1"
+                    ),
+                    {"cid": customer_id},
+                )
+            )
+            .mappings()
+            .first()
+        )
+        if row is None:
+            return None
+        email = (row["email"] or "").strip()
+        if not email:
+            return None
+        name = (row["name"] or "").strip() or None
+        ctx = dict(context or {})
+        ctx.setdefault("name", name)
+        return await send_event_email(
+            db,
+            event_type=event_type,
+            to_email=email,
+            to_name=name,
+            context=ctx,
+            related_type=related_type,
+            related_id=related_id,
+        )
+    except Exception as exc:  # pragma: no cover — never break the caller
+        logger.warning(
+            "email.customer_lookup_failed customer=%s event=%s err=%s",
+            customer_id,
+            event_type,
+            exc,
+        )
+        return None
 
 
 async def send_test_email(db: AsyncSession, to_email: str) -> Dict[str, Any]:
@@ -918,8 +1082,11 @@ async def resend_email(db: AsyncSession, log_id: int) -> Dict[str, Any]:
     event_type = row["event_type"] or "test_email"
     attempts = int(row["attempt_count"] or 0) + 1
 
+    template = (await load_templates(db)).get(event_type)
     try:
-        subject, html_body = await asyncio.to_thread(render_email, event_type, ctx, cfg)
+        subject, html_body = await asyncio.to_thread(
+            render_email, event_type, ctx, cfg, template
+        )
         await asyncio.to_thread(_smtp_send, cfg, to_email, subject, html_body)
         await db.execute(
             text(
@@ -962,9 +1129,11 @@ __all__ = [
     "EVENT_TEMPLATES",
     "EVENT_LABELS",
     "load_config",
+    "load_templates",
     "save_config",
     "public_config",
     "send_event_email",
+    "send_customer_event_email",
     "send_test_email",
     "resend_email",
     "render_email",

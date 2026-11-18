@@ -394,6 +394,26 @@ class CommissionService:
         await db.delete(rule)
         return True
 
+    @staticmethod
+    async def resolve(
+        db: AsyncSession,
+        *,
+        city_id: Optional[int],
+        service_type: str = "CAB",
+        for_date: Optional[date] = None,
+        partner_id: Optional[int] = None,
+    ):
+        # Delegates to the resolver below. An earlier duplicate definition of
+        # `CommissionService` shadowed this CRUD class entirely, leaving
+        # create_group/list_groups/resolve unreachable at runtime.
+        return await _CommissionRuleResolver.resolve(
+            db,
+            city_id=city_id,
+            service_type=service_type,
+            for_date=for_date,
+            partner_id=partner_id,
+        )
+
 
 # ── Vehicle Pricing Rules ─────────────────────────────────────────────────────
 
@@ -842,7 +862,7 @@ class DefaultPricingService:
         return None
 
 
-class CommissionService:
+class _CommissionRuleResolver:
     """Which commission rule applies to a booking, decided in one place.
 
     Doc Ref: DB Schema Part 2 §15 — commission_rules; BRD Part 3 §45
@@ -877,8 +897,16 @@ class CommissionService:
         city_id: Optional[int],
         service_type: str = "CAB",
         for_date: Optional[date] = None,
+        partner_id: Optional[int] = None,
     ):
-        """Return a `CommissionRuleSpec` for the booking's city and day."""
+        """Return a `CommissionRuleSpec` for the booking's city and day.
+
+        When the partner is assigned to a commission group, the group's rule
+        takes precedence over the city default. Admin assigns the group to the
+        partner exactly so their trips settle at the negotiated rate; before
+        this the assignment was stored but never read, so every partner paid
+        the city rule regardless of group.
+        """
         from app.modules.booking.services.settlement_math import CommissionRuleSpec
         from app.modules.admin.models import CommissionRule
 
@@ -931,6 +959,45 @@ class CommissionService:
                     "re-date one before closing a trip."
                 )
             return _spec(rows[0], source) if rows else None
+
+        if partner_id:
+            from sqlalchemy import text as _text
+
+            group_id = (
+                await db.execute(
+                    _text(
+                        """
+                        SELECT pcg.commission_group_id
+                        FROM partner_commission_groups pcg
+                        JOIN commission_groups cg ON cg.id = pcg.commission_group_id
+                        WHERE pcg.partner_id = :pid AND cg.is_active = TRUE
+                        ORDER BY pcg.assigned_at DESC, pcg.id DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"pid": partner_id},
+                )
+            ).scalar()
+            if group_id:
+                if city_id:
+                    group_city = await _one_where(
+                        (
+                            CommissionRule.commission_group_id == group_id,
+                            CommissionRule.city_id == city_id,
+                        ),
+                        f"partner group #{group_id} city",
+                    )
+                    if group_city:
+                        return group_city
+                group_rule = await _one_where(
+                    (
+                        CommissionRule.commission_group_id == group_id,
+                        CommissionRule.city_id.is_(None),
+                    ),
+                    f"partner group #{group_id}",
+                )
+                if group_rule:
+                    return group_rule
 
         if city_id:
             city_rule = await _one_where((CommissionRule.city_id == city_id,), "city")
@@ -1122,8 +1189,12 @@ class CmsService:
     # and offered in the editor; nothing rendered them, so they are rejected now
     # rather than quietly filling a form that does nothing.
     SECTION_CONTENT_KEYS: dict[str, set[str]] = {
-        "HERO": {"marquee_items"},
+        # `trust_items` is the hero's icon chips (Verified Partners,
+        # Transparent Pricing, 24/7 Support). The site falls back to its own
+        # three when an admin never saves any.
+        "HERO": {"marquee_items", "trust_items"},
         "SERVICES": {"items", "eyebrow", "title", "subtitle"},
+        "RIDE_TYPES": {"items"},
         "WHY_US": {"items", "eyebrow", "title", "subtitle"},
         "STATS": {"stats", "eyebrow", "title"},
         "HOW_IT_WORKS": {"steps"},
@@ -1930,7 +2001,9 @@ class CmsService:
                     Customer.last_name,
                     City.name,
                 )
-                .join(MasterBooking, MasterBooking.id == BookingReview.master_booking_id)
+                .join(
+                    MasterBooking, MasterBooking.id == BookingReview.master_booking_id
+                )
                 .join(Customer, Customer.id == BookingReview.customer_id)
                 .outerjoin(City, City.id == MasterBooking.city_id)
                 .where(

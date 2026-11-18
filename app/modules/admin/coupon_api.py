@@ -33,6 +33,11 @@ COUPON_TYPES = {"PLATFORM", *PARTNER_FUNDED_TYPES}
 CENT = Decimal("0.01")
 
 
+def _actor_id(current_user: dict) -> str:
+    """The authenticated user's id from the JWT payload (`sub` is the id)."""
+    return str(current_user.get("sub") or current_user.get("id") or "")
+
+
 class CouponServiceRuleIn(BaseModel):
     service_type: ServiceType
     vehicle_category_id: int | None = Field(None, gt=0)
@@ -341,13 +346,13 @@ async def create_coupon(
         exclude={"service_rules", "city_rules", "customer_mobiles", "partner_ids"}
     )
     data["platform_share_percent"] = pct
-    coupon = Coupon(**data, created_by=str(current_user["id"]), partner_rules=[])
+    coupon = Coupon(**data, created_by=_actor_id(current_user), partner_rules=[])
     db.add(coupon)
     await db.flush()
     await _save_relations(
         db, coupon, payload.service_rules, payload.city_rules, payload.customer_mobiles
     )
-    await _save_partner_rules(db, coupon, payload.partner_ids, str(current_user["id"]))
+    await _save_partner_rules(db, coupon, payload.partner_ids, _actor_id(current_user))
     await db.flush()
     return await _load_coupon(db, coupon.id)
 
@@ -408,7 +413,7 @@ async def update_coupon(
         db, coupon, payload.service_rules, payload.city_rules, payload.customer_mobiles
     )
     if payload.partner_ids is not None:
-        await _save_partner_rules(db, coupon, ids, str(current_user["id"]))
+        await _save_partner_rules(db, coupon, ids, _actor_id(current_user))
     await db.flush()
     return await _load_coupon(db, coupon.id)
 
@@ -904,7 +909,7 @@ async def remove_coupon_partner(
         )
     rule.is_active = False
     rule.removed_at = datetime.now(timezone.utc)
-    rule.removed_by = str(current_user["id"])
+    rule.removed_by = _actor_id(current_user)
     if not any(r.is_active for r in coupon.partner_rules):
         coupon.is_active = False
     await db.flush()
