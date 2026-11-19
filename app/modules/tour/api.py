@@ -14,7 +14,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy import desc, func, or_, select, text
+from sqlalchemy import and_, desc, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.database import get_db
@@ -26,6 +26,7 @@ from app.modules.booking.services.numbering import next_master_booking_number
 from app.modules.customer.models import Customer
 from app.modules.master.models import City
 from app.modules.partner.models import Partner, PartnerService
+from app.modules.vehicle.models import VehicleCategory
 from app.modules.tour.models import (
     TourBooking,
     TourItinerary,
@@ -180,6 +181,97 @@ class TourChargeIn(BaseModel):
     label: str = Field(min_length=2, max_length=255)
     amount: float = Field(gt=0)
     reason: Optional[str] = None
+
+
+# ── Custom / private tour plan (migration 0109) ──────────────────────────────
+# Admin builds these for one customer. The plan is deliberately separate from
+# a published package: status CUSTOM keeps it out of the website catalog, while
+# the normal tour package columns let the existing booking, partner acceptance,
+# invoice and PDF paths work without a second booking engine.
+
+
+class CustomPlaceIn(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    arrival_time: Optional[str] = Field(default=None, max_length=20)
+    distance_from_previous_km: float = Field(default=0, ge=0)
+    distance_source: Optional[str] = Field(default=None, max_length=20)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+class CustomHotelIn(BaseModel):
+    enabled: bool = False
+    hotel_name: Optional[str] = Field(default=None, max_length=255)
+    address: Optional[str] = Field(default=None, max_length=500)
+    category: Optional[str] = Field(default=None, max_length=100)
+    room_type: Optional[str] = Field(default=None, max_length=100)
+    rooms: int = Field(default=1, ge=1, le=20)
+    nights: int = Field(default=1, ge=1, le=30)
+    cost: float = Field(default=0, ge=0)
+    notes: Optional[str] = Field(default=None, max_length=500)
+
+
+class CustomDayIn(BaseModel):
+    day_number: int = Field(ge=1, le=90)
+    title: str = Field(min_length=2, max_length=255)
+    description: Optional[str] = None
+    places: list[CustomPlaceIn] = Field(default_factory=list)
+    hotel: Optional[CustomHotelIn] = None
+    other_cost: float = Field(default=0, ge=0)
+    notes: Optional[str] = None
+
+
+class CustomPlanIn(BaseModel):
+    customer_id: int
+    partner_id: int
+    package_name: str = Field(min_length=3, max_length=255)
+    destination: str = Field(min_length=2, max_length=255)
+    city_id: int
+    duration_days: int = Field(ge=1, le=30)
+    duration_nights: int = Field(ge=0, le=29)
+    travel_start_date: date
+    persons_count: int = Field(ge=1)
+    minimum_persons: int = Field(default=1, ge=1)
+    maximum_persons: Optional[int] = Field(default=None, ge=1)
+    pickup_location: Optional[str] = Field(default=None, max_length=500)
+    short_description: Optional[str] = Field(default=None, max_length=500)
+    description: Optional[str] = None
+    cab_category_id: int
+    days: list[CustomDayIn] = Field(min_length=1)
+    inclusions: list[str] = Field(default_factory=list)
+    exclusions: list[str] = Field(default_factory=list)
+    media: list[str] = Field(default_factory=list)
+    toll_cost: float = Field(default=0, ge=0)
+    other_cost: float = Field(default=0, ge=0)
+    quoted_price: Optional[Decimal] = Field(default=None, gt=0)
+    book_now: bool = False
+    special_requests: Optional[str] = None
+    participants: list[ParticipantIn] = Field(default_factory=list)
+
+
+class CustomEstimateIn(BaseModel):
+    city_id: int
+    travel_start_date: date
+    duration_days: int = Field(ge=1, le=30)
+    cab_category_id: int
+    days: list[CustomDayIn] = Field(min_length=1)
+    toll_cost: float = Field(default=0, ge=0)
+    other_cost: float = Field(default=0, ge=0)
+
+
+class CustomBookIn(BaseModel):
+    partner_id: int
+    quoted_price: Decimal = Field(gt=0)
+    travel_start_date: date
+    persons_count: int = Field(ge=1)
+    special_requests: Optional[str] = None
+    participants: list[ParticipantIn] = Field(default_factory=list)
+
+
+class CustomRouteDistanceIn(BaseModel):
+    origin: str = Field(min_length=1, max_length=500)
+    destination: str = Field(min_length=1, max_length=500)
+    origin_hint: Optional[str] = Field(default=None, max_length=255)
+    destination_hint: Optional[str] = Field(default=None, max_length=255)
 
 
 ADMIN_ROLES = ("SUPER_ADMIN", "ADMIN", "CCO", "VERIFICATION_OFFICER")
@@ -474,6 +566,15 @@ async def _package_payload(
         "description": package.description,
         "terms_and_conditions": package.terms_and_conditions,
         "status": package.status,
+        "is_custom": bool(getattr(package, "is_custom", False)),
+        "custom_customer_id": getattr(package, "custom_customer_id", None),
+        "custom_plan": getattr(package, "custom_plan", None),
+        "estimated_cost": float(getattr(package, "estimated_cost", 0) or 0),
+        "quoted_price": (
+            float(package.quoted_price)
+            if getattr(package, "quoted_price", None) is not None
+            else None
+        ),
         "partner_id": package.partner_id,
         "partner_name": (partner[0] if partner else None),
         "partner_code": (partner[1] if partner else None),
@@ -521,6 +622,10 @@ async def _package_payload(
         data.pop("rejection_reason", None)
         data.pop("partner_id", None)
         data.pop("partner_code", None)
+        data.pop("custom_customer_id", None)
+        data.pop("custom_plan", None)
+        data.pop("estimated_cost", None)
+        data.pop("quoted_price", None)
     return data
 
 
@@ -631,6 +736,451 @@ async def _price_for(
     return total, commission, total - commission, percent
 
 
+# ════════════════════════════════════════════════════════════════
+# CUSTOM TOUR PLAN HELPERS
+# ════════════════════════════════════════════════════════════════
+
+_CUSTOM_ESTIMATE_TRIP_TYPES = (
+    "ROUND_TRIP",
+    "OUTSTATION",
+    "ONE_WAY",
+    "LOCAL",
+)
+
+
+def _custom_days_total_km(days: list[CustomDayIn]) -> float:
+    return round(
+        sum(
+            max(float(place.distance_from_previous_km or 0), 0)
+            for day in days
+            for place in day.places
+        ),
+        2,
+    )
+
+
+def _validate_custom_days(
+    days: list[CustomDayIn],
+    duration_days: int,
+    duration_nights: int | None = None,
+) -> None:
+    if len(days) != duration_days:
+        raise HTTPException(
+            422,
+            f"The itinerary has {len(days)} day(s), but the package duration is "
+            f"{duration_days} day(s). Add exactly one itinerary day per package day.",
+        )
+    if duration_nights is not None and duration_nights != duration_days - 1:
+        raise HTTPException(422, "Nights must be exactly one less than days.")
+    numbers = sorted(day.day_number for day in days)
+    if numbers != list(range(1, duration_days + 1)):
+        raise HTTPException(
+            422, "Itinerary days must be numbered 1 through duration_days."
+        )
+    for day in days:
+        if not day.places:
+            raise HTTPException(
+                422,
+                f"Day {day.day_number} needs at least one place. Add the places "
+                "visited that day so the route and cab estimate are meaningful.",
+            )
+        if day.hotel and day.hotel.enabled and not (day.hotel.hotel_name or "").strip():
+            raise HTTPException(
+                422,
+                f"Day {day.day_number}: enter the hotel name or turn the hotel off.",
+            )
+
+
+async def _custom_cab_rule(
+    db: AsyncSession,
+    *,
+    city_id: int,
+    cab_category_id: int,
+    travel_date: date,
+):
+    """The first effective cab sheet for a custom plan.
+
+    ROUND_TRIP is the natural default for a multi-day tour. The fallbacks keep
+    older city sheets (which may only have OUTSTATION / ONE_WAY rows) usable.
+    """
+    from app.modules.admin.services import DefaultPricingService
+
+    for trip_type in _CUSTOM_ESTIMATE_TRIP_TYPES:
+        rule = await DefaultPricingService.get_effective_rule(
+            db,
+            city_id,
+            cab_category_id,
+            trip_type,
+            for_date=travel_date,
+        )
+        if rule:
+            return rule
+    raise HTTPException(
+        422,
+        "No cab pricing rule is configured for this city and cab type. Set the "
+        "round-trip / outstation rate in Settings → Vehicle Pricing first.",
+    )
+
+
+async def _custom_plan_estimate(
+    db: AsyncSession, payload: CustomEstimateIn | CustomPlanIn
+) -> tuple[dict[str, Any], dict[str, float], dict[str, Any]]:
+    """Validate the plan and compute the minimum operating estimate.
+
+    The estimate is what the plan costs the platform before margin: cab
+    (base + billed KM + driver allowance + night/toll), hotels entered by the
+    admin, and other/toll charges. It is not the customer selling price; that
+    is `quoted_price`, set by the admin after review.
+    """
+    _validate_custom_days(
+        payload.days,
+        payload.duration_days,
+        getattr(payload, "duration_nights", None),
+    )
+
+    category = await db.scalar(
+        select(VehicleCategory).where(VehicleCategory.id == payload.cab_category_id)
+    )
+    if not category:
+        raise HTTPException(404, "Cab category not found")
+
+    rule = await _custom_cab_rule(
+        db,
+        city_id=payload.city_id,
+        cab_category_id=payload.cab_category_id,
+        travel_date=payload.travel_start_date,
+    )
+
+    total_km = _custom_days_total_km(payload.days)
+    billed_km = max(total_km, float(rule.get("minimum_km") or 0))
+    base_fare = float(rule.get("base_fare") or 0)
+    per_km_rate = float(rule.get("per_km_rate") or 0)
+    distance_charge = round(per_km_rate * billed_km, 2)
+
+    allowance = float(rule.get("driver_allowance") or 0)
+    allowance_type = str(rule.get("driver_allowance_type") or "PER_TRIP")
+    if allowance_type == "PER_DAY":
+        driver_allowance = round(allowance * payload.duration_days, 2)
+    elif allowance_type == "PER_KM":
+        driver_allowance = round(allowance * billed_km, 2)
+    elif allowance_type == "NONE":
+        driver_allowance = 0.0
+    else:
+        driver_allowance = round(allowance, 2)
+
+    night_charge = float(rule.get("night_charge") or 0)
+    night_charge_type = str(rule.get("night_charge_type") or "FIXED")
+    if night_charge_type == "PERCENTAGE":
+        night_total = round((base_fare + distance_charge) * night_charge / 100.0, 2)
+    elif night_charge_type == "PER_KM":
+        night_total = round(night_charge * billed_km, 2)
+    else:
+        night_total = round(night_charge, 2)
+
+    hotel_total = round(
+        sum(
+            float(day.hotel.cost or 0)
+            for day in payload.days
+            if day.hotel and day.hotel.enabled
+        ),
+        2,
+    )
+    day_other_total = round(sum(float(day.other_cost or 0) for day in payload.days), 2)
+    rule_toll = float(rule.get("toll") or 0)
+    toll_total = round(rule_toll + float(payload.toll_cost or 0), 2)
+    other_total = round(day_other_total + float(payload.other_cost or 0), 2)
+
+    cab_total = round(
+        base_fare + distance_charge + driver_allowance + night_total + toll_total,
+        2,
+    )
+    estimated_cost = round(cab_total + hotel_total + other_total, 2)
+
+    breakdown = {
+        "total_distance_km": total_km,
+        "billed_distance_km": round(billed_km, 2),
+        "cab_base_fare": round(base_fare, 2),
+        "cab_distance_charge": distance_charge,
+        "cab_driver_allowance": driver_allowance,
+        "cab_night_charge": night_total,
+        "cab_toll": round(rule_toll, 2),
+        "toll_cost": round(float(payload.toll_cost or 0), 2),
+        "hotel_total": hotel_total,
+        "other_total": other_total,
+        "cab_total": cab_total,
+        "estimated_cost": estimated_cost,
+    }
+
+    cab_pricing = {
+        "category_id": category.id,
+        "category_name": category.category_name,
+        "trip_type": rule.get("trip_type"),
+        "source": rule.get("source"),
+        "base_fare": base_fare,
+        "minimum_km": float(rule.get("minimum_km") or 0),
+        "per_km_rate": per_km_rate,
+        "driver_allowance": allowance,
+        "driver_allowance_type": allowance_type,
+        "night_charge": night_charge,
+        "night_charge_type": night_charge_type,
+        "toll": rule_toll,
+    }
+
+    plan = {
+        "version": 1,
+        "days": [day.model_dump() for day in payload.days],
+        "total_distance_km": total_km,
+        "cab": cab_pricing,
+        "toll_cost": round(float(payload.toll_cost or 0), 2),
+        "other_cost": round(float(payload.other_cost or 0), 2),
+        "cost_breakdown": breakdown,
+    }
+    return plan, breakdown, cab_pricing
+
+
+def _custom_package_in(
+    payload: CustomPlanIn,
+    plan: dict[str, Any],
+    breakdown: dict[str, float],
+) -> PackageIn:
+    """Translate the rich custom plan into the existing PackageIn shape.
+
+    The normal TourItinerary rows are kept informative enough for the existing
+    customer PDF: place names, drive distance and hotel name all appear in the
+    day's activity list.
+    """
+    itinerary: list[ItineraryIn] = []
+    for day in payload.days:
+        activities: list[str] = []
+        for place in day.places:
+            label = place.name.strip()
+            if place.arrival_time:
+                label = f"{label} ({place.arrival_time})"
+            if place.distance_from_previous_km:
+                label = (
+                    f"{label} - {place.distance_from_previous_km:g} km"
+                    f" ({place.distance_source or 'MANUAL'})"
+                )
+            activities.append(label)
+        if day.hotel and day.hotel.enabled:
+            hotel_label = day.hotel.hotel_name or "Hotel"
+            if day.hotel.category:
+                hotel_label = f"{hotel_label} ({day.hotel.category})"
+            if day.hotel.cost:
+                hotel_label = f"{hotel_label} - Rs. {day.hotel.cost:,.2f}"
+            activities.append(f"Hotel: {hotel_label}")
+        if day.other_cost:
+            activities.append(f"Other charges: Rs. {day.other_cost:,.2f}")
+        itinerary.append(
+            ItineraryIn(
+                day_number=day.day_number,
+                title=day.title,
+                description=day.description or day.notes,
+                activities=activities,
+            )
+        )
+
+    media = [
+        {
+            "media_url": url,
+            "caption": "",
+            "is_primary": i == 0,
+            "display_order": i,
+            "media_type": "IMAGE",
+        }
+        for i, url in enumerate(payload.media)
+        if url.strip()
+    ]
+    price = float(payload.quoted_price or breakdown["estimated_cost"] or 0)
+    return PackageIn(
+        partner_id=payload.partner_id,
+        package_name=payload.package_name,
+        package_type="CUSTOM",
+        destination=payload.destination,
+        city_id=payload.city_id,
+        duration_days=payload.duration_days,
+        duration_nights=payload.duration_nights,
+        minimum_persons=payload.minimum_persons,
+        maximum_persons=payload.maximum_persons,
+        short_description=payload.short_description
+        or f"{payload.duration_days}D/{payload.duration_nights}N custom tour",
+        description=payload.description
+        or f"Private custom tour plan for {payload.destination}.",
+        terms_and_conditions=(
+            "Private custom tour prepared for one customer. Not a published "
+            "catalog package."
+        ),
+        itinerary=itinerary,
+        inclusions=payload.inclusions,
+        exclusions=payload.exclusions,
+        pricing=(
+            [
+                PricingIn(
+                    persons_count=1,
+                    package_price=Decimal(str(price)).quantize(Decimal("0.01")),
+                )
+            ]
+            if price > 0
+            else []
+        ),
+        media=media,
+    )
+
+
+async def _assert_tour_partner(db: AsyncSession, partner_id: int) -> Partner:
+    partner = await db.scalar(
+        select(Partner).where(Partner.id == partner_id, Partner.status == "ACTIVE")
+    )
+    if not partner:
+        raise HTTPException(404, "Active partner not found")
+    service = await db.scalar(
+        select(PartnerService.id).where(
+            PartnerService.partner_id == partner_id,
+            PartnerService.service_type == "TOUR",
+            PartnerService.is_active.is_(True),
+        )
+    )
+    if not service:
+        raise HTTPException(
+            422,
+            "This partner does not have the TOUR service enabled. Enable TOUR "
+            "for the partner before assigning a custom tour.",
+        )
+    return partner
+
+
+async def _create_custom_booking(
+    db: AsyncSession,
+    *,
+    package: TourPackage,
+    payload: CustomBookIn,
+) -> dict[str, Any]:
+    """Create the master + tour booking for a private custom package.
+
+    The normal partner acceptance gate applies: the selected partner gets the
+    request popup and must accept before the tour is confirmed.
+    """
+    if not package.is_custom or not package.custom_customer_id:
+        raise HTTPException(422, "This is not a private custom tour package")
+    await _assert_tour_partner(db, payload.partner_id)
+
+    total = Decimal(str(payload.quoted_price)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    package.quoted_price = total
+    pricing_row = await db.scalar(
+        select(TourPackagePricing)
+        .where(TourPackagePricing.package_id == package.id)
+        .order_by(TourPackagePricing.persons_count)
+        .limit(1)
+    )
+    if pricing_row:
+        pricing_row.package_price = total
+    else:
+        db.add(
+            TourPackagePricing(
+                package_id=package.id,
+                persons_count=1,
+                package_price=total,
+            )
+        )
+    percent = await _commission(db, package)
+    commission = (total * percent / Decimal("100")).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    payout = total - commission
+    end_date = payload.travel_start_date + timedelta(days=package.duration_days - 1)
+
+    plan = package.custom_plan or {}
+    hotel_lines: list[str] = []
+    for day in plan.get("days", []):
+        hotel = day.get("hotel") or {}
+        if hotel.get("enabled") and hotel.get("hotel_name"):
+            hotel_lines.append(
+                f"Day {day.get('day_number')}: {hotel['hotel_name']}"
+                + (f" ({hotel.get('category')})" if hotel.get("category") else "")
+            )
+
+    master = MasterBooking(
+        booking_number=await next_master_booking_number(db),
+        customer_id=package.custom_customer_id,
+        city_id=package.city_id,
+        booking_status="PENDING_PAYMENT",
+        payment_status="PENDING",
+        total_amount=total,
+        journey_start_date=payload.travel_start_date,
+        journey_end_date=end_date,
+        remarks=payload.special_requests,
+    )
+    db.add(master)
+    await db.flush()
+    tour = TourBooking(
+        master_booking_id=master.id,
+        package_id=package.id,
+        booking_number=f"TO-{datetime.now(timezone.utc):%Y%m%d}-{str(master.id).zfill(5)}",
+        travel_start_date=payload.travel_start_date,
+        travel_end_date=end_date,
+        pickup_location=plan.get("pickup_location"),
+        persons_count=payload.persons_count,
+        total_amount=total,
+        payment_status="PENDING",
+        platform_commission=commission,
+        partner_payout=payout,
+        booking_status="PENDING_CONFIRMATION",
+        special_requests=payload.special_requests,
+        itinerary_snapshot=plan,
+        hotel_details="\n".join(hotel_lines) or None,
+        other_details=(
+            f"Custom plan estimate Rs. {float(package.estimated_cost or 0):,.2f}; "
+            f"quoted price Rs. {float(total):,.2f}."
+        ),
+    )
+    db.add(tour)
+    await db.flush()
+    db.add(
+        BookingService(
+            master_booking_id=master.id,
+            service_type="TOUR",
+            service_reference_id=tour.id,
+            service_status=tour.booking_status,
+            service_amount=total,
+        )
+    )
+    for participant in payload.participants:
+        db.add(TourParticipant(tour_booking_id=tour.id, **participant.model_dump()))
+    await db.flush()
+
+    try:
+        from app.modules.notification.services.booking_notifications import (
+            partner_tour_booking_requested,
+        )
+
+        await partner_tour_booking_requested(
+            db,
+            partner_id=package.partner_id,
+            master_booking_id=master.id,
+            tour_booking_id=tour.id,
+            tour_booking_number=tour.booking_number,
+            package_name=package.package_name or "",
+            travel_start_date=payload.travel_start_date.isoformat(),
+            persons_count=payload.persons_count,
+            total_amount=float(total),
+        )
+    except Exception:  # pragma: no cover - notifications must never block money
+        pass
+
+    return {
+        "tour_booking_id": tour.id,
+        "master_booking_id": master.id,
+        "booking_number": tour.booking_number,
+        "master_booking_number": master.booking_number,
+        "total_amount": float(total),
+        "platform_commission": float(commission),
+        "partner_payout": float(payout),
+        "booking_status": tour.booking_status,
+    }
+
+
 async def _list_packages(
     db: AsyncSession,
     *,
@@ -644,6 +1194,10 @@ async def _list_packages(
     stmt = select(TourPackage).order_by(desc(TourPackage.created_at))
     if statuses:
         stmt = stmt.where(TourPackage.status.in_(statuses))
+    if not include_private:
+        # A custom plan must never leak into the public catalog, even if an
+        # operator accidentally moves its status to ACTIVE.
+        stmt = stmt.where(TourPackage.is_custom.is_(False))
     if partner_id is not None:
         stmt = stmt.where(TourPackage.partner_id == partner_id)
     if city_id is not None:
@@ -726,6 +1280,235 @@ async def admin_create_package(
         db, payload, user, partner_id=payload.partner_id, status_value="ACTIVE"
     )
     return await _package_payload(db, package)
+
+
+# ── Custom plan discovery helpers ────────────────────────────────────────────
+
+
+@admin_router.get("/custom-plans/partners")
+async def custom_plan_partners(
+    city_id: Optional[int] = None,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_roles(*ADMIN_ROLES)),
+):
+    """Active partners with the TOUR service, for the custom-plan review step."""
+    stmt = (
+        select(Partner, PartnerService, City)
+        .outerjoin(
+            PartnerService,
+            and_(
+                PartnerService.partner_id == Partner.id,
+                PartnerService.service_type == "TOUR",
+                PartnerService.is_active.is_(True),
+            ),
+        )
+        .outerjoin(City, City.id == Partner.city_id)
+        .where(Partner.status == "ACTIVE")
+        .order_by(Partner.business_name)
+    )
+    if city_id is not None:
+        stmt = stmt.where(Partner.city_id == city_id)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "id": partner.id,
+            "business_name": partner.business_name,
+            "owner_name": partner.owner_name,
+            "mobile": partner.mobile,
+            "city_id": partner.city_id,
+            "city_name": city.name if city else None,
+            "has_tour_service": service is not None,
+        }
+        for partner, service, city in rows
+    ]
+
+
+@admin_router.get("/custom-plans/cab-options")
+async def custom_cab_options(
+    city_id: int,
+    travel_date: Optional[date] = None,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_roles(*ADMIN_ROLES)),
+):
+    """Cab categories + the effective sheet the custom estimator will use."""
+    categories = (
+        await db.scalars(
+            select(VehicleCategory)
+            .where(VehicleCategory.is_active.is_(True))
+            .order_by(VehicleCategory.display_order, VehicleCategory.category_name)
+        )
+    ).all()
+    on_day = travel_date or date.today()
+    result: list[dict[str, Any]] = []
+    for category in categories:
+        try:
+            rule = await _custom_cab_rule(
+                db,
+                city_id=city_id,
+                cab_category_id=category.id,
+                travel_date=on_day,
+            )
+        except HTTPException:
+            continue
+        result.append(
+            {
+                "id": category.id,
+                "category_name": category.category_name,
+                "seating_capacity": category.seating_capacity,
+                "luggage_capacity": category.luggage_capacity,
+                "trip_type": rule.get("trip_type"),
+                "source": rule.get("source"),
+                "base_fare": float(rule.get("base_fare") or 0),
+                "minimum_km": float(rule.get("minimum_km") or 0),
+                "per_km_rate": float(rule.get("per_km_rate") or 0),
+                "driver_allowance": float(rule.get("driver_allowance") or 0),
+                "driver_allowance_type": rule.get("driver_allowance_type"),
+                "night_charge": float(rule.get("night_charge") or 0),
+                "night_charge_type": rule.get("night_charge_type"),
+                "toll": float(rule.get("toll") or 0),
+            }
+        )
+    return result
+
+
+@admin_router.post("/custom-plans/route-distance")
+async def custom_plan_route_distance(
+    payload: CustomRouteDistanceIn,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_roles(*ADMIN_ROLES)),
+):
+    """Google driving distance for one itinerary leg (admin-only helper)."""
+    from app.modules.admin.cab_route_distance import resolve_route_distance
+
+    km, source = await resolve_route_distance(
+        db,
+        payload.origin,
+        payload.destination,
+        origin_hint=payload.origin_hint,
+        destination_hint=payload.destination_hint,
+    )
+    return {"distance_km": float(km), "source": source}
+
+
+@admin_router.post("/custom-plans/estimate")
+async def custom_plan_estimate(
+    payload: CustomEstimateIn,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_roles(*ADMIN_ROLES)),
+):
+    plan, breakdown, cab = await _custom_plan_estimate(db, payload)
+    return {"plan": plan, "breakdown": breakdown, "cab": cab}
+
+
+@admin_router.post("/custom-plans", status_code=status.HTTP_201_CREATED)
+async def admin_create_custom_plan(
+    payload: CustomPlanIn,
+    db: AsyncSession = Depends(get_db),
+    user: dict = Depends(require_roles(*ADMIN_ROLES)),
+):
+    """Create a private tour plan for one customer, optionally booking it now.
+
+    The package is saved with status CUSTOM, so the public catalog never shows
+    it. The selected partner receives the normal tour accept request as soon as
+    the booking is created.
+    """
+    customer = await db.scalar(
+        select(Customer).where(Customer.id == payload.customer_id)
+    )
+    if not customer:
+        raise HTTPException(404, "Customer not found")
+    city = await db.scalar(select(City.id).where(City.id == payload.city_id))
+    if city is None:
+        raise HTTPException(404, "City not found")
+    if payload.maximum_persons and payload.maximum_persons < payload.minimum_persons:
+        raise HTTPException(
+            422, "Maximum persons cannot be lower than minimum persons."
+        )
+    if not (
+        payload.minimum_persons
+        <= payload.persons_count
+        <= (payload.maximum_persons or 10**9)
+    ):
+        raise HTTPException(
+            422,
+            f"Traveller count must be between {payload.minimum_persons} and "
+            f"{payload.maximum_persons or 'unlimited'}.",
+        )
+    await _assert_tour_partner(db, payload.partner_id)
+    plan, breakdown, _ = await _custom_plan_estimate(db, payload)
+
+    if payload.book_now and not payload.quoted_price:
+        raise HTTPException(
+            422,
+            "Set the final quoted price before creating the booking.",
+        )
+
+    package_in = _custom_package_in(payload, plan, breakdown)
+    package = await _save_package(
+        db,
+        package_in,
+        user,
+        partner_id=payload.partner_id,
+        status_value="CUSTOM",
+    )
+    package.is_custom = True
+    package.custom_customer_id = payload.customer_id
+    plan["package_name"] = payload.package_name
+    plan["destination"] = payload.destination
+    plan["pickup_location"] = payload.pickup_location
+    package.custom_plan = plan
+    package.estimated_cost = Decimal(str(breakdown["estimated_cost"])).quantize(
+        Decimal("0.01")
+    )
+    package.quoted_price = (
+        Decimal(str(payload.quoted_price)).quantize(Decimal("0.01"))
+        if payload.quoted_price
+        else None
+    )
+    await db.flush()
+
+    booking = None
+    if payload.book_now:
+        booking = await _create_custom_booking(
+            db,
+            package=package,
+            payload=CustomBookIn(
+                partner_id=payload.partner_id,
+                quoted_price=payload.quoted_price,
+                travel_start_date=payload.travel_start_date,
+                persons_count=payload.persons_count,
+                special_requests=payload.special_requests,
+                participants=payload.participants,
+            ),
+        )
+
+    return {
+        "package": await _package_payload(db, package),
+        "estimate": breakdown,
+        "booking": booking,
+    }
+
+
+@admin_router.post("/custom-plans/{package_id}/book")
+async def admin_book_custom_plan(
+    package_id: int,
+    payload: CustomBookIn,
+    db: AsyncSession = Depends(get_db),
+    _: dict = Depends(require_roles(*ADMIN_ROLES)),
+):
+    """Turn an already-saved custom plan into a partner-acceptance booking."""
+    package = await db.scalar(
+        select(TourPackage).where(
+            TourPackage.id == package_id, TourPackage.is_custom.is_(True)
+        )
+    )
+    if not package:
+        raise HTTPException(404, "Custom tour plan not found")
+    await _assert_tour_partner(db, payload.partner_id)
+    if package.partner_id != payload.partner_id:
+        package.partner_id = payload.partner_id
+    booking = await _create_custom_booking(db, package=package, payload=payload)
+    return {"package": await _package_payload(db, package), "booking": booking}
 
 
 @admin_router.post("/partners/{partner_id}/enable-tour-service")
@@ -856,8 +1639,19 @@ async def admin_package_status(
         "INACTIVE",
         "SUSPENDED",
         "REJECTED",
+        "CUSTOM",
     }:
         raise HTTPException(422, "Unsupported tour package status")
+    if package.is_custom and desired in {"PENDING_APPROVAL", "APPROVED", "ACTIVE"}:
+        raise HTTPException(
+            422,
+            "Custom tour plans are private to one customer and cannot be "
+            "published on the website.",
+        )
+    if desired == "CUSTOM" and not package.is_custom:
+        raise HTTPException(
+            422, "A CUSTOM package must be created through the custom plan flow."
+        )
     if desired == "APPROVED":
         package.approved_at = datetime.now(timezone.utc)
         package.approved_by = _actor_uuid(user)
@@ -1485,6 +2279,8 @@ async def partner_update_package(
     package = await _find_package(
         db, package_id, own_partner_id=await _partner_id(db, user)
     )
+    if package.is_custom:
+        raise HTTPException(409, "Custom tour plans are managed by the admin team.")
     if package.status in {"ACTIVE", "SUSPENDED"}:
         raise HTTPException(409, "Active packages must be edited by admin")
     values = payload.model_dump(
@@ -1541,6 +2337,8 @@ async def partner_submit_package(
     package = await _find_package(
         db, package_id, own_partner_id=await _partner_id(db, user)
     )
+    if package.is_custom:
+        raise HTTPException(409, "Custom tour plans are managed by the admin team.")
     # Validation before submit: must have at least one pricing slab and
     # itinerary day so the admin can review a real product.
     pricing_count = (
@@ -2360,6 +3158,7 @@ async def public_popular_destinations(
                   JOIN states st        ON st.id = c.state_id
                   JOIN tour_packages tp ON tp.city_id = c.id
                        AND tp.status = 'ACTIVE'
+                       AND tp.is_custom = FALSE
              LEFT JOIN tour_package_pricing p ON p.package_id = tp.id
                  WHERE c.is_active = TRUE
                  GROUP BY c.id, c.name, st.id, st.name
@@ -2372,6 +3171,7 @@ async def public_popular_destinations(
                   JOIN tour_packages tp2 ON tp2.id = m.package_id
                  WHERE tp2.city_id = d.city_id
                    AND tp2.status = 'ACTIVE'
+                   AND tp2.is_custom = FALSE
                    AND m.media_url IS NOT NULL
                  ORDER BY (m.is_primary IS NOT TRUE), tp2.created_at DESC
                  LIMIT 1
@@ -2424,6 +3224,7 @@ async def public_tour_suggestions(
             .join(City, City.id == TourPackage.city_id)
             .where(
                 TourPackage.status == "ACTIVE",
+                TourPackage.is_custom.is_(False),
                 or_(
                     TourPackage.package_name.ilike(term),
                     TourPackage.destination.ilike(term),
@@ -2548,7 +3349,9 @@ async def public_packages(
 async def public_package(slug: str, db: AsyncSession = Depends(get_db)):
     package = await db.scalar(
         select(TourPackage).where(
-            TourPackage.slug == slug, TourPackage.status == "ACTIVE"
+            TourPackage.slug == slug,
+            TourPackage.status == "ACTIVE",
+            TourPackage.is_custom.is_(False),
         )
     )
     if not package:
@@ -2562,6 +3365,7 @@ async def public_package(slug: str, db: AsyncSession = Depends(get_db)):
                 select(TourPackage).where(
                     TourPackage.package_code.ilike(code_match.group(1)),
                     TourPackage.status == "ACTIVE",
+                    TourPackage.is_custom.is_(False),
                 )
             )
     if not package:
@@ -2581,6 +3385,7 @@ async def public_package(slug: str, db: AsyncSession = Depends(get_db)):
             .where(
                 TourPackage.city_id == package.city_id,
                 TourPackage.status == "ACTIVE",
+                TourPackage.is_custom.is_(False),
                 TourPackage.id != package.id,
             )
             .order_by(desc(TourPackage.created_at))
@@ -2628,7 +3433,9 @@ async def public_related(slug: str, db: AsyncSession = Depends(get_db)):
     the customer-web detail page 'Other tours in {city}' strip."""
     package = await db.scalar(
         select(TourPackage).where(
-            TourPackage.slug == slug, TourPackage.status == "ACTIVE"
+            TourPackage.slug == slug,
+            TourPackage.status == "ACTIVE",
+            TourPackage.is_custom.is_(False),
         )
     )
     if not package:
@@ -2639,6 +3446,7 @@ async def public_related(slug: str, db: AsyncSession = Depends(get_db)):
             .where(
                 TourPackage.city_id == package.city_id,
                 TourPackage.status == "ACTIVE",
+                TourPackage.is_custom.is_(False),
                 TourPackage.id != package.id,
             )
             .order_by(desc(TourPackage.created_at))
@@ -2688,7 +3496,9 @@ async def public_quote(
 ):
     package = await db.scalar(
         select(TourPackage).where(
-            TourPackage.id == package_id, TourPackage.status == "ACTIVE"
+            TourPackage.id == package_id,
+            TourPackage.status == "ACTIVE",
+            TourPackage.is_custom.is_(False),
         )
     )
     if not package:
@@ -2720,7 +3530,9 @@ async def create_public_booking(
         raise HTTPException(403, "Customer profile not found")
     package = await db.scalar(
         select(TourPackage).where(
-            TourPackage.id == payload.package_id, TourPackage.status == "ACTIVE"
+            TourPackage.id == payload.package_id,
+            TourPackage.status == "ACTIVE",
+            TourPackage.is_custom.is_(False),
         )
     )
     if not package:
@@ -2928,7 +3740,7 @@ async def care_tour_meta(
     db: AsyncSession = Depends(get_db),
     _: dict = Depends(require_roles(*ADMIN_ROLES)),
 ):
-    packages = await _list_packages(db, statuses=["ACTIVE"])
+    packages = await _list_packages(db, statuses=["ACTIVE"], include_private=False)
     customer = await db.scalar(select(Customer).where(Customer.id == customer_id))
     if not customer:
         raise HTTPException(404, "Customer not found")
@@ -2955,7 +3767,9 @@ async def care_create_tour(
         raise HTTPException(404, "Customer not found")
     package = await db.scalar(
         select(TourPackage).where(
-            TourPackage.id == payload.package_id, TourPackage.status == "ACTIVE"
+            TourPackage.id == payload.package_id,
+            TourPackage.status == "ACTIVE",
+            TourPackage.is_custom.is_(False),
         )
     )
     if not package:

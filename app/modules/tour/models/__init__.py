@@ -56,6 +56,23 @@ class TourPackage(Base):
     terms_and_conditions = Column(Text, nullable=True)
     status = Column(String(50), nullable=False, default="DRAFT")
     rejection_reason = Column(Text, nullable=True)
+    # ── Custom / private plan (migration 0109) ───────────────────────────
+    # An admin-built plan for one customer. `status` is CUSTOM, which keeps
+    # it out of every public catalog query (those require ACTIVE). The rich
+    # planning payload (day-wise places, KM, hotels, estimate breakdown)
+    # lives in `custom_plan`; the normal catalog columns stay populated so
+    # bookings, partner acceptance, invoices and PDFs work unchanged.
+    is_custom = Column(Boolean, nullable=False, default=False, server_default="false")
+    custom_customer_id = Column(
+        BigInteger,
+        ForeignKey("customers.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    custom_plan = Column(JSONB, nullable=True)
+    estimated_cost = Column(
+        Numeric(14, 2), nullable=False, default=Decimal("0.00"), server_default="0"
+    )
+    quoted_price = Column(Numeric(14, 2), nullable=True)
     submitted_at = Column(DateTime(timezone=True), nullable=True)
     approved_at = Column(DateTime(timezone=True), nullable=True)
     approved_by = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=True)
