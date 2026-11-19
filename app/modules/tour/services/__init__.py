@@ -32,6 +32,8 @@ from app.modules.tour.models import (
     TourBookingCharge,
     TourItinerary,
     TourPackage,
+    TourPackageExclusion,
+    TourPackageInclusion,
     TourPackagePricing,
 )
 from app.modules.vehicle.models import Vehicle
@@ -531,6 +533,25 @@ async def build_itinerary(db: AsyncSession, *, tour_booking_id: int) -> dict:
         for r in itinerary_rows
     ]
 
+    inclusions = list(
+        (
+            await db.scalars(
+                select(TourPackageInclusion.inclusion_text)
+                .where(TourPackageInclusion.package_id == booking.package_id)
+                .order_by(TourPackageInclusion.id)
+            )
+        ).all()
+    )
+    exclusions = list(
+        (
+            await db.scalars(
+                select(TourPackageExclusion.exclusion_text)
+                .where(TourPackageExclusion.package_id == booking.package_id)
+                .order_by(TourPackageExclusion.id)
+            )
+        ).all()
+    )
+
     # Assigned fleet (if any).
     vehicle = None
     if booking.vehicle_id:
@@ -580,6 +601,8 @@ async def build_itinerary(db: AsyncSession, *, tour_booking_id: int) -> dict:
         balance_due=float(max(booking.payable_amount - paid, 0)),
         invoice_number=booking.invoice_number,
         itinerary=itinerary,
+        inclusions=inclusions,
+        exclusions=exclusions,
         vehicle=vehicle,
         driver=driver,
         **await _platform_branding(db),

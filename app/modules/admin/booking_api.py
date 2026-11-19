@@ -90,6 +90,43 @@ async def _offer_brief(db: AsyncSession, offer_id: Optional[int]):
     return (offer_id, row["title"], row["slug"]) if row else None
 
 
+async def _load_pdf_branding(db: AsyncSession) -> dict[str, str]:
+    """Branding keys shared by every customer-facing PDF."""
+    from app.modules.admin.models import SystemConfiguration
+
+    rows = (
+        (
+            await db.execute(
+                select(SystemConfiguration).where(
+                    SystemConfiguration.config_key.in_(
+                        [
+                            "PLATFORM_NAME",
+                            "PLATFORM_LOGO_URL",
+                            "BUSINESS_LEGAL_NAME",
+                            "BUSINESS_GST_NUMBER",
+                            "BUSINESS_REGISTERED_ADDRESS",
+                            "SUPPORT_EMAIL",
+                            "SUPPORT_PHONE",
+                        ]
+                    )
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    cfg = {row.config_key: (row.config_value or "") for row in rows}
+    return {
+        "platform_name": cfg.get("PLATFORM_NAME") or "WayTero",
+        "platform_logo_url": cfg.get("PLATFORM_LOGO_URL") or "",
+        "business_legal_name": cfg.get("BUSINESS_LEGAL_NAME") or "",
+        "business_gst_number": cfg.get("BUSINESS_GST_NUMBER") or "",
+        "business_registered_address": cfg.get("BUSINESS_REGISTERED_ADDRESS") or "",
+        "support_email": cfg.get("SUPPORT_EMAIL") or "",
+        "support_phone": cfg.get("SUPPORT_PHONE") or "",
+    }
+
+
 async def _customer_email_and_name(
     db: AsyncSession, customer_id: int
 ) -> tuple[str, Optional[str]]:
@@ -3143,6 +3180,160 @@ async def admin_download_cab_invoice(
 
 
 # ════════════════════════════════════════════════════════════════
+# CAB BOOKING CONFIRMATION — GET /admin/bookings/{booking_id}/cab/{cab_id}/booking-pdf
+#
+# The customer-facing voucher, available immediately after booking. It is
+# deliberately separate from the tax invoice: the invoice only exists after
+# completion and payment, while this document is what the customer shows at
+# pickup. Reuses the shared PDF branding in booking_pdf_service.py.
+# Doc Ref: BRD Part 3 §45
+# ════════════════════════════════════════════════════════════════
+
+
+@router.get("/{booking_id}/cab/{cab_id}/booking-pdf", tags=["Admin Bookings"])
+async def admin_cab_booking_pdf(
+    booking_id: int,
+    cab_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: dict = Depends(get_current_user),
+):
+    """Stream a branded booking confirmation for a cab booking."""
+    from app.core.timezone import to_platform_tz
+    from app.modules.admin.booking_pdf_service import generate_booking_confirmation_pdf
+    from app.modules.booking.services.settlement_math import money
+
+    mb = await _get_master_booking(db, booking_id)
+    cb = next((c for c in mb.cab_bookings if c.id == cab_id), None)
+    if not cb:
+        raise HTTPException(
+            404, f"Cab booking {cab_id} not found on master {booking_id}."
+        )
+
+    cust = (
+        await db.execute(select(Customer).where(Customer.id == mb.customer_id))
+    ).scalar_one_or_none()
+    cust_user = None
+    if cust:
+        cust_user = (
+            await db.execute(select(User).where(User.id == cust.user_id))
+        ).scalar_one_or_none()
+
+    city = (
+        await db.execute(select(City).where(City.id == mb.city_id))
+    ).scalar_one_or_none()
+
+    cat_name = None
+    if cb.vehicle_category_id:
+        vc = (
+            await db.execute(
+                select(VehicleCategory).where(
+                    VehicleCategory.id == cb.vehicle_category_id
+                )
+            )
+        ).scalar_one_or_none()
+        cat_name = vc.category_name if vc else None
+
+    partner_name = driver_name = vehicle_reg = vehicle_model = None
+    if cb.assignments:
+        latest = sorted(cb.assignments, key=lambda a: a.assigned_at, reverse=True)[0]
+        if latest.partner_id:
+            p = (
+                await db.execute(select(Partner).where(Partner.id == latest.partner_id))
+            ).scalar_one_or_none()
+            partner_name = p.business_name if p else None
+        if latest.driver_id:
+            d = (
+                await db.execute(select(Driver).where(Driver.id == latest.driver_id))
+            ).scalar_one_or_none()
+            driver_name = d.full_name if d else None
+        if latest.vehicle_id:
+            v = (
+                await db.execute(select(Vehicle).where(Vehicle.id == latest.vehicle_id))
+            ).scalar_one_or_none()
+            if v:
+                vehicle_reg = v.registration_number
+                vehicle_model = (
+                    f"{v.vehicle_brand or ''} {v.vehicle_model or ''}".strip() or None
+                )
+
+    advance_paid = money(await advance_service.get_advance_amount(db, cb.id))
+    total = float(cb.final_amount or cb.estimated_amount or 0)
+    balance = max(total - float(advance_paid), 0)
+
+    def _when(value) -> str:
+        return to_platform_tz(value).strftime("%d %b %Y, %I:%M %p") if value else "—"
+
+    details = [
+        ("Service", "Cab"),
+        ("Trip type", (cb.trip_type or "—").replace("_", " ").title()),
+        ("City", city.name if city else "—"),
+        ("Pickup location", cb.pickup_location or "—"),
+        ("Drop location", cb.drop_location or "—"),
+        ("Pickup date & time", _when(cb.pickup_datetime)),
+        ("Return date & time", _when(cb.return_datetime)),
+        (
+            "Distance",
+            (
+                f"{float(cb.estimated_distance):,.2f} km"
+                if cb.estimated_distance is not None
+                else "—"
+            ),
+        ),
+        ("Stops", str(len(cb.stops or [])) if cb.stops else "Direct"),
+        ("Vehicle category", cat_name or "—"),
+        (
+            "Vehicle",
+            " ".join(filter(None, [vehicle_model, vehicle_reg])) or "To be assigned",
+        ),
+        ("Driver", driver_name or "To be assigned"),
+        ("Partner", partner_name or "To be assigned"),
+        ("Cab booking", cb.booking_number),
+        ("Master booking", mb.booking_number),
+        ("Status", (cb.booking_status or "—").replace("_", " ").title()),
+    ]
+
+    payment_lines: list[tuple[str, float]] = []
+    if cb.estimated_amount:
+        payment_lines.append(("Estimated fare", float(cb.estimated_amount)))
+    if cb.final_amount and float(cb.final_amount) != float(cb.estimated_amount or 0):
+        payment_lines.append(("Final fare", float(cb.final_amount)))
+    if advance_paid:
+        payment_lines.append(("Advance paid", float(advance_paid)))
+    if cb.coupon_discount:
+        payment_lines.append(("Coupon discount", -float(cb.coupon_discount)))
+
+    pdf_bytes = generate_booking_confirmation_pdf(
+        service_label="Cab",
+        booking_number=mb.booking_number,
+        service_booking_number=cb.booking_number,
+        booking_status=cb.booking_status,
+        booked_at=cb.created_at,
+        customer_name=cust.full_name if cust else None,
+        customer_mobile=cust_user.mobile_number if cust_user else None,
+        customer_email=cust_user.email if cust_user else None,
+        details=details,
+        payment_lines=payment_lines,
+        total_label="Total fare",
+        total_amount=total,
+        balance_due=balance,
+        notes=[
+            "Please reach the pickup point at least 10 minutes before the scheduled time.",
+            "Driver and vehicle details may change until the trip starts; the "
+            "assignment shown in the app is final.",
+            "For changes or cancellation, contact support with the booking reference above.",
+        ],
+        **await _load_pdf_branding(db),
+    )
+
+    filename = f"Booking_{cb.booking_number}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+# ════════════════════════════════════════════════════════════════
 # CANCEL BOOKING — POST /admin/bookings/{booking_id}/cancel
 # Doc Ref: Admin API §11, Booking API §20
 # Guard: Cannot cancel if already IN_PROGRESS/COMPLETED/CLOSED
@@ -5243,6 +5434,196 @@ async def hotel_download_invoice_pdf(
     )
 
     filename = f"{hr.invoice_number}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/{booking_id}/hotel/{hotel_id}/booking-pdf", tags=["Admin Hotel Bookings"])
+async def hotel_booking_pdf(
+    booking_id: int,
+    hotel_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream a branded hotel booking confirmation/voucher."""
+    from app.modules.admin.booking_pdf_service import generate_booking_confirmation_pdf
+
+    mb = await _get_master_booking(db, booking_id)
+    hr = await _get_hotel_booking(db, booking_id, hotel_id)
+
+    cust = (
+        await db.execute(select(Customer).where(Customer.id == mb.customer_id))
+    ).scalar_one_or_none()
+    cust_user = None
+    if cust:
+        cust_user = (
+            await db.execute(select(User).where(User.id == cust.user_id))
+        ).scalar_one_or_none()
+
+    hotel_name = hotel_address = None
+    if hr.hotel_id:
+        h = (
+            await db.execute(select(Hotel).where(Hotel.id == hr.hotel_id))
+        ).scalar_one_or_none()
+        if h:
+            hotel_name = h.hotel_name
+            hotel_address = h.address
+
+    room_category_name = room_type = None
+    if hr.room_category_id:
+        rc = (
+            await db.execute(
+                select(HotelRoomCategory).where(
+                    HotelRoomCategory.id == hr.room_category_id
+                )
+            )
+        ).scalar_one_or_none()
+        if rc:
+            room_category_name = rc.category_name
+            room_type = rc.room_type
+
+    bill = await hotel_billing.build_bill(db, hr)
+    occupancy = (hr.rate_snapshot or {}).get("occupancy") or {}
+    reservation_number = hr.reservation_number or f"HR-{hr.id}"
+
+    details = [
+        ("Service", "Hotel stay"),
+        ("Hotel", hotel_name or "—"),
+        ("Address", hotel_address or "—"),
+        ("Room category", room_category_name or "—"),
+        ("Room type", (room_type or "—").replace("_", " ").title()),
+        (
+            "Check-in",
+            hr.check_in_date.strftime("%d %b %Y") if hr.check_in_date else "—",
+        ),
+        (
+            "Check-out",
+            hr.check_out_date.strftime("%d %b %Y") if hr.check_out_date else "—",
+        ),
+        ("Nights", str(hr.nights or "—")),
+        ("Rooms", str(hr.rooms_count or "—")),
+        (
+            "Guests",
+            f"{hr.adults_count or 0} adult(s), {hr.children_count or 0} child(ren)",
+        ),
+        ("Extra beds", str(occupancy.get("extra_beds", 0) or 0)),
+        ("Hotel confirmation", hr.hotel_confirmation_number or "Pending"),
+        ("Hotel booking", reservation_number),
+        ("Master booking", mb.booking_number),
+        ("Status", (hr.reservation_status or "—").replace("_", " ").title()),
+    ]
+
+    payment_lines: list[tuple[str, float]] = []
+    for line in bill.lines:
+        amount = float(line.amount)
+        if line.kind in ("CHARGE", "TAX") and amount > 0:
+            payment_lines.append((line.label, amount))
+        elif line.kind == "DISCOUNT" and amount > 0:
+            payment_lines.append((line.label, -amount))
+    if bill.advance_paid:
+        payment_lines.append(("Advance paid", float(bill.advance_paid)))
+
+    pdf_bytes = generate_booking_confirmation_pdf(
+        service_label="Hotel",
+        booking_number=mb.booking_number,
+        service_booking_number=reservation_number,
+        booking_status=hr.reservation_status,
+        booked_at=hr.created_at,
+        customer_name=cust.full_name if cust else None,
+        customer_mobile=cust_user.mobile_number if cust_user else None,
+        customer_email=cust_user.email if cust_user else None,
+        details=details,
+        payment_lines=payment_lines,
+        total_label="Total stay amount",
+        total_amount=float(bill.grand_total),
+        balance_due=float(bill.balance_due),
+        notes=[
+            "Present this voucher and a valid government ID at hotel check-in.",
+            "Check-in and check-out times are set by the hotel; early check-in or "
+            "late check-out may incur additional charges.",
+            "For changes or cancellation, contact support with the booking reference above.",
+        ],
+        **await _load_pdf_branding(db),
+    )
+
+    filename = f"Booking_{reservation_number}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
+    "/{booking_id}/hotel/{hotel_id}/payment-receipt", tags=["Admin Hotel Bookings"]
+)
+async def hotel_payment_receipt_pdf(
+    booking_id: int,
+    hotel_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream a branded receipt for the latest payment on a hotel stay."""
+    from app.core.timezone import to_platform_tz
+    from app.modules.admin.booking_pdf_service import generate_payment_receipt_pdf
+
+    mb = await _get_master_booking(db, booking_id)
+    hr = await _get_hotel_booking(db, booking_id, hotel_id)
+
+    payment = (
+        await db.execute(
+            select(HotelAdvancePayment)
+            .where(
+                HotelAdvancePayment.hotel_reservation_id == hr.id,
+                HotelAdvancePayment.status == "ACTIVE",
+            )
+            .order_by(HotelAdvancePayment.collected_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if not payment:
+        raise HTTPException(404, "No payment has been recorded on this hotel booking.")
+
+    cust = (
+        await db.execute(select(Customer).where(Customer.id == mb.customer_id))
+    ).scalar_one_or_none()
+    cust_user = None
+    if cust:
+        cust_user = (
+            await db.execute(select(User).where(User.id == cust.user_id))
+        ).scalar_one_or_none()
+
+    bill = await hotel_billing.build_bill(db, hr)
+    hotel_name = None
+    if hr.hotel_id:
+        h = (
+            await db.execute(select(Hotel).where(Hotel.id == hr.hotel_id))
+        ).scalar_one_or_none()
+        hotel_name = h.hotel_name if h else None
+
+    pdf_bytes = generate_payment_receipt_pdf(
+        receipt_number=payment.receipt_number,
+        booking_number=mb.booking_number,
+        service_booking_number=hr.reservation_number or f"HR-{hr.id}",
+        payment_date=(
+            to_platform_tz(payment.collected_at) if payment.collected_at else None
+        ),
+        customer_name=cust.full_name if cust else None,
+        customer_mobile=cust_user.mobile_number if cust_user else None,
+        service_label=f"Hotel stay - {hotel_name or hr.reservation_number or 'Hotel'}",
+        amount=float(payment.amount),
+        payment_mode=payment.payment_mode,
+        received_by=payment.received_by,
+        reference_number=payment.reference_number,
+        payment_notes=payment.notes,
+        total_amount=float(bill.grand_total),
+        total_paid=float(bill.advance_paid),
+        balance_due=float(bill.balance_due),
+        **await _load_pdf_branding(db),
+    )
+
+    filename = f"Payment_{payment.receipt_number}.pdf"
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",

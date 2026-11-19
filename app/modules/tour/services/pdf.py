@@ -19,6 +19,7 @@ import io
 import logging
 from datetime import datetime, timezone
 from typing import Any
+from xml.sax.saxutils import escape
 
 import httpx
 from reportlab.lib import colors
@@ -89,6 +90,11 @@ def _ps(
 
 def _p(text: str, style: ParagraphStyle) -> Paragraph:
     return Paragraph(text, style)
+
+
+def _e_text(value: Any) -> str:
+    """Escape package copy before it is embedded in a ReportLab paragraph."""
+    return escape(str(value)) if value not in (None, "") else "—"
 
 
 # ── Indian-numbering amount in words ─────────────────────────────────────────
@@ -955,8 +961,10 @@ def build_tour_itinerary_pdf(
     balance_due: float,
     invoice_number: str | None,
     itinerary: list[dict],
-    vehicle: dict | None,
-    driver: dict | None,
+    inclusions: list[str] | None = None,
+    exclusions: list[str] | None = None,
+    vehicle: dict | None = None,
+    driver: dict | None = None,
     generated_at: datetime | None = None,
     # Platform branding (from system_configurations)
     platform_name: str = "WayTero",
@@ -981,7 +989,7 @@ def build_tour_itinerary_pdf(
     )
     doc.story = []
     doc.header_block(
-        doc_title="TOUR ITINERARY",
+        doc_title="TOUR BOOKING & ITINERARY",
         doc_number=booking_number,
         date_label="Generated",
         date_value=gen_at.strftime("%d %B %Y"),
@@ -1004,6 +1012,7 @@ def build_tour_itinerary_pdf(
             ("Tour Booking", booking_number),
             ("Master Booking", master_booking_number or "—"),
             ("Package", package_name or "—"),
+            ("Package code", package_code or "—"),
             ("Destination", destination or "—"),
             (
                 "Travel dates",
@@ -1122,6 +1131,53 @@ def build_tour_itinerary_pdf(
                 it_style.append(("BACKGROUND", (0, i), (-1, i), GREY_100))
         it_tbl.setStyle(TableStyle(it_style))
         doc.story.append(it_tbl)
+        doc.story.append(Spacer(1, 6 * mm))
+
+    # ── What the package includes / excludes ─────────────────────────────────
+    if inclusions or exclusions:
+        doc.hr()
+        doc.section_h("PACKAGE INCLUSIONS & EXCLUSIONS")
+        doc.story.append(Spacer(1, 2 * mm))
+        inc_rows: list[list[Any]] = []
+        if inclusions:
+            inc_rows.append(
+                [
+                    Paragraph("Included", _ps("incl_h", 8.5, SUCCESS, bold=True)),
+                    Paragraph(
+                        "<br/>".join(f"• {_e_text(i)}" for i in inclusions),
+                        _ps("incl", 8, GREY_900),
+                    ),
+                ]
+            )
+        if exclusions:
+            inc_rows.append(
+                [
+                    Paragraph(
+                        "Not included", _ps("excl_h", 8.5, BRAND_GOLD, bold=True)
+                    ),
+                    Paragraph(
+                        "<br/>".join(f"• {_e_text(i)}" for i in exclusions),
+                        _ps("excl", 8, GREY_900),
+                    ),
+                ]
+            )
+        inc_tbl = Table(
+            inc_rows, colWidths=[doc.content_width * 0.22, doc.content_width * 0.78]
+        )
+        inc_tbl.setStyle(
+            TableStyle(
+                [
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("BOX", (0, 0), (-1, -1), 0.3, GREY_200),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.3, GREY_200),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                    ("TOPPADDING", (0, 0), (-1, -1), 5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ]
+            )
+        )
+        doc.story.append(inc_tbl)
         doc.story.append(Spacer(1, 6 * mm))
 
     # ── Vehicle & driver ─────────────────────────────────────────────────────
