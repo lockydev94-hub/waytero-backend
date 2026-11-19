@@ -3453,6 +3453,19 @@ async def public_related(slug: str, db: AsyncSession = Depends(get_db)):
             .limit(6)
         )
     ).all()
+    partner_names = (
+        dict(
+            (
+                await db.execute(
+                    select(Partner.id, Partner.business_name).where(
+                        Partner.id.in_({r.partner_id for r in related_rows})
+                    )
+                )
+            ).all()
+        )
+        if related_rows
+        else {}
+    )
     items = []
     for r in related_rows:
         primary = (
@@ -3480,7 +3493,7 @@ async def public_related(slug: str, db: AsyncSession = Depends(get_db)):
                 "duration_nights": r.duration_nights,
                 "minimum_persons": r.minimum_persons,
                 "package_type": r.package_type,
-                "partner_name": r.partner.business_name if r.partner else None,
+                "partner_name": partner_names.get(r.partner_id),
                 "image_url": primary.media_url if primary else None,
                 "starting_price": float(
                     min((p.package_price for p in pricing), default=0)
