@@ -1553,12 +1553,13 @@ async def list_admin_accept_queue(
     Bookings placed on the customer website that are waiting for admin
     acceptance:
 
-      CAB   — master DRAFT + cab PENDING_ASSIGNMENT (needs partner)
+      CAB   — master DRAFT + cab PENDING_ASSIGNMENT with no live offer
       HOTEL — master DRAFT + reservation PENDING_PAYMENT
-      TOUR  — tour booking PENDING_CONFIRMATION
+      TOUR  — unpaid master + tour booking PENDING_CONFIRMATION
 
     Limited to the last 72 hours so stale rows don't pile up forever.
-    Ordered newest-first. Once accepted, rows drop out of the queue.
+    Ordered newest-first. Once accepted, assigned, auto-assigned or completed,
+    the booking no longer matches and drops out of the queue.
     """
     items: list[dict] = []
 
@@ -1591,6 +1592,14 @@ async def list_admin_accept_queue(
             LEFT JOIN cities ci ON ci.id = mb.city_id
             WHERE mb.booking_status = 'DRAFT'
               AND cb.booking_status = 'PENDING_ASSIGNMENT'
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM cab_booking_assignments cba
+                  WHERE cba.cab_booking_id = cb.id
+                    AND cba.closed_at IS NULL
+                    AND cba.accepted_at IS NULL
+                    AND cba.rejected_at IS NULL
+              )
               AND mb.created_at > NOW() - INTERVAL '72 hours'
               AND ({scope_clause})
             ORDER BY mb.created_at DESC
@@ -1694,7 +1703,8 @@ async def list_admin_accept_queue(
             JOIN tour_bookings tb ON tb.master_booking_id = mb.id
             JOIN tour_packages tp ON tp.id = tb.package_id
             LEFT JOIN customers c ON c.id = mb.customer_id
-            WHERE tb.booking_status = 'PENDING_CONFIRMATION'
+            WHERE mb.booking_status IN ('DRAFT', 'PENDING_PAYMENT')
+              AND tb.booking_status = 'PENDING_CONFIRMATION'
               AND mb.created_at > NOW() - INTERVAL '72 hours'
               AND ({scope_clause})
             ORDER BY mb.created_at DESC
@@ -2050,6 +2060,7 @@ async def assign_partner(
         from app.modules.notification.services.booking_notifications import (
             partner_assignment_requested,
         )
+        from app.modules.notification.realtime import manager as _rt
 
         await partner_assignment_requested(
             db,
@@ -2063,12 +2074,25 @@ async def assign_partner(
             deadline_iso=deadline.isoformat(),
         )
 
+        # Assigning the partner moves this cab out of the admin acceptance
+        # queue (it now waits on the partner, not the admin). Reconcile the
+        # other admins' modals immediately.
+        await _rt.broadcast(
+            {
+                "event": "BOOKING_ADMIN_REFRESH",
+                "data": {
+                    "cab_booking_number": cb.booking_number,
+                    "master_booking_id": booking_id,
+                    "new_status": cb.booking_status,
+                    "reason": "PARTNER_ASSIGNED",
+                },
+            }
+        )
+
         # Any partner that held an offer the admin just replaced must have
         # their popup dropped, otherwise they keep a live Accept button on a
         # booking that is no longer theirs.
         if displaced_partner_ids and payload.partner_id not in displaced_partner_ids:
-            from app.modules.notification.realtime import manager as _rt
-
             nudged = (
                 await db.execute(
                     select(Partner.id, Partner.user_id).where(
@@ -2475,8 +2499,43 @@ async def admin_accept_booking(
 
     Returns the master + service statuses so the FE can update its queue.
     """
+    # Serialize two admins clicking Accept at the same time: the second must
+    # see the first one's committed status, not the pre-accept snapshot.
+    await db.execute(
+        select(MasterBooking.id).where(MasterBooking.id == booking_id).with_for_update()
+    )
     mb = await _get_master_booking(db, booking_id)
     service_type = (payload.service_type or "").upper()
+
+    # A booking only needs admin acceptance once. After that its master moves
+    # to CONFIRMED (and then IN_PROGRESS / COMPLETED), so a stale modal — or a
+    # second admin — must not be able to accept it again.
+    if mb.booking_status not in {"DRAFT", "PENDING_PAYMENT"}:
+        raise HTTPException(
+            409,
+            f"Booking is already '{mb.booking_status}'; acceptance is no "
+            "longer required.",
+        )
+
+    async def broadcast_accepted(service_number: str, new_status: str) -> None:
+        """Tell every other admin tab to reconcile its acceptance queue."""
+        try:
+            from app.modules.notification.realtime import manager as _rt
+
+            await _rt.broadcast(
+                {
+                    "event": "BOOKING_ADMIN_REFRESH",
+                    "data": {
+                        "master_booking_id": booking_id,
+                        "service_type": service_type,
+                        "service_number": service_number,
+                        "new_status": new_status,
+                        "reason": "ADMIN_ACCEPTED",
+                    },
+                }
+            )
+        except Exception:  # pragma: no cover - WS is best-effort
+            pass
 
     if service_type == "CAB":
         cb = next(
@@ -2508,6 +2567,7 @@ async def admin_accept_booking(
             # endpoint reports is the status the booking is actually in.
             await db.refresh(cb)
             await notify_offered_partners(db, cb, offered)
+        await broadcast_accepted(cb.booking_number, cb.booking_status)
         # ── Email: booking confirmation to the customer ──
         await _send_booking_email(
             db,
@@ -2572,6 +2632,9 @@ async def admin_accept_booking(
         # ── Email: booking confirmation to the customer ──
         hotel_name = await db.scalar(
             select(Hotel.hotel_name).where(Hotel.id == hr.hotel_id)
+        )
+        await broadcast_accepted(
+            hr.reservation_number or str(hr.id), hr.reservation_status
         )
         await _send_booking_email(
             db,
@@ -2669,6 +2732,7 @@ async def admin_accept_booking(
         package_name = await db.scalar(
             select(TourPackage.package_name).where(TourPackage.id == tb.package_id)
         )
+        await broadcast_accepted(tb.booking_number, tb.booking_status)
         await _send_booking_email(
             db,
             event_type="booking_confirmed",
