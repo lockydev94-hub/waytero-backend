@@ -824,16 +824,14 @@ class LandingPageService:
             out["tour_from"] = _money(tour_row["from_price"])
 
         if page.page_type in ("CITY_CABS", PLACE_CABS):
-            # A place page leads with the rides a traveller at an airport or
-            # station actually books; if the city prices none of those, the
-            # full matrix is shown rather than an empty teaser.
-            place_filter = (
-                ("AIRPORT", "ONE_WAY", "ROUND_TRIP")
-                if page.page_type == PLACE_CABS
-                else None
-            )
-            fares = await LandingPageService.cab_fare_matrix(
-                db, int(city_id or 0), trip_types_filter=place_filter
+            # Priced from the rental rate card, not the per-km rule tables, so
+            # the page quotes what checkout charges. A place page leads with
+            # the local hire and one-way package a traveller at an airport or
+            # station actually books, so the daily product is left out there.
+            fares = await LandingPageService.cab_package_matrix(
+                db,
+                int(city_id or 0),
+                include_daily=page.page_type != PLACE_CABS,
             )
             out["cab_fares"] = fares["rows"]
             out["cab_from"] = fares["fare_from"]
@@ -1002,6 +1000,131 @@ class LandingPageService:
             "vehicle_count": len({r["vehicle_category_id"] for r in rows}),
             "trip_types": included_types,
             "sample_distance_km": sample,
+        }
+
+    @staticmethod
+    async def cab_package_matrix(
+        db: AsyncSession,
+        city_id: int,
+        max_rows: int = MAX_FARE_ROWS,
+        include_daily: bool = True,
+    ) -> Dict[str, Any]:
+        """The city's published rate card, one row per class and rental type.
+
+        A marketing table built from the per-kilometre rule tables quotes a
+        price no search ever charges: 10 km at the platform default is \u20b9210
+        for a hatchback, while checkout sells the card's shortest local hire
+        for \u20b91,800. So this reads the same `cab_rental_rates` rows the booking
+        flow and /public/cab/cities/{id}/price-list read, and "from \u20b9x" becomes
+        a fare a customer can actually book.
+
+        LOCAL carries several duty options; the shortest is shown here because
+        it is what the "from" figure rests on \u2014 every option is on the price
+        page. A class no active vehicle category is matched to is skipped: it
+        cannot be booked, so it is not a price either.
+        """
+        from app.modules.booking.services.rental_booking import load_rate_card
+        from app.modules.booking.services.rental_rates import calculate_rental_fare
+
+        by_class, source = await load_rate_card(db, city_id)
+        categories = {
+            int(row["id"]): dict(row)
+            for row in (
+                (
+                    await db.execute(
+                        text(
+                            "SELECT id, category_name, seating_capacity, "
+                            "luggage_capacity, image_url, icon_url "
+                            "FROM vehicle_categories WHERE is_active = TRUE"
+                        )
+                    )
+                )
+                .mappings()
+                .all()
+            )
+        }
+
+        order = {"LOCAL": 0, "OUTSTATION": 1, "DAILY": 2}
+        groups: List[List[Dict[str, Any]]] = []
+        for vehicle_class, class_rows in by_class.items():
+            sample = class_rows[0]
+            category_id = sample.get("vehicle_category_id")
+            if category_id is None or int(category_id) not in categories:
+                continue
+            category = categories[int(category_id)]
+
+            chosen: Dict[str, Dict[str, Any]] = {}
+            for row in class_rows:
+                rental_type = str(row.get("rental_type") or "").upper()
+                if rental_type not in order:
+                    continue
+                if rental_type == "DAILY" and not include_daily:
+                    continue
+                current = chosen.get(rental_type)
+                if current is None or int(row.get("included_hours") or 0) < int(
+                    current.get("included_hours") or 0
+                ):
+                    chosen[rental_type] = row
+
+            group: List[Dict[str, Any]] = []
+            for rental_type, row in chosen.items():
+                included_hours = int(row.get("included_hours") or 0)
+                included_km = int(row.get("included_km") or 0)
+                try:
+                    quote = calculate_rental_fare(
+                        class_rows,
+                        rental_type=rental_type,
+                        hours=included_hours,
+                        km=included_km,
+                    )
+                    total = quote.total
+                except Exception:
+                    total = Decimal(str(row.get("price") or 0))
+                group.append(
+                    {
+                        "vehicle_category_id": int(category_id),
+                        "vehicle_category": category["category_name"],
+                        "vehicle_class": vehicle_class,
+                        "vehicle_label": sample.get("vehicle_label") or vehicle_class,
+                        "vehicle_models": sample.get("vehicle_models"),
+                        "seats": sample.get("seating_capacity")
+                        or category.get("seating_capacity"),
+                        "luggage": category.get("luggage_capacity"),
+                        "image_url": category.get("image_url"),
+                        "icon_url": category.get("icon_url"),
+                        "rental_type": rental_type,
+                        "included_hours": included_hours,
+                        "included_km": included_km,
+                        "price": _money(row.get("price")),
+                        "extra_km_rate": _money(row.get("extra_km_rate")),
+                        "extra_hour_rate": _money(row.get("extra_hour_rate")),
+                        "driver_allowance": _money(row.get("driver_allowance")),
+                        "estimated_total": _money(total),
+                        "source": source.get(vehicle_class, "PLATFORM"),
+                    }
+                )
+            if group:
+                group.sort(key=lambda r: order[r["rental_type"]])
+                groups.append(group)
+
+        # Cheapest class first, then the whole class group: a truncated group
+        # would leave a vehicle out of a tab while "from" still quoted it.
+        groups.sort(key=lambda g: min(r["estimated_total"] for r in g))
+        rows: List[Dict[str, Any]] = []
+        for group in groups:
+            if rows and len(rows) + len(group) > max_rows:
+                break
+            rows.extend(group)
+
+        totals = [Decimal(str(r["estimated_total"])) for r in rows]
+        rental_types = sorted(
+            {r["rental_type"] for r in rows}, key=lambda t: order.get(t, 9)
+        )
+        return {
+            "rows": rows,
+            "fare_from": _money(min(totals)) if totals else None,
+            "vehicle_count": len({r["vehicle_category_id"] for r in rows}),
+            "rental_types": rental_types,
         }
 
     @staticmethod
