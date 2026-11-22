@@ -1694,9 +1694,11 @@ class CmsService:
 
     _FOOTER_DEFAULTS: dict = {
         "logo_url": None,
+        # Service area is Bhubaneswar/Odisha, not "India": the footer shows on
+        # every page, so a national claim here diluted every local signal.
         "description": (
-            "India's Travel Operating System — connecting customers, partners, "
-            "drivers, hotels, and tour operators on one seamless platform."
+            "Odisha's travel platform — cabs in Bhubaneswar, hotels and curated "
+            "tour packages across the state, booked and managed on one system."
         ),
         # No invented company registration numbers — plain brand line.
         "copyright_text": "WayTero · waytero.com · All rights reserved.",
