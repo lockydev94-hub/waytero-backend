@@ -616,9 +616,19 @@ async def seed() -> None:
             _fill(page, "headline", content["headline"])
             _fill(page, "subheadline", content["subheadline"])
             _fill(page, "body_text", content["body_text"])
-            _fill(page, "seo_title", content["seo_title"])
-            _fill(page, "seo_description", content["seo_description"])
-            _fill(page, "seo_keywords", content["seo_keywords"])
+            # The SEO block is authored once per landmark and serves both the
+            # Place override and the landing page.
+            _fill(page, "seo_title", content.get("seo_title") or item["seo_title"])
+            _fill(
+                page,
+                "seo_description",
+                content.get("seo_description") or item["seo_description"],
+            )
+            _fill(
+                page,
+                "seo_keywords",
+                content.get("seo_keywords") or item["seo_keywords"],
+            )
             if not page.highlights:
                 page.highlights = content["highlights"]
             if not page.faqs:
