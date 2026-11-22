@@ -353,7 +353,7 @@ class PlaceOut(BaseModel):
 
 class PlaceCreate(BaseModel):
     city_id: int
-    kind: str = Field(..., pattern="^(AIRPORT|RAILWAY_STATION)$")
+    kind: str = Field(..., pattern="^(AIRPORT|RAILWAY_STATION|LANDMARK)$")
     name: str = Field(..., max_length=200)
     code: Optional[str] = Field(None, max_length=10)
     address: Optional[str] = None
@@ -366,7 +366,7 @@ class PlaceCreate(BaseModel):
 
 
 class PlaceUpdate(BaseModel):
-    kind: Optional[str] = Field(None, pattern="^(AIRPORT|RAILWAY_STATION)$")
+    kind: Optional[str] = Field(None, pattern="^(AIRPORT|RAILWAY_STATION|LANDMARK)$")
     name: Optional[str] = Field(None, max_length=200)
     code: Optional[str] = Field(None, max_length=10)
     address: Optional[str] = None

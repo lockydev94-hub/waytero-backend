@@ -143,17 +143,19 @@ class Branch(Base):
 
 class Place(Base):
     """
-    Airport / railway-station registry per city.
-    Migration 0070 — places. Backs the PLACE_CABS landing pages
-    ("bhubaneswar-airport-cab"). SEO columns are per-place overrides; the
-    landing page row remains the published source of truth for the URL.
+    Pickup-place registry per city — airports, railway stations and
+    landmarks (temples, zoos, caves, monuments).
+    Migration 0070 — places. Migration 0110 widened ``kind`` beyond transport
+    nodes. Backs the PLACE_CABS landing pages ("bhubaneswar-airport-cab").
+    SEO columns are per-place overrides; the landing page row remains the
+    published source of truth for the URL.
     """
 
     __tablename__ = "places"
 
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     city_id = Column(BigInteger, ForeignKey("cities.id"), nullable=False)
-    kind = Column(String(30), nullable=False)  # AIRPORT | RAILWAY_STATION
+    kind = Column(String(30), nullable=False)  # AIRPORT | RAILWAY_STATION | LANDMARK
     name = Column(String(200), nullable=False)
     code = Column(String(10), nullable=True)  # IATA / station code
     address = Column(sa.Text, nullable=True)

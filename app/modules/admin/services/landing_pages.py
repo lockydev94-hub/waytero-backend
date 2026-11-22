@@ -132,10 +132,9 @@ _CTA = {
     "CITY_TOURS": ("Browse {city} tours", "/tours?destination={city}"),
     "STATE_HOTELS": ("See hotels in {state}", "/hotels"),
     "STATE_TOURS": ("Browse {state} tours", "/tours"),
-    "PLACE_CABS": (
-        "Book a cab to {city}",
-        "/cabs?city_id={city_id}&trip_type=AIRPORT",
-    ),
+    # Not pinned to AIRPORT: a place is as often a temple or a zoo as it is a
+    # terminal, and sending a landmark page into the airport flow is a dead end.
+    "PLACE_CABS": ("Book a cab to {city}", "/cabs?city_id={city_id}"),
 }
 
 
