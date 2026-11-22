@@ -27,6 +27,23 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+# Every model table must be registered before SQLAlchemy configures its
+# mappers: LandingPage carries FKs to users and cities, and a partial import
+# fails with NoReferencedTableError the first time a row is loaded.
+import app.modules.auth.models  # noqa: F401
+import app.modules.booking.models  # noqa: F401
+import app.modules.chat.models  # noqa: F401
+import app.modules.customer.models  # noqa: F401
+import app.modules.driver.models  # noqa: F401
+import app.modules.hotel.models  # noqa: F401
+import app.modules.notification.models  # noqa: F401
+import app.modules.partner.models  # noqa: F401
+import app.modules.payment.models  # noqa: F401
+import app.modules.settlement.models  # noqa: F401
+import app.modules.tour.models  # noqa: F401
+import app.modules.vehicle.models  # noqa: F401
+import app.modules.wallet.models  # noqa: F401
+
 from app.core.config import settings
 from app.modules.admin.models import LandingPage
 from app.modules.admin.schemas import PlaceCreate
