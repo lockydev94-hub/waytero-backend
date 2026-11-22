@@ -101,6 +101,7 @@ RESERVED_LANDING_SLUGS: FrozenSet[str] = frozenset(
         "forgot-password",
         "login",
         "partner",
+        "places",
         "press",
         "privacy",
         "profile",
