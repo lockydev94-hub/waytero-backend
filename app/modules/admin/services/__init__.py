@@ -2157,18 +2157,32 @@ class CmsService:
         # follows one number; CMS keeps its own value only as a fallback.
         from sqlalchemy import text as _text
 
-        settings_row = (
+        settings_rows = (
             await db.execute(
                 _text(
-                    "SELECT config_value FROM system_configurations "
-                    "WHERE config_key = 'SUPPORT_PHONE'"
+                    "SELECT config_key, config_value FROM system_configurations "
+                    "WHERE config_key IN ('SUPPORT_PHONE', 'PLATFORM_LOGO_URL')"
                 )
             )
-        ).first()
-        settings_phone = (settings_row[0] or "").strip() if settings_row else ""
+        ).all()
+        settings = {key: (value or "").strip() for key, value in settings_rows}
+
+        settings_phone = settings.get("SUPPORT_PHONE", "")
         if settings_phone:
             header_data["support_phone"] = settings_phone
             footer_data["support_phone"] = settings_phone
+
+        # Settings → Platform Profile writes PLATFORM_LOGO_URL, while the
+        # Website → Header/Footer editors keep their own logo_url column. An
+        # admin who uploaded the logo in only one of the two saw no change on
+        # the site (the header fell back to the text wordmark), so the
+        # platform logo now fills any empty CMS logo slot.
+        platform_logo = settings.get("PLATFORM_LOGO_URL", "")
+        if platform_logo:
+            if not header_data.get("logo_url"):
+                header_data["logo_url"] = platform_logo
+            if not footer_data.get("logo_url"):
+                footer_data["logo_url"] = platform_logo
 
         return PublicHomepageOut(
             header=SiteHeaderOut.model_validate(header_data),
