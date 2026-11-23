@@ -1015,7 +1015,10 @@ async def get_effective_pricing_rule(
 #
 #  Upload spec per asset_type:
 #    logo     → crop=fill  w=400  h=120  folder=waytero/platform
-#    favicon  → crop=fill  w=32   h=32   folder=waytero/platform
+#    favicon  → crop=fill  w=96   h=96   folder=waytero/platform
+#               (Google only shows a site icon in search results when it is
+#                square and at least 48×48 — a multiple of 48. 96 covers the
+#                browser tab, the Android home screen and the SERP favicon.)
 #    og_image → crop=fill  w=1200 h=630  folder=waytero/platform
 #    general  → no forced dimensions   folder=waytero/platform
 #
@@ -1028,7 +1031,7 @@ async def get_effective_pricing_rule(
 
 ASSET_SPECS: dict[str, dict] = {
     "logo": {"width": 400, "height": 120, "crop": "fill"},
-    "favicon": {"width": 32, "height": 32, "crop": "fill"},
+    "favicon": {"width": 96, "height": 96, "crop": "fill"},
     "og_image": {"width": 1200, "height": 630, "crop": "fill"},
     "general": {},
 }

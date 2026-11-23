@@ -70,7 +70,7 @@ async def list_cities_for_partner(
 
 ASSET_SPECS: dict = {
     "logo": {"width": 400, "height": 120, "crop": "fill"},
-    "favicon": {"width": 32, "height": 32, "crop": "fill"},
+    "favicon": {"width": 96, "height": 96, "crop": "fill"},
     "og_image": {"width": 1200, "height": 630, "crop": "fill"},
     "general": {},
 }
