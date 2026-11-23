@@ -240,17 +240,26 @@ async def test_set_mpin_twice_is_refused_and_keeps_the_original(monkeypatch):
     assert user.mpin_hash is original
 
 
-async def test_minimum_length_is_read_from_configuration(monkeypatch):
+async def test_pin_length_is_fixed_at_six_digits(monkeypatch):
+    # The length is part of the API contract now (six boxes in both portals and
+    # `^\d{6}$` in the schema), so a configuration row must not stretch it: an
+    # 8-digit row still leaves "248157" as the only accepted shape.
     user = _make_user()
     service, _ = _service(
         user, {**DEFAULT_CONFIG, "ADMIN_MPIN_MIN_LENGTH": "8"}, monkeypatch=monkeypatch
     )
 
-    with pytest.raises(ValidationException) as exc:
-        await service.set_mpin(user.id, "248157", "Str0ng!Passw0rd")
+    policy = await service._admin_policy()
+    assert policy["mpin_min_length"] == 6
 
-    assert exc.value.code == "MPIN_TOO_SHORT"
+    with pytest.raises(ValidationException) as exc:
+        await service.set_mpin(user.id, "24815700", "Str0ng!Passw0rd")
+
+    assert exc.value.code == "MPIN_INVALID_LENGTH"
     assert user.mpin_hash is None
+
+    await service.set_mpin(user.id, "248157", "Str0ng!Passw0rd")
+    assert verify_password("248157", user.mpin_hash)
 
 
 async def test_a_corrupt_config_row_falls_back_to_the_seed_value(monkeypatch):

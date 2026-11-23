@@ -344,12 +344,15 @@ class PartnerChangeFirstPasswordRequest(BaseModel):
 # Migration: 0084. Static shape lives here; the platform's minimum length is a
 # configuration value, so the service checks that part.
 
-_MPIN_RE = re.compile(r"^\d{6,12}$")
+    # Exactly six digits, in lockstep with MPIN_LENGTH and the six boxes both
+    # portals render. A range here would let an API caller store a PIN the
+    # unlock screen cannot type.
+_MPIN_RE = re.compile(r"^\d{6}$")
 
 
 def _validate_mpin_shape(value: str) -> str:
     if not _MPIN_RE.match(value):
-        raise ValueError("Unlock PIN must be 6 to 12 digits")
+        raise ValueError("Unlock PIN must be exactly 6 digits")
     return value
 
 
@@ -469,6 +472,8 @@ class SessionConfigResponse(BaseModel):
     server_now: datetime
     mpin_locked_until: Optional[datetime]
     mpin_attempts_remaining: Optional[int] = None
+    # Kept for older shells: always 6 now, because the PIN length is part of
+    # the API contract rather than a configurable policy.
     mpin_min_length: int
     access_token_expires_in: int
     # Absolute session bound (12 h for admin/partner dashboards). The client

@@ -88,7 +88,7 @@ from app.modules.auth.constants import (
     IDLE_LOCK_MINUTES_MIN,
     MPIN_LOCKOUT_MINUTES_DEFAULT,
     MPIN_MAX_ATTEMPTS_DEFAULT,
-    MPIN_MIN_LENGTH_DEFAULT,
+    MPIN_LENGTH,
     STAFF_USER_TYPES,
     DASHBOARD_USER_TYPES,
     DASHBOARD_SESSION_HOURS,
@@ -2061,9 +2061,10 @@ class AuthService:
                 DAILY_LOGOUT_HOUR_MIN,
                 DAILY_LOGOUT_HOUR_MAX,
             ),
-            "mpin_min_length": as_int(
-                CONFIG_ADMIN_MPIN_MIN_LENGTH, MPIN_MIN_LENGTH_DEFAULT, 4, 12
-            ),
+            # Fixed, not configurable: the request schema accepts exactly six
+            # digits, so a policy row saying 4 or 12 could only disagree with
+            # the validator standing in front of it.
+            "mpin_min_length": MPIN_LENGTH,
             "mpin_max_attempts": as_int(
                 CONFIG_ADMIN_MPIN_MAX_ATTEMPTS, MPIN_MAX_ATTEMPTS_DEFAULT, 1, 10
             ),
@@ -2073,11 +2074,16 @@ class AuthService:
         }
 
     @staticmethod
-    def _validate_mpin_length(mpin: str, min_length: int) -> None:
-        if len(mpin) < min_length:
+    def _validate_mpin(mpin: str) -> None:
+        """The PIN is exactly MPIN_LENGTH digits, matching the schema regex.
+
+        Both portals render six boxes and submit on the sixth digit, so any
+        other length can only arrive from a hand-crafted request.
+        """
+        if not mpin.isdigit() or len(mpin) != MPIN_LENGTH:
             raise ValidationException(
-                message=f"Unlock PIN must be at least {min_length} digits.",
-                code="MPIN_TOO_SHORT",
+                message=f"Unlock PIN must be exactly {MPIN_LENGTH} digits.",
+                code="MPIN_INVALID_LENGTH",
             )
 
     async def _confirm_password(
@@ -2250,7 +2256,6 @@ class AuthService:
         otp: Optional[str] = None,
     ) -> None:
         user = await self._dashboard_user(user_id)
-        policy = await self._admin_policy()
         if user.mpin_hash is not None:
             raise BusinessException(
                 message="An unlock PIN is already set — change or remove it instead.",
@@ -2264,7 +2269,7 @@ class AuthService:
             # holder of a live token could install the gate that locks the real
             # admin out.
             await self._confirm_mpin_otp(user, otp)
-        self._validate_mpin_length(mpin, policy["mpin_min_length"])
+        self._validate_mpin(mpin)
         user.mpin_hash = hash_password(mpin)
         await self.db.flush()
         logger.info(AUTH_EVENT_MPIN_SET, user_id=str(user_id))
@@ -2286,7 +2291,7 @@ class AuthService:
             policy["mpin_max_attempts"],
             policy["mpin_lockout_minutes"],
         )
-        self._validate_mpin_length(new_mpin, policy["mpin_min_length"])
+        self._validate_mpin(new_mpin)
         if new_mpin == current_mpin:
             raise ValidationException(
                 message="Choose a PIN different from the current one.",

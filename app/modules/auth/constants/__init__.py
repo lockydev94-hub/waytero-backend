@@ -107,8 +107,12 @@ CONFIG_ADMIN_MPIN_LOCKOUT_MINUTES = "ADMIN_MPIN_LOCKOUT_MINUTES"
 
 # Code-side fallbacks for when a configuration row is missing (fresh database,
 # or a seed deleted from /settings). They match what 0084 seeds.
-MPIN_MIN_LENGTH_DEFAULT = 6
-MPIN_MAX_LENGTH = 12
+# The unlock PIN is a fixed six digits: six boxes in both portals, `^\d{6}$`
+# in the request schema, and this constant in the service. The old
+# ADMIN_MPIN_MIN_LENGTH configuration row is retired — it still exists so an
+# existing database keeps loading, but nothing reads it into the policy any
+# more, because a PIN longer than the UI can type is unusable.
+MPIN_LENGTH = 6
 MPIN_MAX_ATTEMPTS_DEFAULT = 5
 MPIN_LOCKOUT_MINUTES_DEFAULT = 15
 IDLE_LOCK_MINUTES_DEFAULT = 5
